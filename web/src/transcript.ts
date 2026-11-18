@@ -7,6 +7,7 @@ export interface ToolBlock {
   target: string;
   output: string;
   status: "running" | "waiting" | "ok" | "error" | "denied" | "cancelled";
+  interactive?: "terminal" | "agent";
   summary?: string;
   diff?: Diff;
   approval?: { id: string; state: string; summary?: string };
@@ -52,7 +53,10 @@ export function fold(events: TranscriptEvent[]): Transcript {
       }
       case "tool_output": {
         const block = tools.get(event.call_id!);
-        if (block) block.output += event.data || "";
+        if (block) {
+          block.output += event.data || "";
+          if (event.interactive) block.interactive = event.interactive;
+        }
         break;
       }
       case "tool_result": {
@@ -87,7 +91,10 @@ export function fold(events: TranscriptEvent[]): Transcript {
         break;
     }
   }
-  if (!running) for (const block of tools.values()) if (block.status === "running" || block.status === "waiting") block.status = "cancelled";
+  if (!running) for (const block of tools.values()) if (block.status === "running" || block.status === "waiting") {
+    block.status = "cancelled";
+    if (block.approval?.state === "pending") block.approval.state = "expired";
+  }
   return { blocks, todos, changes: [...changes.values()], usage, running };
 }
 

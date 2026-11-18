@@ -7,9 +7,9 @@ agent runs files, commands, terminals, sub-agents and MCP tools on the harness,
 asking for permission per tool call. The same agent can answer `@ventic`
 mentions in Slack, Telegram and GitLab, holding any write for review.
 
-Status: the browser app and its API contract are implemented against a
-synthetic mock. The Rust backend and the Ventic deployment integration are not
-built yet (see [Integration plan](#integration-plan)).
+The browser uses the Rust service in an installation and a loopback-only
+synthetic API during UI development. Ventic control authorizes the workspace
+and relays member-scoped requests to the gateway and connected harnesses.
 
 ## Layout
 
@@ -17,6 +17,8 @@ built yet (see [Integration plan](#integration-plan)).
 |---|---|
 | `api/openapi.yaml` | Browser API contract (source of truth) |
 | `web/` | Vite + React + TypeScript app; `web/src/api/schema.ts` is generated |
+| `server/` | Rust HTTP service, PostgreSQL schema and encrypted S3 event storage |
+| `connector/` | Apache Camel loopback transport for Slack, Telegram and GitLab |
 | `dev/mock.ts` | Synthetic in-memory API used for development and tests |
 
 ## Development
@@ -49,36 +51,25 @@ ticket exchange.
 - Conversations: `GET|POST /conversations`, `GET|PATCH|DELETE /conversations/{id}`,
   `GET /conversations/{id}/events`, `GET /conversations/{id}/stream` (SSE),
   `POST /conversations/{id}/messages` (idempotent on the message id),
-  `POST /conversations/{id}/interrupt`, `POST /approvals/{id}`
+  `POST /conversations/{id}/interrupt`, `POST /approvals/{id}`,
+  `POST /conversations/{id}/sessions/{call_id}/input` for live terminal or agent input
 - Bots: `GET /bots`, `GET|PATCH /bots/{id}`, `GET /bots/{id}/mentions`,
   `POST /bots/{id}/mentions/{mention_id}/review`
+- Connections: `GET|POST /connections`, credential rotation and disconnect,
+  and member identity linking and unlinking under `/connections/{id}`
 
 Permission modes: `ask` (writes and commands ask), `auto_edit` (file edits run,
-commands ask), `plan` (read-only tools). A harness in YOLO mode skips prompts.
+commands ask), `plan` (read-only tools). An owner using a YOLO harness can skip prompts in write-enabled modes. Bot runs follow their connection review policy.
 
-## Integration plan
+## Ventic integration
 
-Venticode plugs into Ventic the way Open WebUI does, without sharing its code:
+The distribution chart enables the service with `venticode.enabled`. The
+standalone image includes the browser. A separate connector image runs in
+the same pod and listens on loopback. Use the
+[installation guide](https://gitlab.com/nettersrl/ventic/ventic-frontend/-/blob/main/docs/venticode.md)
+for DNS, TLS, PostgreSQL, S3, feature policy and connection setup.
 
-1. **Host and tenancy.** One shared deployment serves
-   `https://<workspace-uuid>.code.<domain>`. The workspace always comes from
-   the host and the session.
-2. **Sign-in.** The portal calls `POST /api/v1/venticode/access` and gets a
-   one-time ticket bound to the portal session. It posts the ticket to
-   `/venticode/bootstrap` on the workspace host, which sets a host-only
-   `venticode_session` cookie. Mutations require that host's exact Origin.
-3. **Backend (Rust).** Implements this contract. It keeps metadata
-   (projects, conversations, approvals, bots, usage) in PostgreSQL and
-   transcripts, tool output and diffs encrypted in S3. It runs the agent loop
-   server-side through the Ventic gateway and sends tool calls to harnesses
-   through control.
-4. **Ventic changes still needed:**
-   - control routes for the ticket exchange;
-   - harness execution that does not depend on Open WebUI (today's harness
-     consent and execute path requires an Open WebUI session);
-   - a listing of harnesses shared with the user;
-   - a `venticode.use` feature flag;
-   - export and erasure hooks;
-   - WAF, ingress and certificate entries for `*.code.<domain>`;
-   - a Helm workload for the image;
-   - a portal navigation entry.
+Run `make check-service` to format-check, lint, test and build the release
+binary. Run `make check-connector` to package Camel and exercise it with a
+disposable loopback HTTPS provider. The synthetic mock never sends messages
+to any external provider.

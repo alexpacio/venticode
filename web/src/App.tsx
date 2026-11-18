@@ -9,6 +9,8 @@ import { ProjectView } from "./components/ProjectView.tsx";
 import { ConversationView } from "./components/ConversationView.tsx";
 import { BotView } from "./components/BotView.tsx";
 
+import { Connections } from "./components/Connections.tsx";
+
 export function App() {
   useLanguage();
   const session = useSession();
@@ -20,6 +22,7 @@ export function App() {
     return <div className="empty" role="status"><LoaderCircle className="spin" aria-hidden="true" />{t("Caricamento…")}</div>;
   if (session.isError) return isUnauthorized(session.error) ? <SignedOut /> : <Failure message={session.error.message} />;
 
+  const admin = ["tenant_admin", "reseller_admin"].includes(session.data.role);
   const menu = (
     <button className="icon-btn menu-btn" aria-label={t("Apri il menu")} onClick={() => setNavOpen(true)}>
       <Menu size={18} aria-hidden="true" />
@@ -33,7 +36,8 @@ export function App() {
         <Route path="/" element={<Home session={session.data} menu={menu} />} />
         <Route path="/p/:id" element={<ProjectView menu={menu} />} />
         <Route path="/c/:id" element={<ConversationView menu={menu} />} />
-        <Route path="/bots/:id" element={<BotView menu={menu} />} />
+        <Route path="/bots/:id" element={<BotView menu={menu} admin={admin} />} />
+        <Route path="/connections" element={<Connections menu={menu} admin={admin} />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </div>

@@ -18,10 +18,10 @@ unless asked.
 - `dev/mock.ts` is a synthetic, in-memory stand-in for the backend. It must
   stay loopback-only, never call a model or a harness, and never store real
   credentials or customer data.
-- The backend (Rust, PostgreSQL for metadata, S3 for transcripts and tool
-  output) is not implemented yet. Keep backend authorization, the exact
+- The backend uses Rust, PostgreSQL for metadata, and encrypted S3 objects
+  for transcripts and tool output. Keep backend authorization, the exact
   workspace-host Origin check on mutations, idempotent message ids,
-  optimistic revisions and unbuffered SSE as invariants when it is built.
+  optimistic revisions and unbuffered SSE as invariants.
 
 UI copy is Italian first with explicit English translations in
 `web/src/i18n/en.json`; the Italian string is the message id. Write all

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
 import { ShieldAlert } from "lucide-react";
 import { api } from "../api/client.ts";
 import type { ApprovalDecision } from "../api/client.ts";
@@ -48,9 +49,33 @@ function Tool({ block, harness }: { block: ToolBlock; harness: string }) {
       )}
       {block.output && <div className="tool-body"><pre>{block.output.replace(/\n$/, "")}</pre></div>}
       {block.summary && !block.diff && <div className="tool-result">└ {block.summary}</div>}
+      {block.interactive && block.status === "running" && <SessionControls block={block} />}
       {block.approval?.state === "pending" && <Approval id={block.approval.id} operation={block.operation} target={block.target} harness={harness} />}
     </div>
   );
+}
+
+function SessionControls({ block }: { block: ToolBlock }) {
+  const { id } = useParams();
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(action: "send" | "stop") {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/conversations/${id}/sessions/${block.id}/input`, "POST", { id:crypto.randomUUID(),action, ...(action === "send" ? {text} : {}) });
+      setText("");
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(false); }
+  }
+  return <form onSubmit={e => {e.preventDefault(); void submit("send");}}>
+    <label className="field">{block.interactive === "terminal" ? t("Riga da inviare al terminale") : t("Messaggio per l’agente")}
+      <input className="input mono" maxLength={8192} autoComplete="off" value={text} onChange={e => setText(e.target.value)} /></label>
+    <div className="approval-actions"><button className="btn" disabled={busy || !text}>{t("Invia")}</button>
+      <button className="btn" type="button" disabled={busy} onClick={() => void submit("stop")}>{t("Chiudi sessione")}</button></div>
+    {error && <p role="alert" className="error-line">{error}</p>}
+  </form>;
 }
 
 function Approval({ id, operation, target, harness }: { id: string; operation: string; target: string; harness: string }) {

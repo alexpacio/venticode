@@ -241,6 +241,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/conversations/{id}/sessions/{call_id}/input": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+                call_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["sendHarnessSessionInput"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/approvals/{id}": {
         parameters: {
             query?: never;
@@ -331,6 +350,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listConnections"];
+        put?: never;
+        post: operations["connectChannel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/connections/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["rotateChannel"];
+        post?: never;
+        delete: operations["disconnectChannel"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/connections/{id}/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["linkExternalIdentity"];
+        delete: operations["unlinkExternalIdentity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -338,6 +409,36 @@ export interface components {
         Error: {
             error: {
                 message: string;
+            };
+        };
+        Connection: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            kind: "slack" | "telegram" | "gitlab";
+            destination: string;
+            identity?: string;
+            /** @description Current member’s linked provider identity */
+            linked_user_id?: string | null;
+            /** @enum {string} */
+            status: "pending" | "connected" | "disconnected";
+            /** Format: uri */
+            webhook_url: string;
+            /** Format: uuid */
+            project_id: string | null;
+        };
+        ConnectionSetup: {
+            /** @enum {string} */
+            kind: "slack" | "telegram" | "gitlab";
+            /** @description Slack channel ID, Telegram chat ID or GitLab numeric project ID */
+            destination: string;
+            /** Format: uuid */
+            project_id: string;
+            credentials: {
+                token?: string;
+                client_id?: string;
+                client_secret?: string;
+                signing_secret?: string;
             };
         };
         Session: {
@@ -353,7 +454,7 @@ export interface components {
                 name: string;
             };
             /** @enum {string} */
-            role: "tenant_admin" | "group_manager" | "member";
+            role: "tenant_admin" | "reseller_admin" | "group_manager" | "member";
             /** Format: uri */
             portal_url: string;
         };
@@ -361,6 +462,8 @@ export interface components {
             id: string;
             name: string;
             default?: boolean;
+            /** @description Tool calling is available for this model and member */
+            tools?: boolean;
         };
         /** @enum {string} */
         HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_call_tool" | "preview";
@@ -495,6 +598,11 @@ export interface components {
             /** @description tool_output: text chunk */
             data?: string;
             /**
+             * @description A live session open for member input
+             * @enum {string}
+             */
+            interactive?: "terminal" | "agent";
+            /**
              * @description tool_result
              * @enum {string}
              */
@@ -572,8 +680,10 @@ export interface components {
             author: string;
             text: string;
             /** @enum {string} */
-            state: "answering" | "replied" | "review" | "discarded" | "failed";
-            reply?: string;
+            state: "answering" | "replied" | "review" | "discarded" | "sending" | "uncertain" | "failed";
+            reply?: string | null;
+            /** Format: uuid */
+            conversation_id?: string | null;
             tool_calls: {
                 operation: components["schemas"]["HarnessOperation"];
                 target: string;
@@ -587,6 +697,22 @@ export interface components {
         };
     };
     responses: {
+        /** @description Connection details or a Slack authorization redirect */
+        ConnectionResult: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Connection"] | {
+                    /** Format: uuid */
+                    id: string;
+                    /** Format: uri */
+                    authorize_url: string;
+                    /** Format: uri */
+                    webhook_url: string;
+                };
+            };
+        };
         /** @description Error */
         Error: {
             headers: {
@@ -1093,6 +1219,41 @@ export interface operations {
             };
         };
     };
+    sendHarnessSessionInput: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+                call_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Format: uuid */
+                    id: string;
+                    /** @enum {string} */
+                    action: "send" | "stop";
+                    text?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Input queued for the current member's live harness session */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: components["responses"]["Error"];
+        };
+    };
     decideApproval: {
         parameters: {
             query?: never;
@@ -1261,6 +1422,136 @@ export interface operations {
             };
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    listConnections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified channel bindings visible to this workspace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["Connection"][];
+                    };
+                };
+            };
+        };
+    };
+    connectChannel: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSetup"];
+            };
+        };
+        responses: {
+            201: components["responses"]["ConnectionResult"];
+        };
+    };
+    rotateChannel: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSetup"];
+            };
+        };
+        responses: {
+            200: components["responses"]["ConnectionResult"];
+        };
+    };
+    disconnectChannel: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: components["responses"]["Deleted"];
+        };
+    };
+    linkExternalIdentity: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    external_user_id: string;
+                };
+            };
+        };
+        responses: {
+            /** @description One-time challenge to submit from the named provider account */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        command: string;
+                        expires_in: number;
+                    };
+                };
+            };
+        };
+    };
+    unlinkExternalIdentity: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: components["responses"]["Deleted"];
         };
     };
 }

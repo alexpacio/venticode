@@ -184,9 +184,11 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   }
 
   function route(method: string, path: string, body: Json, headers: Json): Json | undefined {
-    const authed = sessions.has(headers.cookie?.match(/(?:^|;\s*)venticode_session=([a-f0-9]{64})/)?.[1] || "");
+    const cookie = headers.cookie?.match(/(?:^|;\s*)venticode_session=([a-f0-9]{64})/)?.[1] || "";
+    const authed = sessions.has(cookie);
     if (method === "POST" && path === "/api/v1/venticode/access") {
-      // Synthetic: the real portal route checks the portal session and Origin.
+      if (headers.origin !== portalOrigin) return fail(403, "Origine non consentita / Origin not allowed");
+      // The portal session itself is synthetic in this loopback-only mock.
       const ticket = randomBytes(32).toString("hex");
       tickets.set(ticket, Date.now() + 60000);
       return ok({ url: origin, ticket, expires_in: 60 });
@@ -208,7 +210,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
 
     if (p === "/session" && method === "GET") return ok({ user, workspace, role: "tenant_admin", portal_url: portalOrigin });
     if (p === "/session" && method === "DELETE") {
-      sessions.clear();
+      sessions.delete(cookie);
       return { ...ok({ signed_out: true, redirect_url: portalOrigin + "/app" }), headers: { "Set-Cookie": "venticode_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" } };
     }
     if (p === "/models" && method === "GET") return ok({ items: models });
@@ -313,6 +315,11 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       entry.resolve(body.decision);
       return ok({ state: entry.state });
     }
+    if (p === "/connections" && method === "GET") return ok({ items: bots.map(b => ({
+      id: b.id, kind: "slack", destination: "C_SYNTHETIC", identity: "@ventic", status: "connected",
+      project_id: projects[0].id, webhook_url: origin + "/hooks/slack/" + b.id,
+    })) });
+    if (p.startsWith("/connections")) return fail(501, "Connessione esterna non disponibile nel mock / External connection unavailable in the mock");
     if (p === "/bots" && method === "GET") return ok({ items: bots });
     if ((m = p.match(/^\/bots\/([^/]+)(\/mentions)?$/))) {
       const bot = bots.find((b) => b.id === m![1]);

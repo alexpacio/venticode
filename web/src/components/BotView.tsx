@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Bot as BotIcon, LoaderCircle } from "lucide-react";
 import { api } from "../api/client.ts";
@@ -8,7 +8,7 @@ import { useBot, useHarnesses, useMentions } from "../queries.ts";
 import { t } from "../i18n/index.ts";
 import { relative } from "./format.ts";
 
-export function BotView({ menu }: { menu: ReactNode }) {
+export function BotView({ menu, admin }: { menu: ReactNode; admin: boolean }) {
   const { id = "" } = useParams();
   const bot = useBot(id);
   const mentions = useMentions(id);
@@ -39,7 +39,7 @@ export function BotView({ menu }: { menu: ReactNode }) {
           <span className="muted" style={{ fontSize: 12 }}>{t("{0} · strumenti su {1} ({2})", b.name, harness?.name || "", b.root)}</span>
         </div>
         <span className={`pill ${b.enabled ? "pill-ok" : "pill-off"}`}><span className="dot" aria-hidden="true" />{b.enabled ? t("Attivo") : t("In pausa")}</span>
-        <button className="btn" onClick={() => void update({ enabled: !b.enabled })}>{b.enabled ? t("Metti in pausa") : t("Riattiva")}</button>
+        {admin && <button className="btn" onClick={() => void update({ enabled: !b.enabled })}>{b.enabled ? t("Metti in pausa") : t("Riattiva")}</button>}
       </header>
       <div className="page">
         {error && <p className="error-line" role="alert">{error}</p>}
@@ -47,14 +47,14 @@ export function BotView({ menu }: { menu: ReactNode }) {
           <section className="wide" aria-label={t("Menzioni")}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "baseline" }}>
               <h2 style={{ margin: 0, fontSize: 15 }}>{t("Menzioni")}</h2>
-              <span className="muted" style={{ fontSize: 12 }}>{t("Le risposte in sola lettura partono subito · le scritture attendono revisione")}</span>
+              <span className="muted" style={{ fontSize: 12 }}>{t("Approva la bozza per pubblicarla nel canale.")}</span>
             </div>
             {mentions.data?.length === 0 && <p className="muted">{t("Nessuna menzione di {0} finora.", b.handle)}</p>}
             {mentions.data?.map((m) => <MentionCard key={m.id} bot={b} mention={m} />)}
           </section>
-          <aside className="narrow" aria-label={t("Configurazione bot")}>
+          {admin && <aside className="narrow" aria-label={t("Configurazione bot")}>
             <Settings bot={b} onSave={update} />
-          </aside>
+          </aside>}
         </div>
       </div>
     </main>
@@ -72,6 +72,7 @@ function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {
   };
   const state = {
     review: [t("Da rivedere"), "pill-warn"], replied: [t("Risposto"), "pill-ok"], answering: [t("Sta rispondendo"), "pill-warn"],
+    sending: [t("Invio in corso"), "pill-warn"], uncertain: [t("Consegna da verificare nel canale"), "pill-warn"],
     discarded: [t("Scartato"), "pill-off"], failed: [t("Non riuscito"), "pill-bad"],
   }[mention.state];
   // The handle is rendered as a token wherever it is mentioned.
@@ -84,6 +85,7 @@ function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {
         <time dateTime={mention.created_at}>{relative(mention.created_at)}</time>
       </div>
       <p style={{ margin: 0 }}><strong>{mention.author}</strong>{"  "}{parts.map((part, i) => part === bot.handle ? <span key={i} className="handle">{part}</span> : part)}</p>
+      {mention.conversation_id && <Link to={`/c/${mention.conversation_id}`}>{t("Apri conversazione")}</Link>}
       {mention.tool_calls.length > 0 && (
         <div className="calls">
           {mention.tool_calls.map((call, i) => (

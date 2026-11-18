@@ -1,0 +1,18 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.ventic</groupId><artifactId>venticode-connector</artifactId><version>0.1.0</version>
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <camel.version>4.18.3</camel.version>
+  </properties>
+  <dependencies>
+    <dependency><groupId>org.apache.camel</groupId><artifactId>camel-main</artifactId><version>${camel.version}</version></dependency>
+    <dependency><groupId>org.apache.camel</groupId><artifactId>camel-jetty</artifactId><version>${camel.version}</version></dependency>
+    <dependency><groupId>org.apache.camel</groupId><artifactId>camel-http</artifactId><version>${camel.version}</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.21.7</version></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.14.1</version></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.8.1</version></plugin>
+  </plugins></build>
+</project>

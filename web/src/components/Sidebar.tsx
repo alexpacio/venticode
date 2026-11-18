@@ -104,6 +104,7 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
         })}
         <div className="nav-head" style={{ marginTop: 8 }}>
           <h2 className="section-title">{t("Bot")}</h2>
+          <NavLink to="/connections" className="btn" onClick={onNavigate}>{t("Connessioni bot")}</NavLink>
         </div>
         {bots.data?.map((bot) => (
           <NavLink key={bot.id} to={`/bots/${bot.id}`} className="bot-link" onClick={onNavigate}>

@@ -41,3 +41,14 @@ check:
 	npm --prefix web run typecheck
 	$(MAKE) --no-print-directory test
 	npm --prefix web run build
+
+.PHONY: check-service check-connector
+check-service:
+	cargo fmt --all --check
+	cargo clippy --release --locked --all-targets -- -D warnings
+	cargo test --release --locked
+	cargo build --release --locked
+
+check-connector:
+	mvn -B -f connector/pom.xml package dependency:copy-dependencies
+	python3 connector/tests/transport.py
