@@ -1,0 +1,820 @@
+openapi: 3.1.0
+info:
+  title: Venticode API
+  version: 0.1.0
+  description: |
+    Browser API of Venticode, the coding and bot agent that runs tools on
+    connected ventiharness instances.
+
+    Hosts and trust boundary (mirrors the Open WebUI integration in ventic):
+    - `POST /api/v1/venticode/access` is served on the portal host and uses the
+      portal session plus the exact portal Origin. It returns a one-time ticket.
+    - Every other operation is served on the per-workspace host
+      `https://<workspace-uuid>.code.<domain>`. The browser posts the ticket to
+      `/venticode/bootstrap`, which sets the host-only `venticode_session`
+      cookie (HttpOnly, Secure, SameSite=Lax). Mutations require the exact
+      Origin of that workspace host. The workspace is always derived from the
+      host and the session, never from a request parameter.
+
+    Storage (backend): conversation, project, approval and bot metadata live in
+    PostgreSQL; transcripts, tool output and diffs live in S3 (encrypted).
+    The backend is not implemented yet; `dev/mock.ts` is a synthetic stand-in.
+servers:
+  - url: /api/v1/venticode
+tags:
+  - name: session
+  - name: inventory
+  - name: conversations
+  - name: bots
+paths:
+  /access:
+    post:
+      operationId: createAccess
+      tags: [session]
+      summary: Issue a one-time ticket for the workspace host (portal host only)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: Ticket issued
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, ticket, expires_in]
+                properties:
+                  url: { type: string, format: uri, description: Workspace host origin }
+                  ticket: { type: string, minLength: 32 }
+                  expires_in: { type: integer, example: 60 }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /bootstrap:
+    servers:
+      - url: /venticode
+    post:
+      operationId: bootstrap
+      tags: [session]
+      summary: Exchange a ticket for a workspace-host session (Origin must be the portal)
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [ticket]
+              properties:
+                ticket: { type: string }
+      responses:
+        '303':
+          description: Session cookie set; redirect to the application root
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie: { schema: { type: string } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /session:
+    get:
+      operationId: getSession
+      tags: [session]
+      responses:
+        '200':
+          description: Current session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: signOut
+      tags: [session]
+      responses:
+        '200':
+          description: Session revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [signed_out, redirect_url]
+                properties:
+                  signed_out: { type: boolean }
+                  redirect_url: { type: string, format: uri }
+  /models:
+    get:
+      operationId: listModels
+      tags: [session]
+      responses:
+        '200':
+          description: Models the workspace may use
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Model' }
+  /harnesses:
+    get:
+      operationId: listHarnesses
+      tags: [inventory]
+      summary: Harnesses the user owns or that are shared with them in this workspace
+      responses:
+        '200':
+          description: Inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: { $ref: '#/components/schemas/Harness' }
+        '401': { $ref: '#/components/responses/Error' }
+  /projects:
+    get:
+      operationId: listProjects
+      tags: [inventory]
+      parameters:
+        - in: query
+          name: harness_id
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Project folders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Project' }
+    post:
+      operationId: createProject
+      tags: [inventory]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectCreate' }
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /projects/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    delete:
+      operationId: deleteProject
+      tags: [inventory]
+      summary: Delete a project and all of its conversations
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '200': { $ref: '#/components/responses/Deleted' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /conversations:
+    get:
+      operationId: listConversations
+      tags: [conversations]
+      parameters:
+        - in: query
+          name: project_id
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Conversations, most recently updated first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 200
+                    items: { $ref: '#/components/schemas/Conversation' }
+    post:
+      operationId: createConversation
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationCreate' }
+      responses:
+        '201':
+          description: Conversation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /conversations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getConversation
+      tags: [conversations]
+      responses:
+        '200':
+          description: Conversation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateConversation
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteConversation
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '200': { $ref: '#/components/responses/Deleted' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /conversations/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: listEvents
+      tags: [conversations]
+      summary: Replay transcript events after a cursor
+      parameters:
+        - $ref: '#/components/parameters/After'
+      responses:
+        '200':
+          description: Events in sequence order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, cursor, state]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 1000
+                    items: { $ref: '#/components/schemas/Event' }
+                  cursor: { type: integer, minimum: 0 }
+                  state: { $ref: '#/components/schemas/ConversationState' }
+        '404': { $ref: '#/components/responses/Error' }
+  /conversations/{id}/stream:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: streamEvents
+      tags: [conversations]
+      summary: Unbuffered SSE of transcript events after a cursor
+      description: |
+        Each event is sent as `event: transcript` with `id: <sequence>` and the
+        Event JSON as data. `event: heartbeat` is sent every 15 s.
+        `event: authorization_expired` ends the stream when the session ends.
+        Clients reconnect with `after` set to the last received sequence.
+      parameters:
+        - $ref: '#/components/parameters/After'
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+  /conversations/{id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      operationId: sendMessage
+      tags: [conversations]
+      summary: Append a user message and start a run
+      description: |
+        Idempotent on `id`: replaying the same id with the same content returns
+        the original result; a reused id with different content returns 409.
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id, content]
+              properties:
+                id: { type: string, format: uuid }
+                content: { type: string, minLength: 1, maxLength: 100000 }
+      responses:
+        '202':
+          description: Run started
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [run_id, message_id]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  message_id: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '423': { $ref: '#/components/responses/Error' }
+  /conversations/{id}/interrupt:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      operationId: interruptRun
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '200':
+          description: Run interrupted; pending approvals expire and in-flight tool calls are cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { $ref: '#/components/schemas/ConversationState' }
+  /approvals/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      operationId: decideApproval
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision: { $ref: '#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { $ref: '#/components/schemas/ApprovalState' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /bots:
+    get:
+      operationId: listBots
+      tags: [bots]
+      responses:
+        '200':
+          description: Bots of this workspace
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Bot' }
+  /bots/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getBot
+      tags: [bots]
+      responses:
+        '200':
+          description: Bot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bot' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateBot
+      tags: [bots]
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BotUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bot' }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /bots/{id}/mentions:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: listMentions
+      tags: [bots]
+      responses:
+        '200':
+          description: Mentions of the bot, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: { $ref: '#/components/schemas/Mention' }
+  /bots/{id}/mentions/{mention_id}/review:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - in: path
+        name: mention_id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      operationId: reviewMention
+      tags: [bots]
+      summary: Approve and post, or discard, a reply that is held for review
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, discard] }
+      responses:
+        '200':
+          description: Review recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mention' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+components:
+  parameters:
+    Id:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+    After:
+      in: query
+      name: after
+      required: false
+      schema: { type: integer, minimum: 0, default: 0 }
+    TenantId:
+      in: header
+      name: X-Tenant-Id
+      required: false
+      schema: { type: string, format: uuid }
+    Origin:
+      in: header
+      name: Origin
+      required: true
+      description: Exact origin of the workspace host
+      schema: { type: string }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Deleted:
+      description: Deleted
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [deleted]
+            properties:
+              deleted: { type: boolean }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message]
+          properties:
+            message: { type: string }
+    Session:
+      type: object
+      additionalProperties: false
+      required: [user, workspace, portal_url, role]
+      properties:
+        user:
+          type: object
+          additionalProperties: false
+          required: [id, name]
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            email: { type: string }
+        workspace:
+          type: object
+          additionalProperties: false
+          required: [id, name]
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+        role: { type: string, enum: [tenant_admin, group_manager, member] }
+        portal_url: { type: string, format: uri }
+    Model:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        default: { type: boolean }
+    HarnessOperation:
+      type: string
+      enum: [list_files, find_files, search_files, read_file, write_file, edit_file, mkdir, rename, remove, execute, terminal_start, agent_start, mcp_call_tool, preview]
+    Harness:
+      type: object
+      additionalProperties: false
+      required: [id, name, roots, online, mode, owned, revision]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        roots:
+          type: array
+          description: Granted root labels on the harness
+          items: { type: string }
+        online: { type: boolean }
+        mode: { type: string, enum: [sandboxed, yolo] }
+        owned: { type: boolean }
+        revision: { type: integer }
+        host_info:
+          oneOf:
+            - type: 'null'
+            - type: object
+              additionalProperties: false
+              required: [os, arch, version]
+              properties:
+                os: { type: string }
+                arch: { type: string }
+                version: { type: string }
+                hostname: { type: string }
+        mcp_servers:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, transport, tools, status]
+            properties:
+              name: { type: string }
+              transport: { type: string, enum: [stdio, http] }
+              tools: { type: integer, minimum: 0 }
+              status: { type: string, enum: [running, stopped, auth_required] }
+    Project:
+      type: object
+      additionalProperties: false
+      required: [id, harness_id, root, path, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        harness_id: { type: string, format: uuid }
+        root: { type: string, description: Granted root label }
+        path: { type: string, description: 'Relative folder inside the root; "." is the root itself' }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    ProjectCreate:
+      type: object
+      additionalProperties: false
+      required: [harness_id, root]
+      properties:
+        harness_id: { type: string, format: uuid }
+        root: { type: string }
+        path: { type: string, maxLength: 1024, pattern: '^(\.|[^/\\][^\\]*)$', default: '.' }
+        name: { type: string, minLength: 1, maxLength: 80 }
+    PermissionMode:
+      type: string
+      enum: [ask, auto_edit, plan]
+      description: ask = every write and command asks; auto_edit = file edits run, commands ask; plan = read-only tools only
+    ConversationState:
+      type: string
+      enum: [idle, running, waiting, failed]
+    Conversation:
+      type: object
+      additionalProperties: false
+      required: [id, project_id, harness_id, title, model, permission_mode, state, revision, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        project_id: { type: string, format: uuid }
+        harness_id: { type: string, format: uuid }
+        title: { type: string }
+        model: { type: string }
+        permission_mode: { $ref: '#/components/schemas/PermissionMode' }
+        state: { $ref: '#/components/schemas/ConversationState' }
+        revision: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ConversationCreate:
+      type: object
+      additionalProperties: false
+      required: [project_id]
+      properties:
+        project_id: { type: string, format: uuid }
+        title: { type: string, maxLength: 200 }
+        model: { type: string }
+        permission_mode: { $ref: '#/components/schemas/PermissionMode' }
+    ConversationUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      minProperties: 2
+      properties:
+        revision: { type: integer }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        model: { type: string }
+        permission_mode: { $ref: '#/components/schemas/PermissionMode' }
+    ApprovalDecision:
+      type: string
+      enum: [allow_once, allow_project, deny]
+    ApprovalState:
+      type: string
+      enum: [pending, allowed, denied, expired]
+    Diff:
+      type: object
+      additionalProperties: false
+      required: [path, additions, deletions, patch]
+      properties:
+        path: { type: string }
+        additions: { type: integer, minimum: 0 }
+        deletions: { type: integer, minimum: 0 }
+        patch: { type: string, description: Unified diff, truncated to 64 KiB (full copy in S3) }
+    Todo:
+      type: object
+      additionalProperties: false
+      required: [content, status]
+      properties:
+        content: { type: string }
+        status: { type: string, enum: [pending, in_progress, completed] }
+    Event:
+      type: object
+      description: One transcript entry. Fields beyond the common ones depend on `type`.
+      required: [sequence, type, created_at]
+      properties:
+        sequence: { type: integer, minimum: 1 }
+        type: { type: string, enum: [user_message, text, tool_call, tool_output, tool_result, approval, todo, run, error] }
+        created_at: { type: string, format: date-time }
+        message_id: { type: string, format: uuid, description: 'user_message, text' }
+        content: { type: string, description: 'user_message: full text' }
+        delta: { type: string, description: 'text: appended to the assistant message with the same message_id' }
+        call_id: { type: string, format: uuid, description: 'tool_call, tool_output, tool_result, approval' }
+        operation: { $ref: '#/components/schemas/HarnessOperation' }
+        target: { type: string, description: 'tool_call: path, command or MCP tool shown to the user' }
+        arguments: { type: object, description: 'tool_call: operation arguments' }
+        stream: { type: string, enum: [stdout, stderr] }
+        data: { type: string, description: 'tool_output: text chunk' }
+        status: { type: string, enum: [ok, error, denied, cancelled], description: 'tool_result' }
+        summary: { type: string, description: 'tool_result, approval' }
+        diff: { $ref: '#/components/schemas/Diff' }
+        approval_id: { type: string, format: uuid }
+        approval_state: { $ref: '#/components/schemas/ApprovalState' }
+        todos:
+          type: array
+          items: { $ref: '#/components/schemas/Todo' }
+        run_id: { type: string, format: uuid }
+        state: { $ref: '#/components/schemas/ConversationState' }
+        usage:
+          type: object
+          additionalProperties: false
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            context_ratio: { type: number, minimum: 0, maximum: 1 }
+        message: { type: string, description: 'error' }
+    ToolPolicy:
+      type: string
+      enum: [auto, review, off]
+    BotTriggers:
+      type: object
+      additionalProperties: false
+      required: [mentions, direct_messages]
+      properties:
+        mentions: { type: boolean }
+        direct_messages: { type: boolean }
+    BotTools:
+      type: object
+      additionalProperties: false
+      required: [read, write, execute, mcp]
+      properties:
+        read: { $ref: '#/components/schemas/ToolPolicy' }
+        write: { $ref: '#/components/schemas/ToolPolicy' }
+        execute: { $ref: '#/components/schemas/ToolPolicy' }
+        mcp: { $ref: '#/components/schemas/ToolPolicy' }
+    Bot:
+      type: object
+      additionalProperties: false
+      required: [id, name, handle, harness_id, root, enabled, revision, channels, triggers, tools, instructions, rate_limit_per_hour]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        handle: { type: string, const: '@ventic', description: Mention handle used in every channel }
+        harness_id: { type: string, format: uuid }
+        root: { type: string }
+        enabled: { type: boolean }
+        revision: { type: integer }
+        channels:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [kind, name]
+            properties:
+              kind: { type: string, enum: [slack, telegram, gitlab] }
+              name: { type: string }
+        triggers: { $ref: '#/components/schemas/BotTriggers' }
+        tools: { $ref: '#/components/schemas/BotTools' }
+        instructions: { type: string, maxLength: 8000 }
+        rate_limit_per_hour: { type: integer, minimum: 1, maximum: 1000 }
+    BotUpdate:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      minProperties: 2
+      properties:
+        revision: { type: integer }
+        enabled: { type: boolean }
+        triggers: { $ref: '#/components/schemas/BotTriggers' }
+        tools: { $ref: '#/components/schemas/BotTools' }
+        instructions: { type: string, maxLength: 8000 }
+        rate_limit_per_hour: { type: integer, minimum: 1, maximum: 1000 }
+    Mention:
+      type: object
+      additionalProperties: false
+      required: [id, channel, author, text, state, created_at, tool_calls]
+      properties:
+        id: { type: string, format: uuid }
+        channel:
+          type: object
+          additionalProperties: false
+          required: [kind, name]
+          properties:
+            kind: { type: string, enum: [slack, telegram, gitlab] }
+            name: { type: string }
+        author: { type: string }
+        text: { type: string }
+        state: { type: string, enum: [answering, replied, review, discarded, failed] }
+        reply: { type: string }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [operation, target, status]
+            properties:
+              operation: { $ref: '#/components/schemas/HarnessOperation' }
+              target: { type: string }
+              status: { type: string, enum: [ok, error, held] }
+        created_at: { type: string, format: date-time }
+        replied_at: { type: string, format: date-time }
