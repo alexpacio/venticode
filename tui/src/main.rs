@@ -1,4 +1,5 @@
 mod client;
+mod login;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use client::{Remote, origin};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -6,15 +7,43 @@ use futures_util::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, BorderType, Paragraph, Wrap},
 };
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::{io, process::Command};
+use std::io;
 use tokio::{sync::mpsc, task::JoinHandle};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+const COMMANDS: &[&str] = &[
+    "/help",
+    "/new",
+    "/resume",
+    "/model",
+    "/permissions",
+    "/status",
+    "/rename",
+    "/diff",
+    "/plan",
+    "/goal",
+    "/build",
+    "/answer",
+    "/allow",
+    "/deny",
+    "/stop",
+    "/projects",
+    "/use",
+    "/harnesses",
+    "/folder",
+    "/chats",
+    "/open",
+    "/models",
+    "/cancel-goal",
+    "/logout",
+    "/exit",
+    "/quit",
+];
 fn string(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or("").to_owned()
 }
@@ -53,6 +82,7 @@ fn entries(items: &[Value]) -> String {
 }
 struct App {
     remote: Remote,
+    credential: keyring::Entry,
     en: bool,
     projects: Vec<Value>,
     models: Vec<Value>,
@@ -63,6 +93,7 @@ struct App {
     model: String,
     lines: Vec<String>,
     last_text: String,
+    patches: Vec<String>,
     input: String,
     status: String,
     question: String,
@@ -104,7 +135,7 @@ impl App {
     fn project_chats(&self) -> Vec<Value> {
         self.chats
             .iter()
-            .filter(|c| c["project_id"] == self.project["id"])
+            .filter(|c| self.project.is_null() || c["project_id"] == self.project["id"])
             .cloned()
             .collect()
     }
@@ -114,6 +145,7 @@ impl App {
         }
         self.chat = Value::Null;
         self.lines.clear();
+        self.patches.clear();
         self.question.clear();
         self.choices.clear();
         self.retry = None;
@@ -210,7 +242,9 @@ impl App {
             Some("tool_result") => {
                 self.note(format!("{} {}", val("status"), val("summary")));
                 if let Some(patch) = e["diff"]["patch"].as_str().filter(|s| !s.is_empty()) {
-                    self.note(format!("{}\n{}", string(&e["diff"], "path"), patch));
+                    let diff = format!("{}\n{}", string(&e["diff"], "path"), patch);
+                    self.patches.push(clean(&diff));
+                    self.note(diff);
                 }
             }
             Some("approval") => {
@@ -267,16 +301,31 @@ impl App {
         let (command, argument) = line.split_once(' ').unwrap_or((line, ""));
         let argument = argument.trim();
         match command {
-            "/quit" => return Ok(true),
+            "/logout" => {
+                self.remote.api(Method::DELETE, "/session", None).await?;
+                match self.credential.delete_credential() { Ok(()) | Err(keyring::Error::NoEntry) => (), Err(e) => return Err(e.into()) };
+                return Ok(true);
+            }
+            "/diff" => {
+                if self.patches.is_empty() { self.note(self.msg("Nessuna modifica nella conversazione", "No changes in this conversation")); }
+                else { self.note(self.patches.join("\n")); }
+            }
+            "/rename" => {
+                ensure!(!argument.is_empty(), "/rename <title>");
+                let body = json!({"revision":self.chat["revision"], "title":argument});
+                self.chat = self.remote.api(Method::PATCH, &self.path()?, Some(body)).await?;
+            }
+            "/status" => self.note(format!("{} · {} · {} · {}", self.remote.workspace, self.model, string(&self.chat,"permission_mode"), string(&self.chat,"state"))),
+            "/quit" | "/exit" => return Ok(true),
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /quit",
-                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /quit",
+                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit",
+                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit",
             )),
-            "/projects" | "/harnesses" | "/models" | "/chats" => {
+            "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model" if argument.is_empty() => {
                 self.refresh().await?;
                 let listing = match command {
                     "/projects" => entries(&self.projects),
-                    "/models" => entries(&self.models),
+                    "/models" | "/model" => entries(&self.models),
                     "/harnesses" => self.harnesses.iter().enumerate()
                         .map(|(index, harness)| format!("{}  {}  {}", index + 1, string(harness, "name"), harness["roots"]))
                         .collect::<Vec<_>>().join("\n"),
@@ -301,9 +350,18 @@ impl App {
                 self.project = project;
                 self.refresh().await?;
             }
-            "/open" => {
+            "/open" | "/resume" => {
                 let id = string(choice(&self.project_chats(), argument)?, "id");
                 self.open(&id).await?;
+            }
+            "/permissions" => {
+                if argument.is_empty() { self.note("ask · auto_edit · plan"); }
+                else {
+                    ensure!(["ask", "auto_edit", "plan"].contains(&argument), "/permissions ask|auto_edit|plan");
+                    let path = self.path()?;
+                    let payload = json!({"revision":self.chat["revision"],"permission_mode":argument});
+                    self.chat = self.remote.api(Method::PATCH,&path,Some(payload)).await?;
+                }
             }
             "/model" => {
                 let model = string(choice(&self.models, argument)?, "id");
@@ -399,17 +457,24 @@ async fn run_ui(
     let mut draft_history: Vec<String> = Vec::new();
     let mut hist_index = 0;
     let mut caret = 0;
+    let mut selection = 0usize;
     loop {
+        let suggestions: Vec<_> = COMMANDS
+            .iter()
+            .copied()
+            .filter(|cmd| app.input.starts_with('/') && cmd.starts_with(&app.input))
+            .collect();
+        selection = selection.min(suggestions.len().saturating_sub(1));
         terminal.draw(|f| {
-            let [head, body, foot, input] = Layout::vertical([
-                Constraint::Length(1),
+            let [head, body, input, foot] = Layout::vertical([
+                Constraint::Length(4),
                 Constraint::Min(2),
-                Constraint::Length(1),
                 Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .areas(f.area());
             let title = clean(&format!(
-                " Venticode  {} / {}  ·  {}  ·  {}  {}",
+                " {}  {}\n {}  {}  {}",
                 string(&app.project, "name"),
                 string(&app.chat, "title"),
                 app.model,
@@ -417,7 +482,13 @@ async fn run_ui(
                 string(&app.chat, "state")
             ));
             f.render_widget(
-                Paragraph::new(title).style(Style::new().fg(Color::Cyan)),
+                Paragraph::new(title)
+                    .block(
+                        Block::bordered()
+                            .border_type(BorderType::Rounded)
+                            .title(" >_ Venticode "),
+                    )
+                    .style(Style::new().fg(Color::Cyan)),
                 head,
             );
             let text = app.lines.join("\n");
@@ -435,7 +506,23 @@ async fn run_ui(
                     .scroll((offset.saturating_sub(app.scroll), 0)),
                 body,
             );
-            let status = if app.status.is_empty() {
+            let hints = suggestions
+                .iter()
+                .enumerate()
+                .skip(selection.saturating_sub(1))
+                .take(5)
+                .map(|(i, cmd)| {
+                    if i == selection {
+                        format!("› {cmd}")
+                    } else {
+                        cmd.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("   ");
+            let status = if !suggestions.is_empty() && app.status.is_empty() {
+                &hints
+            } else if app.status.is_empty() {
                 app.msg(
                     "Invio invia · Esc interrompe · PgSu/PgGiù scorri · /help",
                     "Enter send · Esc interrupt · PgUp/PgDn scroll · /help",
@@ -456,9 +543,11 @@ async fn run_ui(
             let avail = usize::from(input.width.saturating_sub(3));
             let left = pos.saturating_sub(avail).min(u16::MAX as usize) as u16;
             f.render_widget(
-                Paragraph::new(app.input.as_str())
-                    .scroll((0, left))
-                    .block(Block::bordered().title(title)),
+                Paragraph::new(app.input.as_str()).scroll((0, left)).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(format!(" › {title} ")),
+                ),
                 input,
             );
             f.set_cursor_position((
@@ -473,6 +562,9 @@ async fn run_ui(
                 match k.code {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL)=>break,
                     KeyCode::Esc=>{if let Err(e)=app.command("/stop").await{app.status=e.to_string()}},
+                    KeyCode::Up if !suggestions.is_empty()=> selection=selection.saturating_sub(1),
+                    KeyCode::Down if !suggestions.is_empty()=> selection=(selection+1).min(suggestions.len()-1),
+                    KeyCode::Tab if !suggestions.is_empty()=>{app.input=format!("{} ",suggestions[selection]);caret=app.input.len();selection=0;},
                     KeyCode::PageUp=>app.scroll=app.scroll.saturating_add(12),KeyCode::PageDown=>app.scroll=app.scroll.saturating_sub(12),
                     KeyCode::Up=>{if hist_index>0{hist_index-=1;app.input=draft_history[hist_index].clone();caret=app.input.len();}},
                     KeyCode::Down=>{hist_index=(hist_index+1).min(draft_history.len());app.input=draft_history.get(hist_index).cloned().unwrap_or_default();caret=app.input.len();},
@@ -482,7 +574,7 @@ async fn run_ui(
                     KeyCode::Delete if caret<app.input.len()=>{app.input.remove(caret);},
                     KeyCode::Backspace if caret>0=>{let prev=app.input[..caret].char_indices().next_back().unwrap().0;app.input.drain(prev..caret);caret=prev;},
                     KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL)=>{app.input.insert(caret,c);caret+=c.len_utf8();},
-                    KeyCode::Enter=>{let line=app.input.trim().to_owned();if line.is_empty(){continue}app.status.clear();
+                    KeyCode::Enter=>{let line=suggestions.get(selection).copied().unwrap_or(app.input.trim()).to_owned();if line.is_empty(){continue}app.status.clear();
                         match app.command(&line).await{Ok(quit)=>{if quit{break}draft_history.push(line);hist_index=draft_history.len();app.input.clear();caret=0},Err(e)=>app.status=e.to_string()}
                     },_=>{}
                 }
@@ -500,17 +592,24 @@ async fn main() -> Result<()> {
     let mut start = None;
     let mut stdin = false;
     let mut browser = true;
+    let mut manual = false;
+    let mut ca = None;
     let mut en = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--portal" => portal = Some(args.next().context("--portal URL")?),
             "--conversation" => start = Some(args.next().context("--conversation UUID")?),
             "--ticket-stdin" => stdin = true,
-            "--no-browser" => browser = false,
+            "--no-browser" => {
+                browser = false;
+                manual = true;
+            }
+            "--manual" => manual = true,
+            "--ca" => ca = Some(std::path::PathBuf::from(args.next().context("--ca PEM")?)),
             "--en" => en = true,
             "--help" | "-h" => {
                 println!(
-                    "venticode-tui --portal https://portal.example.org [--conversation UUID] [--en] [--no-browser] [--ticket-stdin]"
+                    "venticode-tui --portal https://portal.example.org [--conversation UUID] [--en] [--manual] [--ca PEM] [--no-browser] [--ticket-stdin]"
                 );
                 return Ok(());
             }
@@ -533,44 +632,55 @@ async fn main() -> Result<()> {
             origin(value.trim())?
         }
     };
-    let url = format!("{portal}/app/venticode?terminal=1");
-    let code = if stdin {
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        line
-    } else {
-        eprintln!(
-            "{} {url}",
-            if en {
-                "Sign in using your browser:"
-            } else {
-                "Accedi con il browser:"
+    let http = Remote::http(ca.as_deref())?;
+    let credential = keyring::Entry::new("venticode-tui", &portal)?;
+    let mut session = None;
+    if !stdin {
+        match credential.get_password() {
+            Ok(saved) => {
+                let remote = Remote::restore(http.clone(), &saved)?;
+                if remote.valid().await? {
+                    session = Some(remote);
+                } else {
+                    credential.delete_credential()?;
+                }
             }
-        );
-        if browser {
-            #[cfg(windows)]
-            {
-                let _ = Command::new("rundll32.exe")
-                    .args(["url.dll,FileProtocolHandler", &url])
-                    .spawn();
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = Command::new("xdg-open").arg(&url).spawn();
-            }
+            Err(keyring::Error::NoEntry) => (),
+            Err(e) => eprintln!("Portachiavi non disponibile / Keyring unavailable: {e}"),
         }
-        rpassword::prompt_password(if en {
-            "One-time code: "
+    }
+    let remote = if let Some(remote) = session {
+        remote
+    } else {
+        let code = if stdin {
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            line
+        } else if manual {
+            let url = format!("{portal}/app/venticode?terminal=1");
+            eprintln!("Accedi nel browser / Sign in in your browser: {url}");
+            if browser {
+                let _ = open::that_detached(&url);
+            }
+            rpassword::prompt_password(if en {
+                "One-time code: "
+            } else {
+                "Codice monouso: "
+            })?
         } else {
-            "Codice monouso: "
-        })?
+            login::browser(&portal).await?
+        };
+        let remote = Remote::connect(http, &portal, code.trim()).await?;
+        if let Err(e) = credential.set_password(&remote.saved()?) {
+            eprintln!("Sessione solo in memoria / Session available for this launch only: {e}");
+        }
+        remote
     };
-    let remote = Remote::connect(&portal, code.trim()).await?;
-    drop(code);
     let (tx, rx) = mpsc::channel(256);
     run_ui(
         App {
             remote,
+            credential,
             en,
             projects: vec![],
             models: vec![],
@@ -581,6 +691,7 @@ async fn main() -> Result<()> {
             model: String::new(),
             lines: vec![],
             last_text: String::new(),
+            patches: Vec::new(),
             input: String::new(),
             status: String::new(),
             question: String::new(),

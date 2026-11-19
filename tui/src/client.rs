@@ -28,14 +28,47 @@ pub fn origin(input: &str) -> Result<String> {
 }
 
 impl Remote {
-    pub async fn connect(portal: &str, code: &str) -> Result<Self> {
+    pub fn http(ca: Option<&std::path::Path>) -> Result<Client> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(path) = ca {
+            builder = builder
+                .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(path)?)?);
+        }
+        Ok(builder.build()?)
+    }
+    pub fn saved(&self) -> Result<String> {
+        Ok(serde_json::json!({"url": self.workspace, "cookie":self.cookie.to_str()?}).to_string())
+    }
+    pub fn restore(client: Client, saved: &str) -> Result<Self> {
+        let value: Value = serde_json::from_str(saved)?;
+        let workspace = origin(value["url"].as_str().context("Missing workspace")?)?;
+        let mut cookie =
+            header::HeaderValue::from_str(value["cookie"].as_str().context("Missing cookie")?)?;
+        cookie.set_sensitive(true);
+        Ok(Self {
+            client,
+            workspace,
+            cookie,
+        })
+    }
+    pub async fn valid(&self) -> Result<bool> {
+        let res = self
+            .request(Method::GET, "/session")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        if res.status() == 401 {
+            return Ok(false);
+        }
+        res.error_for_status()?;
+        Ok(true)
+    }
+    pub async fn connect(client: Client, portal: &str, code: &str) -> Result<Self> {
         let link: Value = serde_json::from_str(code).context("Invalid one-time code")?;
         let workspace = origin(link["url"].as_str().context("Missing workspace")?)?;
         let ticket = link["ticket"].as_str().context("Missing ticket")?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
         let result = client
             .post(format!("{workspace}/venticode/bootstrap"))
             .timeout(Duration::from_secs(30))
