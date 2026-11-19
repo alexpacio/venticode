@@ -421,38 +421,19 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         }
         let mut request = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
         if use_tools {
-            request["tools"] = tools::definitions(mode, bot.as_ref());
+            request["tools"] = tools::definitions(mode, bot.as_ref(), app.standalone.is_some());
             if bot.is_none() {
                 tools::file_functions(&mut request["tools"], mode);
                 crate::agent::actions(&mut request["tools"], mode, goal);
             }
             request["parallel_tool_calls"] = json!(false);
         }
-        let res = app
-            .control_request(h, Method::POST, "infer")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|_| unavailable())?;
-        if !res.status().is_success() {
-            let status = res.status();
-            let body: Value = res.json().await.unwrap_or_default();
-            return Err(Error(
-                status,
-                body["error"]["message"]
-                    .as_str()
-                    .unwrap_or("Gateway unavailable")
-                    .into(),
-            ));
-        }
-        let mut stream = sse_stream::SseByteStream::new(res.bytes_stream());
+        let mut stream = inference::infer(app, h, &request).await?;
         let msg = Uuid::new_v4();
         let mut done = false;
         let mut truncated = false;
         while let Some(event) = stream.next().await {
-            let Some(data) = event.map_err(|_| unavailable())?.data else {
-                continue;
-            };
+            let data = event?;
             if data == "[DONE]" {
                 done = true;
                 break;

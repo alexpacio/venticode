@@ -40,21 +40,35 @@ impl Storage {
     fn path(id: Uuid) -> ObjectPath {
         ObjectPath::from(format!("venticode/events/{id}"))
     }
-    pub async fn put(&self, id: Uuid, data: &Value) -> Result<()> {
+    pub fn seal(&self, aad: &[u8], data: &Value) -> Result<Vec<u8>> {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let raw = serde_json::to_vec(data).map_err(|_| bad())?;
         let mut body = nonce.to_vec();
         body.extend(
             self.cipher
-                .encrypt(
-                    &nonce,
-                    Payload {
-                        msg: &raw,
-                        aad: id.as_bytes(),
-                    },
-                )
+                .encrypt(&nonce, Payload { msg: &raw, aad })
                 .map_err(|_| unavailable())?,
         );
+        Ok(body)
+    }
+    pub fn open(&self, aad: &[u8], bytes: &[u8]) -> Result<Value> {
+        if bytes.len() < 28 {
+            return Err(unavailable());
+        }
+        let plain = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&bytes[..12]),
+                Payload {
+                    msg: &bytes[12..],
+                    aad,
+                },
+            )
+            .map_err(|_| unavailable())?;
+        serde_json::from_slice(&plain).map_err(|_| unavailable())
+    }
+    pub async fn put(&self, id: Uuid, data: &Value) -> Result<()> {
+        let body = self.seal(id.as_bytes(), data)?;
         self.bucket
             .put(&Self::path(id), body.into())
             .await
@@ -70,20 +84,7 @@ impl Storage {
             .bytes()
             .await
             .map_err(|_| unavailable())?;
-        if bytes.len() < 28 {
-            return Err(unavailable());
-        }
-        let plain = self
-            .cipher
-            .decrypt(
-                Nonce::from_slice(&bytes[..12]),
-                Payload {
-                    msg: &bytes[12..],
-                    aad: id.as_bytes(),
-                },
-            )
-            .map_err(|_| unavailable())?;
-        serde_json::from_slice(&plain).map_err(|_| unavailable())
+        self.open(id.as_bytes(), &bytes)
     }
 }
 pub(super) async fn maintain(app: App) {
@@ -95,6 +96,11 @@ pub(super) async fn maintain(app: App) {
     }
 }
 async fn sweep(app: &App) -> Result<()> {
+    if app.standalone.is_some() {
+        sqlx::query("DELETE FROM standalone_sessions WHERE expires_at<=now()")
+            .execute(&app.db)
+            .await?;
+    }
     let expired = sqlx::query("SELECT id,active_run FROM conversations WHERE lease_until<now() AND active_run IS NOT NULL LIMIT 50").fetch_all(&app.db).await?;
     for row in expired {
         runs::finish(

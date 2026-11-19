@@ -23,11 +23,21 @@ fetch(location.pathname, {method:'POST',body:decodeURIComponent(code)}).then(r=>
 document.getElementById('status').textContent = r.ok ? 'Torna al terminale / Return to the terminal' : 'Collegamento fallito / Connection failed';
 });</script>"#;
 
+fn sign_in_url(portal: &str, port: &str, state: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{portal}/app/venticode"))?;
+    url.query_pairs_mut()
+        .append_pair("terminal", "1")
+        .append_pair("port", port)
+        .append_pair("state", state);
+    Ok(url)
+}
+
 pub async fn browser(portal: &str) -> Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let host = listener.local_addr()?.to_string();
-    let path = format!("/{}", Uuid::new_v4());
-    let callback = format!("http://{host}{path}");
+    let state = Uuid::new_v4().to_string();
+    let port = listener.local_addr()?.port().to_string();
+    let path = format!("/{state}");
     let (sender, receiver) = oneshot::channel();
     let sender = Arc::new(Mutex::new(Some(sender)));
     let route = get(|| async { Html(RETURN_PAGE) }).post(
@@ -50,10 +60,7 @@ pub async fn browser(portal: &str) -> Result<String> {
     let app = Router::new()
         .route(&path, route)
         .layer(DefaultBodyLimit::max(8192));
-    let mut url = reqwest::Url::parse(&format!("{portal}/app/venticode"))?;
-    url.query_pairs_mut()
-        .append_pair("terminal", "1")
-        .append_pair("callback", &callback);
+    let url = sign_in_url(portal, &port, &state)?;
     eprintln!(
         "Accedi nel browser / Sign in in your browser:\n{url}\nPortale precedente / Older portal: --manual"
     );
@@ -70,4 +77,20 @@ pub async fn browser(portal: &str) -> Result<String> {
     let _ = stop.send(());
     task.await??;
     Ok(code.context("Login timed out")??)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_encodes_only_loopback_port_and_nonce() {
+        let state = Uuid::new_v4().to_string();
+        let url = sign_in_url("https://portal.example", "49152", &state).unwrap();
+        assert_eq!(url.path(), "/app/venticode");
+        assert_eq!(
+            url.query().unwrap(),
+            format!("terminal=1&port=49152&state={state}")
+        );
+    }
 }

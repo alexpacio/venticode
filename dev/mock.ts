@@ -211,7 +211,12 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!expires || expires < Date.now()) return fail(409, "Ticket scaduto o già usato / Ticket expired or already used");
       return login();
     }
-    if (method === "GET" && path === "/__dev/login") return login();
+    if (method === "GET" && path === "/__dev/login") {
+      const id = body.query.get("conversation");
+      const result = login();
+      if (isUuid(id) && conversations.some(c => c.id === id)) result.headers.Location = "/c/" + id;
+      return result;
+    }
     if (!path.startsWith("/api/v1/venticode/")) return fail(404, "Not found");
     if (!authed) return fail(401, "Sessione assente / No session");
     if (method !== "GET" && headers.origin !== origin) return fail(403, "Origine non consentita / Origin not allowed");

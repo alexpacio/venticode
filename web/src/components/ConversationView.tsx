@@ -7,7 +7,8 @@ import type { Conversation, Harness, PermissionMode } from "../api/client.ts";
 import { useConversation, useHarnesses, useModels, useProjects, useTranscript } from "../queries.ts";
 import { fold, type Transcript } from "../transcript.ts";
 import { t } from "../i18n/index.ts";
-import { TranscriptView } from "./TranscriptView.tsx";
+import { Terminal } from "./Terminal.tsx";
+import { ToolActions } from "./TranscriptView.tsx";
 import { AgentControls } from "./AgentControls.tsx";
 import { Composer } from "./Composer.tsx";
 import type { ReactNode } from "react";
@@ -45,9 +46,8 @@ export function ConversationView({ menu }: { menu: ReactNode }) {
     <>
       <main className="main">
         <Header key={c.id} conversation={c} harness={harness} projectLabel={project ? (project.path === "." ? project.root : `${project.root}/${project.path}`) : ""} menu={menu} running={running} />
-        {transcript.blocks.length === 0
-          ? <div className="empty"><h1>{t("Cosa facciamo in {0}?", project?.name || "")}</h1><p>{t("Venticode esegue gli strumenti su {0}, dentro la cartella del progetto.", harness?.name || "")}</p></div>
-          : <TranscriptView blocks={transcript.blocks} harness={harness?.name || ""} />}
+        <Terminal key={id} project={project} chat={c} blocks={transcript.blocks} />
+        {transcript.blocks.map(block => block.kind === "tool" && <ToolActions key={block.id} block={block} harness={harness?.name || ""} />)}
         <AgentControls key={c.id} c={c} events={events} running={running} send={send} />
         <Composer key={c.id} placeholder={c.question_id ? t("Rispondi alla domanda…") : t("Scrivi un messaggio, /goal obiettivo o /plan richiesta…")} onSend={async (text) => {
           if(c.question_id) await send(text,"answer",c.question_id);

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Venticode API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Browser API of Venticode, the coding and bot agent that runs tools on
     connected ventiharness instances.
@@ -15,6 +15,9 @@ info:
       cookie (HttpOnly, Secure, SameSite=Lax). Mutations require the exact
       Origin of that workspace host. The workspace is always derived from the
       host and the session, never from a request parameter.
+    - A standalone instance serves one configured workspace on its own
+      origin and issues a session through `/venticode/login`. Its runner
+      connects directly to Venticode. Mutations use that exact origin.
 
     Storage (backend): conversation, project, approval and bot metadata live in
     PostgreSQL; transcripts, tool output and diffs live in S3 (encrypted).
@@ -73,6 +76,43 @@ paths:
             Set-Cookie: { schema: { type: string } }
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+  /login:
+    servers:
+      - url: /venticode
+    get:
+      operationId: loginPage
+      tags: [session]
+      summary: Open the standalone sign-in page or the configured Ventic portal
+      responses:
+        '200':
+          description: Standalone sign-in form
+          content:
+            text/html:
+              schema: { type: string }
+        '303':
+          description: Redirect to the application or portal
+    post:
+      operationId: standaloneSignIn
+      tags: [session]
+      summary: Sign in to a standalone workspace (exact standalone Origin required)
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, writeOnly: true }
+      responses:
+        '303':
+          description: Session cookie set and redirect to the workspace
+        '401':
+          description: Invalid access token
+          content:
+            text/html:
+              schema: { type: string }
+        '403': { $ref: '#/components/responses/Error' }
   /session:
     get:
       operationId: getSession
@@ -700,6 +740,7 @@ components:
             name: { type: string }
         role: { type: string, enum: [tenant_admin, reseller_admin, group_manager, member] }
         portal_url: { type: string, format: uri }
+        standalone: { type: boolean, description: Session issued by a standalone Venticode instance }
     Model:
       type: object
       additionalProperties: false
@@ -711,7 +752,7 @@ components:
         tools: { type: boolean, description: Tool calling is available for this model and member }
     HarnessOperation:
       type: string
-      enum: [list_files, find_files, search_files, read_file, write_file, edit_file, mkdir, rename, remove, execute, terminal_start, agent_start, mcp_call_tool, preview]
+      enum: [list_files, find_files, search_files, read_file, write_file, edit_file, mkdir, rename, remove, execute, terminal_start, agent_start, mcp_list_servers, mcp_list_tools, mcp_call_tool, preview]
     Harness:
       type: object
       additionalProperties: false

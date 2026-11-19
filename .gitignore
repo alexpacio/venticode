@@ -9,3 +9,8 @@ data/
 __pycache__/
 
 /tui/target/
+/tui/browser/target/
+/tui/browser/site/pkg/
+/tui/browser/dist/
+
+/web/src/generated/terminal/

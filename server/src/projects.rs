@@ -23,7 +23,7 @@ struct NewProject {
     path: Option<String>,
     name: Option<String>,
 }
-fn relative(path: &str) -> bool {
+pub(super) fn relative(path: &str) -> bool {
     path == "."
         || (path.len() <= 1024
             && !path.contains(['\\', ':', '\0'])

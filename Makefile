@@ -11,6 +11,7 @@ help:
 	  'make build      production build of the web app into web/dist' \
 	  'make test       mock, transcript and translation tests' \
 	  'make check      generate, type check, tests and build' \
+	  'make demo-tui-web  build the WebAssembly TUI demo and serve it on loopback' \
 	  'make check-tui  format, lint and test the Rust terminal client' \
 	  'make build-tui-windows  build the Windows x64 binary with the MSVC toolchain'
 
@@ -47,9 +48,9 @@ check:
 .PHONY: check-service check-connector
 check-service:
 	cargo fmt --all --check
-	cargo clippy --release --locked --all-targets -- -D warnings
-	cargo test --release --locked
-	cargo build --release --locked
+	cargo clippy --workspace --release --locked --all-targets -- -D warnings
+	cargo test --workspace --release --locked
+	cargo build --workspace --release --locked
 
 check-connector:
 	mvn -B -f connector/pom.xml package dependency:copy-dependencies
@@ -57,9 +58,15 @@ check-connector:
 
 .PHONY: check-tui build-tui-windows
 check-tui:
-	cargo fmt --manifest-path tui/Cargo.toml --check
-	cargo clippy --manifest-path tui/Cargo.toml --release --locked --all-targets -- -D warnings
-	cargo test --manifest-path tui/Cargo.toml --release --locked
+	cd tui && cargo fmt --check
+	cd tui && cargo clippy --release --locked --all-targets -- -D warnings
+	cd tui && cargo test --release --locked
 
 build-tui-windows:
-	cargo build --manifest-path tui/Cargo.toml --release --locked --target x86_64-pc-windows-msvc
+	cd tui && cargo build --release --locked --target x86_64-pc-windows-msvc
+
+.PHONY: build-tui-web demo-tui-web
+build-tui-web: build
+
+demo-tui-web: build-tui-web
+	node dev/tui-demo.ts

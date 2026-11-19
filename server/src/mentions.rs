@@ -1,5 +1,5 @@
 use super::*;
-use crate::connections::{creds, digest, host, member, private, provider};
+use crate::connections::{creds, digest, host, member, origin, private, provider};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::postgres::PgRow;
@@ -14,7 +14,16 @@ pub(super) fn routes() -> Router<App> {
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().ok_or_else(bad)
 }
-fn workspace_headers(workspace: Uuid) -> Result<HeaderMap> {
+fn workspace_headers(app: &App, workspace: Uuid) -> Result<HeaderMap> {
+    if let Some(local) = &app.standalone {
+        if workspace != local.workspace {
+            return Err(forbidden());
+        }
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, local.host.parse().map_err(|_| bad())?);
+        h.insert(header::ORIGIN, local.origin.parse().map_err(|_| bad())?);
+        return Ok(h);
+    }
     let base = env::var("VENTICODE_HOST").map_err(|_| unavailable())?;
     let portal = reqwest::Url::parse(&env::var("PORTAL_ORIGIN").map_err(|_| unavailable())?)
         .map_err(|_| unavailable())?;
@@ -185,7 +194,7 @@ pub(super) async fn hook(
     .fetch_one(&app.db)
     .await?;
     let w: Uuid = r.get("workspace");
-    let trusted = workspace_headers(w)?;
+    let trusted = workspace_headers(&app, w)?;
     if host(&h)? != host(&trusted)? {
         return Err(forbidden());
     }
@@ -240,8 +249,8 @@ pub(super) async fn hook(
                 &c,
                 &ev.address,
                 &format!(
-                    "Collega il tuo account / Link your account: https://{}/connections",
-                    host(&trusted)?
+                    "Collega il tuo account / Link your account: {}/connections",
+                    origin(&app, &trusted)?
                 ),
             )
             .await?;
@@ -470,7 +479,7 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
             return Ok(());
         }
     }
-    let mut h = workspace_headers(w)?;
+    let mut h = workspace_headers(app, w)?;
     let content = app.storage.get(r.get("body_object")).await?;
     let grant:Uuid=sqlx::query_scalar("SELECT control_grant FROM external_links WHERE connection_id=$1 AND external_id=$2 AND user_id=$3")
         .bind(conn).bind(field(&content,"author")?).bind(u).fetch_one(&app.db).await?;

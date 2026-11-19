@@ -1,22 +1,27 @@
 [package]
 name = "venticode"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
+
+[workspace]
+members = ["harness", "harness/terminal"]
+exclude = ["tui", "tui/browser"]
+resolver = "3"
 
 [[bin]]
 name = "venticode"
 path = "server/src/main.rs"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "uuid", "json", "migrate", "macros"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
 async-stream = "0.3"
 futures-util = "0.3"
 sha2 = "0.10"

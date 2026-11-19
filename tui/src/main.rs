@@ -1,19 +1,16 @@
 mod client;
+mod editor;
 mod login;
+mod view;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use client::{Remote, origin};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use ratatui::{
-    layout::{Constraint, Layout},
-    style::{Color, Style},
-    widgets::{Block, BorderType, Paragraph, Wrap},
-};
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::io;
+use std::{io, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle};
-use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 const COMMANDS: &[&str] = &[
@@ -91,7 +88,8 @@ struct App {
     project: Value,
     chat: Value,
     model: String,
-    lines: Vec<String>,
+    lines: Vec<view::Message>,
+    compact_tools: bool,
     last_text: String,
     patches: Vec<String>,
     input: String,
@@ -106,22 +104,98 @@ struct App {
     feed: Option<JoinHandle<()>>,
     tx: mpsc::Sender<(String, Result<Value>)>,
 }
+#[derive(Clone, Copy)]
+enum Picker {
+    Models,
+    Projects,
+    Chats,
+}
+impl Picker {
+    fn label(self, app: &App) -> &'static str {
+        match self {
+            Self::Models => app.msg("Scegli modello", "Select model"),
+            Self::Projects if app.projects.is_empty() && app.folder_options().is_empty() => app
+                .msg(
+                    "Collega un harness con una cartella nel portale, poi premi F3.",
+                    "Connect a harness with a folder in the portal, then press F3.",
+                ),
+            Self::Projects if app.projects.is_empty() => app.msg(
+                "Crea il primo progetto: scegli una cartella",
+                "Create your first project: choose a folder",
+            ),
+            Self::Projects => app.msg("Scegli il progetto in cui lavorare", "Choose a project"),
+            Self::Chats => app.msg("Scegli una conversazione", "Choose a conversation"),
+        }
+    }
+}
 impl App {
     fn msg<'a>(&self, it: &'a str, en: &'a str) -> &'a str {
         if self.en { en } else { it }
     }
+    fn folder_options(&self) -> Vec<(&Value, &str)> {
+        self.harnesses
+            .iter()
+            .flat_map(|h| {
+                h["roots"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(move |root| (h, root))
+            })
+            .collect()
+    }
+    async fn choose(&mut self, picker: Picker, index: usize) -> Result<()> {
+        match picker {
+            Picker::Models => {
+                self.command(&format!("/model {}", index + 1)).await?;
+            }
+            Picker::Projects => {
+                let project = if self.projects.is_empty() {
+                    let (h, root) = self.folder_options()[index];
+                    let body = json!({"harness_id":h["id"],"root":root,"path":"."});
+                    let p = self
+                        .remote
+                        .api(Method::POST, "/projects", Some(body))
+                        .await?;
+                    self.projects.push(p.clone());
+                    p
+                } else {
+                    self.projects[index].clone()
+                };
+                self.close();
+                self.project = project;
+                self.welcome();
+            }
+            Picker::Chats if index == 0 => {
+                self.close();
+                self.welcome();
+            }
+            Picker::Chats => {
+                let id = string(&self.project_chats()[index - 1], "id");
+                self.open(&id).await?;
+            }
+        }
+        Ok(())
+    }
     fn path(&self) -> Result<String> {
         Ok(format!(
             "/conversations/{}",
-            self.chat["id"]
-                .as_str()
-                .context("Apri una conversazione / Open a conversation")?
+            self.chat["id"].as_str().context(self.msg(
+                "Premi F2 per scegliere una conversazione, oppure scrivi il primo messaggio.",
+                "Press F2 to choose a conversation, or write your first message."
+            ))?
         ))
     }
     fn note(&mut self, s: impl AsRef<str>) {
+        self.record(view::Role::Notice, s);
+    }
+    fn record(&mut self, role: view::Role, s: impl AsRef<str>) {
         self.last_text.clear();
-        self.lines.push(clean(s.as_ref()));
-        self.scroll = 0;
+        self.lines.push(view::Message {
+            role,
+            text: clean(s.as_ref()),
+        });
     }
     async fn refresh(&mut self) -> Result<()> {
         (self.projects, self.models, self.harnesses) = tokio::try_join!(
@@ -161,6 +235,13 @@ impl App {
             .remote
             .api(Method::GET, &format!("/conversations/{id}"), None)
             .await?;
+        self.activate(c)
+    }
+    fn activate(&mut self, c: Value) -> Result<()> {
+        let id = c["id"]
+            .as_str()
+            .context("Missing conversation ID")?
+            .to_owned();
         self.close();
         self.project = self
             .projects
@@ -175,7 +256,6 @@ impl App {
         self.goal = string(&self.chat, "goal_id");
         let remote = self.remote.clone();
         let tx = self.tx.clone();
-        let id = id.to_owned();
         self.feed = Some(tokio::spawn(async move { remote.follow(id, tx).await }));
         Ok(())
     }
@@ -184,13 +264,22 @@ impl App {
         match e["type"].as_str() {
             Some("text") => {
                 let id = val("message_id");
-                if self.last_text != id || self.lines.is_empty() {
-                    self.lines.push(String::new());
+                if self.last_text != id
+                    || !self
+                        .lines
+                        .last()
+                        .is_some_and(|line| matches!(line.role, view::Role::Assistant))
+                {
+                    self.lines.push(view::Message {
+                        role: view::Role::Assistant,
+                        text: String::new(),
+                    });
                     self.last_text = id
                 }
                 self.lines
                     .last_mut()
                     .unwrap()
+                    .text
                     .push_str(&clean(&val("delta")));
             }
             Some("user_message") => {
@@ -204,7 +293,7 @@ impl App {
                 if e["intent"] == "goal" {
                     self.goal = val("message_id")
                 }
-                self.note(format!("› {}", val("content")));
+                self.record(view::Role::User, val("content"));
             }
             Some("question") => {
                 self.question = val("reference_id");
@@ -237,14 +326,17 @@ impl App {
                 }
                 self.note(format!("✓ {}", val("content")));
             }
-            Some("tool_call") => self.note(format!("→ {} {}", val("operation"), val("target"))),
-            Some("tool_output") => self.note(val("data")),
+            Some("tool_call") => self.record(
+                view::Role::Tool,
+                format!("{} {}", val("operation"), val("target")),
+            ),
+            Some("tool_output") => self.record(view::Role::Output, val("data")),
             Some("tool_result") => {
                 self.note(format!("{} {}", val("status"), val("summary")));
                 if let Some(patch) = e["diff"]["patch"].as_str().filter(|s| !s.is_empty()) {
                     let diff = format!("{}\n{}", string(&e["diff"], "path"), patch);
                     self.patches.push(clean(&diff));
-                    self.note(diff);
+                    self.record(view::Role::Output, diff);
                 }
             }
             Some("approval") => {
@@ -271,12 +363,38 @@ impl App {
                     self.approval.clear()
                 }
             }
-            Some("error") => self.note(val("message")),
+            Some("error") => self.record(view::Role::Error, val("message")),
             _ => {}
         }
     }
+    async fn new_chat(&mut self, title: &str) -> Result<()> {
+        ensure!(
+            !self.project.is_null(),
+            "F3 · Scegli un progetto / Choose a project"
+        );
+        let mut body = json!({"project_id":self.project["id"]});
+        if !self.model.is_empty() {
+            body["model"] = json!(self.model);
+        }
+        if !title.is_empty() {
+            body["title"] = json!(title);
+        }
+        let chat = self
+            .remote
+            .api(Method::POST, "/conversations", Some(body))
+            .await?;
+        self.activate(chat.clone())?;
+        self.chats.insert(0, chat);
+        Ok(())
+    }
+    fn welcome(&mut self) {
+        self.note(self.msg("Scrivi il primo messaggio e premi Invio per iniziare. Premi F2 per riprendere una conversazione.", "Write your first message and press Enter to start. Press F2 to resume a conversation."));
+    }
     async fn send(&mut self, text: &str, intent: &str, reference: Option<&str>) -> Result<()> {
         ensure!(!text.trim().is_empty(), "Messaggio vuoto / Empty message");
+        if self.chat.is_null() && matches!(intent, "message" | "plan" | "goal") {
+            self.new_chat("").await?;
+        }
         let mut req = json!({"content":text});
         if intent != "message" {
             req["intent"] = json!(intent)
@@ -303,7 +421,8 @@ impl App {
         match command {
             "/logout" => {
                 self.remote.api(Method::DELETE, "/session", None).await?;
-                match self.credential.delete_credential() { Ok(()) | Err(keyring::Error::NoEntry) => (), Err(e) => return Err(e.into()) };
+                // The server has already revoked this session, including any cached copy.
+                let _ = self.credential.delete_credential();
                 return Ok(true);
             }
             "/diff" => {
@@ -318,8 +437,8 @@ impl App {
             "/status" => self.note(format!("{} · {} · {} · {}", self.remote.workspace, self.model, string(&self.chat,"permission_mode"), string(&self.chat,"state"))),
             "/quit" | "/exit" => return Ok(true),
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit",
-                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit",
+                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit\nAlt+Invio a capo · Ctrl+L modello · Ctrl+O strumenti · PgSu/PgGiù scorri · Fine segue · Esc interrompe · Ctrl+C esci",
+                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit\nAlt+Enter newline · Ctrl+L model · Ctrl+O tools · PgUp/PgDn scroll · End follow · Esc interrupt · Ctrl+C quit",
             )),
             "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model" if argument.is_empty() => {
                 self.refresh().await?;
@@ -373,16 +492,7 @@ impl App {
                 }
                 self.model = model;
             }
-            "/new" => {
-                ensure!(!self.project.is_null(), "/projects → /use N");
-                let mut payload = json!({"project_id":self.project["id"],"model":self.model});
-                if !argument.is_empty() {
-                    payload["title"] = json!(argument);
-                }
-                let chat = self.remote.api(Method::POST, "/conversations", Some(payload)).await?;
-                self.open(&string(&chat, "id")).await?;
-                self.refresh().await?;
-            }
+            "/new" => self.new_chat(argument).await?,
             "/stop" => {
                 let path = format!("{}/interrupt", self.path()?);
                 self.remote.api(Method::POST, &path, None).await?;
@@ -436,149 +546,326 @@ async fn run_ui(
         .or(app.models.first())
         .map(|v| string(v, "id"))
         .unwrap_or_default();
+    let mut picker = None;
     if let Some(id) = start {
-        app.open(&id).await?
+        app.open(&id).await?;
+    } else if let [project] = app.projects.as_slice() {
+        app.project = project.clone();
+        app.welcome();
     } else {
-        app.note(app.msg(
-            "Scegli un progetto con /use N. Poi /chats o /new titolo.",
-            "Select a project with /use N. Then /chats or /new title.",
-        ));
-        app.note(entries(&app.projects));
+        picker = Some(Picker::Projects);
     }
-    let mut terminal = ratatui::try_init()?;
-    struct Restore;
+    crossterm::terminal::enable_raw_mode()?;
+    struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
-            ratatui::restore();
+            let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+            if self.0 {
+                let _ = crossterm::execute!(
+                    io::stdout(),
+                    crossterm::event::PopKeyboardEnhancementFlags
+                );
+            }
+            let _ = crossterm::execute!(
+                io::stdout(),
+                crossterm::style::ResetColor,
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen
+            );
+            let _ = crossterm::terminal::disable_raw_mode();
         }
     }
-    let _restore = Restore;
+    let mut _restore = Restore(false);
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )?;
+    let mut terminal = ftui::TerminalWriter::new(
+        io::stdout(),
+        ftui::ScreenMode::AltScreen,
+        ftui::UiAnchor::Bottom,
+        ftui::TerminalCapabilities::detect(),
+    );
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+    _restore.0 = enhanced;
     let mut keys = EventStream::new();
     let mut draft_history: Vec<String> = Vec::new();
     let mut hist_index = 0;
     let mut caret = 0;
+    let mut parked_draft = String::new();
+    let mut hide_menu = false;
+    use ftui::widgets::spinner::DOTS;
+    let mut tick = tokio::time::interval(Duration::from_millis(150));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frame = 0;
     let mut selection = 0usize;
     loop {
-        let suggestions: Vec<_> = COMMANDS
-            .iter()
-            .copied()
-            .filter(|cmd| app.input.starts_with('/') && cmd.starts_with(&app.input))
-            .collect();
-        selection = selection.min(suggestions.len().saturating_sub(1));
-        terminal.draw(|f| {
-            let [head, body, input, foot] = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Min(2),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .areas(f.area());
-            let title = clean(&format!(
-                " {}  {}\n {}  {}  {}",
-                string(&app.project, "name"),
-                string(&app.chat, "title"),
-                app.model,
-                string(&app.chat, "permission_mode"),
-                string(&app.chat, "state")
-            ));
-            f.render_widget(
-                Paragraph::new(title)
-                    .block(
-                        Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .title(" >_ Venticode "),
-                    )
-                    .style(Style::new().fg(Color::Cyan)),
-                head,
-            );
-            let text = app.lines.join("\n");
-            let width = usize::from(body.width.max(1));
-            let height = text
-                .split('\n')
-                .map(|s| UnicodeWidthStr::width(s).max(1).div_ceil(width))
-                .sum::<usize>();
-            let offset = height
-                .saturating_sub(body.height as usize)
-                .min(u16::MAX as usize) as u16;
-            f.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .scroll((offset.saturating_sub(app.scroll), 0)),
-                body,
-            );
-            let hints = suggestions
+        let options = match picker {
+            Some(Picker::Models) => app
+                .models
                 .iter()
-                .enumerate()
-                .skip(selection.saturating_sub(1))
-                .take(5)
-                .map(|(i, cmd)| {
-                    if i == selection {
-                        format!("› {cmd}")
-                    } else {
-                        cmd.to_string()
-                    }
+                .map(|m| clean(m["name"].as_str().or(m["id"].as_str()).unwrap_or("?")))
+                .collect(),
+            Some(Picker::Projects) if app.projects.is_empty() => app
+                .folder_options()
+                .iter()
+                .map(|(h, root)| clean(&format!("{} · {}", string(h, "name"), root)))
+                .collect(),
+            Some(Picker::Projects) => app
+                .projects
+                .iter()
+                .map(|p| {
+                    clean(&format!(
+                        "{} · {}/{}",
+                        string(p, "name"),
+                        string(p, "root"),
+                        string(p, "path")
+                    ))
                 })
-                .collect::<Vec<_>>()
-                .join("   ");
-            let status = if !suggestions.is_empty() && app.status.is_empty() {
-                &hints
-            } else if app.status.is_empty() {
-                app.msg(
-                    "Invio invia · Esc interrompe · PgSu/PgGiù scorri · /help",
-                    "Enter send · Esc interrupt · PgUp/PgDn scroll · /help",
-                )
-            } else {
-                &app.status
-            };
-            f.render_widget(
-                Paragraph::new(clean(status)).style(Style::new().fg(Color::Yellow)),
-                foot,
-            );
-            let title = if app.question.is_empty() {
-                app.msg("Messaggio", "Message")
-            } else {
-                app.msg("Risposta", "Answer")
-            };
-            let pos = UnicodeWidthStr::width(&app.input[..caret]);
-            let avail = usize::from(input.width.saturating_sub(3));
-            let left = pos.saturating_sub(avail).min(u16::MAX as usize) as u16;
-            f.render_widget(
-                Paragraph::new(app.input.as_str()).scroll((0, left)).block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(format!(" › {title} ")),
-                ),
-                input,
-            );
-            f.set_cursor_position((
-                input.x.saturating_add(1 + pos.min(avail) as u16),
-                input.y + 1,
-            ));
-        })?;
-        tokio::select! {
-            Some((id,v))=rx.recv()=>{if app.chat["id"]==id{match v{Ok(e)=>app.event(e),Err(e)=>app.status=e.to_string()}}},
-            item=keys.next()=>{let Some(ev)=item else{break};if let Event::Key(k)=ev?{
-                if k.kind==KeyEventKind::Release{continue}
-                match k.code {
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL)=>break,
-                    KeyCode::Esc=>{if let Err(e)=app.command("/stop").await{app.status=e.to_string()}},
-                    KeyCode::Up if !suggestions.is_empty()=> selection=selection.saturating_sub(1),
-                    KeyCode::Down if !suggestions.is_empty()=> selection=(selection+1).min(suggestions.len()-1),
-                    KeyCode::Tab if !suggestions.is_empty()=>{app.input=format!("{} ",suggestions[selection]);caret=app.input.len();selection=0;},
-                    KeyCode::PageUp=>app.scroll=app.scroll.saturating_add(12),KeyCode::PageDown=>app.scroll=app.scroll.saturating_sub(12),
-                    KeyCode::Up=>{if hist_index>0{hist_index-=1;app.input=draft_history[hist_index].clone();caret=app.input.len();}},
-                    KeyCode::Down=>{hist_index=(hist_index+1).min(draft_history.len());app.input=draft_history.get(hist_index).cloned().unwrap_or_default();caret=app.input.len();},
-                    KeyCode::Left=>caret=app.input[..caret].char_indices().next_back().map_or(0,|(pos,_)|pos),
-                    KeyCode::Right=>caret+=app.input[caret..].chars().next().map_or(0,char::len_utf8),
-                    KeyCode::Home=>caret=0,KeyCode::End=>caret=app.input.len(),
-                    KeyCode::Delete if caret<app.input.len()=>{app.input.remove(caret);},
-                    KeyCode::Backspace if caret>0=>{let prev=app.input[..caret].char_indices().next_back().unwrap().0;app.input.drain(prev..caret);caret=prev;},
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL)=>{app.input.insert(caret,c);caret+=c.len_utf8();},
-                    KeyCode::Enter=>{let line=suggestions.get(selection).copied().unwrap_or(app.input.trim()).to_owned();if line.is_empty(){continue}app.status.clear();
-                        match app.command(&line).await{Ok(quit)=>{if quit{break}draft_history.push(line);hist_index=draft_history.len();app.input.clear();caret=0},Err(e)=>app.status=e.to_string()}
-                    },_=>{}
+                .collect(),
+            Some(Picker::Chats) => std::iter::once(
+                app.msg("Nuova conversazione", "New conversation")
+                    .to_owned(),
+            )
+            .chain(
+                app.project_chats()
+                    .iter()
+                    .map(|c| clean(&string(c, "title"))),
+            )
+            .collect(),
+            None => Vec::new(),
+        };
+        let suggestions: Vec<_> = if picker.is_some() {
+            options.iter().map(String::as_str).collect()
+        } else {
+            COMMANDS
+                .iter()
+                .copied()
+                .filter(|cmd| {
+                    !hide_menu && app.input.starts_with('/') && cmd.starts_with(&app.input)
+                })
+                .collect()
+        };
+        selection = selection.min(suggestions.len().saturating_sub(1));
+        let working = app.chat["state"] == "running" && app.feed.is_some();
+        let size = crossterm::terminal::size()?;
+        if (terminal.width(), terminal.height()) != size {
+            terminal.set_size(size.0, size.1);
+        }
+        let width = usize::from(size.0.saturating_sub(2)).max(1);
+        let buffer = terminal.take_render_buffer(size.0, size.1);
+        let mut screen = ftui::Frame::from_buffer(buffer, terminal.pool_mut());
+        let picker_label = picker.map(|p| p.label(&app));
+        view::draw(
+            &mut screen,
+            &mut app,
+            caret,
+            &suggestions,
+            selection,
+            working.then_some(DOTS[frame]),
+            picker_label,
+        );
+        let (buffer, cursor) = (screen.buffer, screen.cursor_position);
+        terminal.present_ui_owned(buffer, cursor, cursor.is_some())?;
+        if terminal.pool().len() > usize::from(size.0) * usize::from(size.1) {
+            terminal.gc(None);
+        }
+        let ev = tokio::select! {
+            _ = tick.tick(), if working => { frame = (frame + 1) % DOTS.len(); continue; }
+            Some((id,event)) = rx.recv() => {
+                if app.chat["id"] == id {
+                    match event {
+                        Ok(event) => app.event(event),
+                        Err(error) => { app.feed.take(); app.status = error.to_string(); }
+                    }
                 }
-            }}
+                continue;
+            }
+            item = keys.next() => { let Some(event) = item else {break}; event? }
+        };
+        if let Event::Paste(paste) = ev {
+            if picker.is_some() {
+                continue;
+            }
+            let text =
+                clean(&paste.replace("\r\n", "\n").replace('\r', "\n")).replace('\t', "    ");
+            app.input.insert_str(caret, &text);
+            caret += text.len();
+            hide_menu = false;
+        } else if let Event::Key(k) = ev {
+            if k.kind == KeyEventKind::Release {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::F(2) | KeyCode::F(3) => match app.refresh().await {
+                    Ok(()) => {
+                        picker = Some(if k.code == KeyCode::F(3) || app.project.is_null() {
+                            Picker::Projects
+                        } else {
+                            Picker::Chats
+                        });
+                        selection = 0;
+                        app.status.clear();
+                    }
+                    Err(error) => app.status = error.to_string(),
+                },
+                KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !app.models.is_empty() {
+                        picker = Some(Picker::Models);
+                        selection = app
+                            .models
+                            .iter()
+                            .position(|m| m["id"] == app.model)
+                            .unwrap_or(0);
+                    }
+                }
+                KeyCode::Esc if picker.is_some() => {
+                    picker = None;
+                    selection = 0;
+                }
+                KeyCode::Enter if let Some(menu) = picker => {
+                    if options.is_empty() {
+                        continue;
+                    }
+                    match app.choose(menu, selection).await {
+                        Ok(()) => {
+                            picker = None;
+                            selection = 0;
+                            app.status.clear();
+                        }
+                        Err(error) => app.status = error.to_string(),
+                    }
+                }
+                _ if picker.is_some() && !matches!(k.code, KeyCode::Up | KeyCode::Down) => {}
+                KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.compact_tools = !app.compact_tools
+                }
+                KeyCode::Esc if !suggestions.is_empty() => hide_menu = true,
+                KeyCode::Esc if !app.chat.is_null() => {
+                    if let Err(e) = app.command("/stop").await {
+                        app.status = e.to_string()
+                    }
+                }
+                KeyCode::Up if !suggestions.is_empty() => selection = selection.saturating_sub(1),
+                KeyCode::Down if !suggestions.is_empty() => {
+                    selection = (selection + 1).min(suggestions.len() - 1)
+                }
+                KeyCode::Tab if !suggestions.is_empty() => {
+                    app.input = format!("{} ", suggestions[selection]);
+                    caret = app.input.len();
+                    selection = 0;
+                }
+                KeyCode::PageUp => app.scroll = app.scroll.saturating_add(12),
+                KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(12),
+                KeyCode::Up | KeyCode::Down
+                    if let Some(next) =
+                        editor::vertical(&app.input, caret, width, k.code == KeyCode::Down) =>
+                {
+                    caret = next;
+                }
+                KeyCode::Up => {
+                    if hist_index > 0 {
+                        if hist_index == draft_history.len() {
+                            parked_draft = app.input.clone();
+                        }
+                        hist_index -= 1;
+                        app.input = draft_history[hist_index].clone();
+                        caret = app.input.len();
+                    }
+                }
+                KeyCode::Down if hist_index < draft_history.len() => {
+                    hist_index = (hist_index + 1).min(draft_history.len());
+                    app.input = draft_history
+                        .get(hist_index)
+                        .cloned()
+                        .unwrap_or_else(|| parked_draft.clone());
+                    caret = app.input.len();
+                }
+                KeyCode::Left => {
+                    caret = app.input[..caret]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .map_or(0, |(pos, _)| pos)
+                }
+                KeyCode::Right => {
+                    caret += app.input[caret..]
+                        .graphemes(true)
+                        .next()
+                        .map_or(0, str::len)
+                }
+                KeyCode::Home => caret = app.input[..caret].rfind('\n').map_or(0, |n| n + 1),
+                KeyCode::End if app.scroll > 0 => app.scroll = 0,
+                KeyCode::End => {
+                    caret += app.input[caret..]
+                        .find('\n')
+                        .unwrap_or(app.input.len() - caret)
+                }
+                KeyCode::Delete if caret < app.input.len() => {
+                    let n = app.input[caret..].graphemes(true).next().unwrap().len();
+                    app.input.drain(caret..caret + n);
+                    hide_menu = false;
+                }
+                KeyCode::Backspace if caret > 0 => {
+                    let prev = app.input[..caret]
+                        .grapheme_indices(true)
+                        .next_back()
+                        .unwrap()
+                        .0;
+                    app.input.drain(prev..caret);
+                    caret = prev;
+                    hide_menu = false;
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    hide_menu = false;
+                    selection = 0;
+                    app.input.insert(caret, c);
+                    caret += c.len_utf8();
+                }
+                KeyCode::Enter
+                    if k.modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    app.input.insert(caret, '\n');
+                    caret += 1;
+                }
+                KeyCode::Enter => {
+                    let line = suggestions
+                        .get(selection)
+                        .copied()
+                        .unwrap_or(app.input.trim())
+                        .to_owned();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    app.status.clear();
+                    match app.command(&line).await {
+                        Ok(quit) => {
+                            if quit {
+                                break;
+                            }
+                            draft_history.push(line);
+                            hist_index = draft_history.len();
+                            app.input.clear();
+                            parked_draft.clear();
+                            app.scroll = 0;
+                            hide_menu = false;
+                            caret = 0
+                        }
+                        Err(e) => app.status = e.to_string(),
+                    }
+                }
+                _ => {}
+            }
         }
     }
     app.close();
@@ -589,6 +876,7 @@ async fn run_ui(
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut portal = None;
+    let mut standalone = None;
     let mut start = None;
     let mut stdin = false;
     let mut browser = true;
@@ -598,6 +886,11 @@ async fn main() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--portal" => portal = Some(args.next().context("--portal URL")?),
+            "--standalone" => {
+                standalone = Some(client::standalone_origin(
+                    &args.next().context("--standalone URL")?,
+                )?)
+            }
             "--conversation" => start = Some(args.next().context("--conversation UUID")?),
             "--ticket-stdin" => stdin = true,
             "--no-browser" => {
@@ -611,12 +904,21 @@ async fn main() -> Result<()> {
                 println!(
                     "venticode-tui --portal https://portal.example.org [--conversation UUID] [--en] [--manual] [--ca PEM] [--no-browser] [--ticket-stdin]"
                 );
+                println!(
+                    "venticode-tui --standalone https://code.example.org [--conversation UUID] [--en] [--ca PEM]"
+                );
                 return Ok(());
             }
             _ => return Err(anyhow!("Unknown option: {arg}")),
         }
     }
-    let portal = match portal {
+    if standalone.is_some() && (portal.is_some() || stdin || manual) {
+        return Err(anyhow!(
+            "--standalone uses an access token and cannot be combined with the portal sign-in options"
+        ));
+    }
+    let portal = match portal.or_else(|| standalone.clone()) {
+        Some(value) if standalone.is_some() => value,
         Some(value) => origin(&value)?,
         None => {
             eprintln!(
@@ -632,13 +934,19 @@ async fn main() -> Result<()> {
             origin(value.trim())?
         }
     };
-    let http = Remote::http(ca.as_deref())?;
-    let credential = keyring::Entry::new("venticode-tui", &portal)?;
+    let credential = keyring::Entry::new(
+        if standalone.is_some() {
+            "venticode-tui-standalone"
+        } else {
+            "venticode-tui"
+        },
+        &portal,
+    )?;
     let mut session = None;
     if !stdin {
         match credential.get_password() {
             Ok(saved) => {
-                let remote = Remote::restore(http.clone(), &saved)?;
+                let remote = Remote::restore(ca.as_deref(), &saved)?;
                 if remote.valid().await? {
                     session = Some(remote);
                 } else {
@@ -652,7 +960,13 @@ async fn main() -> Result<()> {
     let remote = if let Some(remote) = session {
         remote
     } else {
-        let code = if stdin {
+        let code = if standalone.is_some() {
+            rpassword::prompt_password(if en {
+                "Venticode access token: "
+            } else {
+                "Token di accesso Venticode: "
+            })?
+        } else if stdin {
             let mut line = String::new();
             io::stdin().read_line(&mut line)?;
             line
@@ -670,7 +984,11 @@ async fn main() -> Result<()> {
         } else {
             login::browser(&portal).await?
         };
-        let remote = Remote::connect(http, &portal, code.trim()).await?;
+        let remote = if standalone.is_some() {
+            Remote::connect_standalone(ca.as_deref(), &portal, code.trim()).await?
+        } else {
+            Remote::connect(ca.as_deref(), &portal, code.trim()).await?
+        };
         if let Err(e) = credential.set_password(&remote.saved()?) {
             eprintln!("Sessione solo in memoria / Session available for this launch only: {e}");
         }
@@ -690,6 +1008,7 @@ async fn main() -> Result<()> {
             chat: Value::Null,
             model: String::new(),
             lines: vec![],
+            compact_tools: true,
             last_text: String::new(),
             patches: Vec::new(),
             input: String::new(),

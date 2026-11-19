@@ -6,6 +6,7 @@ import { api } from "../api/client.ts";
 import type { Harness, Project, Session } from "../api/client.ts";
 import { useBots, useConversations, useHarnesses, useProjects } from "../queries.ts";
 import { setLanguage, t, useLanguage } from "../i18n/index.ts";
+import venticMark from "../design/assets/ventic-icon.svg";
 import { relative } from "./format.ts";
 
 export function Sidebar({ session, onNavigate }: { session: Session; onNavigate: () => void }) {
@@ -22,13 +23,18 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
 
   const signOut = async () => {
     const result = await api<{ redirect_url: string }>("/session", "DELETE");
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: "venticode:signed-out" }, new URL(session.portal_url).origin);
+      window.location.replace("/");
+      return;
+    }
     location.assign(result.redirect_url);
   };
 
   return (
     <nav className="sidebar" aria-label={t("Inventario harness")}>
       <div className="brand">
-        <div className="brand-mark" aria-hidden="true">&gt;_</div>
+        <img className="brand-logo" src={venticMark} alt="" />
         <div className="brand-name">
           <strong>Venticode</strong>
           <span>{session.workspace.name}</span>

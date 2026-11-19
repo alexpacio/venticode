@@ -38,6 +38,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Open the standalone sign-in page or the configured Ventic portal */
+        get: operations["loginPage"];
+        put?: never;
+        /** Sign in to a standalone workspace (exact standalone Origin required) */
+        post: operations["standaloneSignIn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/session": {
         parameters: {
             query?: never;
@@ -477,6 +495,8 @@ export interface components {
             role: "tenant_admin" | "reseller_admin" | "group_manager" | "member";
             /** Format: uri */
             portal_url: string;
+            /** @description Session issued by a standalone Venticode instance */
+            standalone?: boolean;
         };
         Model: {
             id: string;
@@ -486,7 +506,7 @@ export interface components {
             tools?: boolean;
         };
         /** @enum {string} */
-        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_call_tool" | "preview";
+        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview";
         Harness: {
             /** Format: uuid */
             id: string;
@@ -837,6 +857,67 @@ export interface operations {
             };
             403: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    loginPage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Standalone sign-in form */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Redirect to the application or portal */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    standaloneSignIn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": {
+                    token: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Session cookie set and redirect to the workspace */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid access token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            403: components["responses"]["Error"];
         };
     };
     getSession: {

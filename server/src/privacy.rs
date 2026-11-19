@@ -18,7 +18,10 @@ pub(super) async fn handle(
         .filter(|v| v.len() >= 32)
         .ok_or_else(forbidden)?;
     if !bool::from(
-        app.control_hash
+        app.ventic
+            .as_ref()
+            .ok_or_else(forbidden)?
+            .control_hash
             .as_slice()
             .ct_eq(&Sha256::digest(token.as_bytes())),
     ) {

@@ -1,10 +1,13 @@
 mod agent;
 mod connections;
 mod history;
+mod inference;
 mod mentions;
 mod privacy;
 mod projects;
+mod runner;
 mod runs;
+mod standalone;
 mod storage;
 mod tools;
 
@@ -27,12 +30,18 @@ use uuid::Uuid;
 struct App {
     db: PgPool,
     http: reqwest::Client,
-    control: String,
     storage: Arc<storage::Storage>,
+    ventic: Option<Arc<Ventic>>,
+    standalone: Option<Arc<standalone::Standalone>>,
+}
+
+struct Ventic {
+    control: String,
     service_token: String,
     control_hash: Vec<u8>,
 }
 type Result<T> = std::result::Result<T, Error>;
+#[derive(Debug)]
 struct Error(StatusCode, String);
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -82,10 +91,11 @@ impl App {
         h: &HeaderMap,
         method: Method,
         path: &str,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder> {
+        let ventic = self.ventic.as_ref().ok_or_else(missing)?;
         let mut req = self.http.request(
             method,
-            format!("{}/internal/venticode/{path}", self.control),
+            format!("{}/internal/venticode/{path}", ventic.control),
         );
         for name in [
             header::HOST,
@@ -97,11 +107,14 @@ impl App {
                 req = req.header(name, v);
             }
         }
-        req.header("x-service-token", &self.service_token)
+        Ok(req.header("x-service-token", &ventic.service_token))
     }
     async fn control_json(&self, h: &HeaderMap, path: &str) -> Result<Value> {
+        if let Some(local) = &self.standalone {
+            return local.json(self, h, path).await;
+        }
         let res = self
-            .control_request(h, Method::GET, path)
+            .control_request(h, Method::GET, path)?
             .send()
             .await
             .map_err(|_| unavailable())?;
@@ -127,7 +140,9 @@ struct Member {
 }
 impl Member {
     async fn load(app: &App, h: &HeaderMap, write: bool) -> Result<Self> {
-        if write {
+        if let Some(local) = &app.standalone {
+            local.validate_host(h, write)?;
+        } else if write {
             let host = h
                 .get(header::HOST)
                 .and_then(|v| v.to_str().ok())
@@ -174,8 +189,17 @@ async fn proxy(
     body: Bytes,
 ) -> Result<Response> {
     let path = uri.path().rsplit('/').next().ok_or_else(missing)?;
+    if let Some(local) = &app.standalone {
+        return match (method, path) {
+            (Method::DELETE, "session") => local.sign_out(&app, &h).await,
+            (Method::GET, "session" | "models" | "harnesses") => {
+                Ok(Json(local.json(&app, &h, path).await?).into_response())
+            }
+            _ => Err(missing()),
+        };
+    }
     let upstream = app
-        .control_request(&h, method, path)
+        .control_request(&h, method, path)?
         .body(body)
         .send()
         .await
@@ -192,6 +216,18 @@ async fn proxy(
 }
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (ventic, standalone) = match env::var("VENTICODE_MODE").as_deref() {
+        Ok("standalone") => (None, Some(Arc::new(standalone::Standalone::from_env()?))),
+        Ok("ventic") | Err(env::VarError::NotPresent) => (
+            Some(Arc::new(Ventic {
+                control: env::var("CONTROL_URL")?,
+                service_token: env::var("VENTICODE_SERVICE_TOKEN")?,
+                control_hash: hex::decode(env::var("CONTROL_SERVICE_TOKEN_HASH")?)?,
+            })),
+            None,
+        ),
+        _ => return Err("Set VENTICODE_MODE to standalone or ventic".into()),
+    };
     let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
     sqlx::migrate!("./server/migrations").run(&db).await?;
     let app = App {
@@ -199,36 +235,63 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-        control: env::var("CONTROL_URL")?,
-        service_token: env::var("VENTICODE_SERVICE_TOKEN")?,
-        control_hash: hex::decode(env::var("CONTROL_SERVICE_TOKEN_HASH")?)?,
+        ventic,
+        standalone,
         storage: Arc::new(storage::Storage::new()?),
     };
+    if let Some(local) = &app.standalone {
+        local
+            .runner
+            .load_inventory(&app.db, local.workspace)
+            .await?;
+    }
     let api = Router::new()
         .route("/session", get(proxy).delete(proxy))
         .route("/models", get(proxy))
         .route("/harnesses", get(proxy))
         .merge(projects::routes())
-        .merge(connections::routes())
-        .merge(mentions::routes())
         .route("/approvals/{id}", post(tools::decide))
         .route(
             "/conversations/{id}/sessions/{call}/input",
             post(tools::input),
         )
         .merge(runs::routes())
+        .merge(connections::routes())
+        .merge(mentions::routes())
         .fallback(|| async { missing() });
     let assets = env::var("WEB_ROOT").unwrap_or_else(|_| "web/dist".into());
-    let router = Router::new()
-        .route("/internal/privacy/{action}", post(privacy::handle))
+    let frame_ancestor = app
+        .ventic
+        .as_ref()
+        .and_then(|_| env::var("PORTAL_ORIGIN").ok())
+        .and_then(|origin| reqwest::Url::parse(&origin).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "'none'".into());
+    let frame_policy = header::HeaderValue::from_str(&format!("frame-ancestors {frame_ancestor}"))?;
+    let router = if app.ventic.is_some() {
+        Router::new()
+            .route("/internal/privacy/{action}", post(privacy::handle))
+            .route("/venticode/bootstrap", post(proxy))
+    } else {
+        Router::new().route("/internal/harness/ws", get(runner::upgrade))
+    };
+    let router = router
+        .route("/healthz", get(|| async { "ok" }))
         .route("/hooks/{kind}/{id}", post(mentions::hook))
         .route("/oauth/slack", get(connections::callback))
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/venticode/bootstrap", post(proxy))
+        .route(
+            "/venticode/login",
+            get(standalone::form).post(standalone::login),
+        )
         .nest("/api/v1/venticode", api)
         .fallback_service(
             ServeDir::new(&assets).fallback(ServeFile::new(format!("{assets}/index.html"))),
         )
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            frame_policy,
+        ))
         .layer(axum::middleware::map_response(
             |mut res: Response| async move {
                 res.headers_mut()

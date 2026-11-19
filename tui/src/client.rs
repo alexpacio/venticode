@@ -13,9 +13,20 @@ pub struct Remote {
 }
 
 pub fn origin(input: &str) -> Result<String> {
+    validate_origin(input, false)
+}
+
+pub fn standalone_origin(input: &str) -> Result<String> {
+    validate_origin(input, true)
+}
+
+fn validate_origin(input: &str, allow_loopback: bool) -> Result<String> {
     let url = Url::parse(input)?;
+    let local = allow_loopback
+        && url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     ensure!(
-        url.scheme() == "https"
+        (url.scheme() == "https" || local)
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
@@ -28,10 +39,20 @@ pub fn origin(input: &str) -> Result<String> {
 }
 
 impl Remote {
-    pub fn http(ca: Option<&std::path::Path>) -> Result<Client> {
+    fn http(ca: Option<&std::path::Path>, workspace: &str) -> Result<Client> {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10));
+        let url = Url::parse(workspace)?;
+        if let Some(host) = url
+            .host_str()
+            .filter(|host| *host == "localhost" || host.ends_with(".localhost"))
+        {
+            builder = builder.no_proxy().resolve(
+                host,
+                ([127, 0, 0, 1], url.port_or_known_default().unwrap_or(443)).into(),
+            );
+        }
         if let Some(path) = ca {
             builder = builder
                 .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(path)?)?);
@@ -41,9 +62,10 @@ impl Remote {
     pub fn saved(&self) -> Result<String> {
         Ok(serde_json::json!({"url": self.workspace, "cookie":self.cookie.to_str()?}).to_string())
     }
-    pub fn restore(client: Client, saved: &str) -> Result<Self> {
+    pub fn restore(ca: Option<&std::path::Path>, saved: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(saved)?;
-        let workspace = origin(value["url"].as_str().context("Missing workspace")?)?;
+        let workspace = standalone_origin(value["url"].as_str().context("Missing workspace")?)?;
+        let client = Self::http(ca, &workspace)?;
         let mut cookie =
             header::HeaderValue::from_str(value["cookie"].as_str().context("Missing cookie")?)?;
         cookie.set_sensitive(true);
@@ -65,9 +87,28 @@ impl Remote {
         res.error_for_status()?;
         Ok(true)
     }
-    pub async fn connect(client: Client, portal: &str, code: &str) -> Result<Self> {
+
+    pub async fn connect_standalone(
+        ca: Option<&std::path::Path>,
+        address: &str,
+        token: &str,
+    ) -> Result<Self> {
+        let workspace = standalone_origin(address)?;
+        let client = Self::http(ca, &workspace)?;
+        let result = client
+            .post(format!("{workspace}/venticode/login"))
+            .timeout(Duration::from_secs(30))
+            .header(header::ORIGIN, &workspace)
+            .form(&[("token", token)])
+            .send()
+            .await?;
+        Self::authenticated(client, workspace, result)
+    }
+
+    pub async fn connect(ca: Option<&std::path::Path>, portal: &str, code: &str) -> Result<Self> {
         let link: Value = serde_json::from_str(code).context("Invalid one-time code")?;
         let workspace = origin(link["url"].as_str().context("Missing workspace")?)?;
+        let client = Self::http(ca, &workspace)?;
         let ticket = link["ticket"].as_str().context("Missing ticket")?;
         let result = client
             .post(format!("{workspace}/venticode/bootstrap"))
@@ -76,6 +117,10 @@ impl Remote {
             .form(&[("ticket", ticket)])
             .send()
             .await?;
+        Self::authenticated(client, workspace, result)
+    }
+
+    fn authenticated(client: Client, workspace: String, result: reqwest::Response) -> Result<Self> {
         ensure!(
             result.status() == 303,
             "Sign-in failed ({})",

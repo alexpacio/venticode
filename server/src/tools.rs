@@ -12,11 +12,18 @@ const ACTION: &[&str] = &[
     "mcp_call_tool",
     "preview",
 ];
-pub(super) fn definitions(mode: &str, bot: Option<&Value>) -> Value {
+const LOCAL_MCP: &[&str] = &["mcp_list_servers", "mcp_list_tools"];
+
+pub(super) fn is_project_operation(op: &str) -> bool {
+    READ.contains(&op) || EDIT.contains(&op) || ACTION.contains(&op) || LOCAL_MCP.contains(&op)
+}
+
+pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> Value {
     let operations: Vec<_> = READ
         .iter()
         .chain(EDIT)
         .chain(ACTION)
+        .chain(LOCAL_MCP.iter().filter(|_| standalone))
         .copied()
         .filter(|op| policy(mode, false, op, bot).is_ok_and(|decision| decision != "deny"))
         .collect();
@@ -35,6 +42,9 @@ pub(super) fn definitions(mode: &str, bot: Option<&Value>) -> Value {
             guidance.push_str(
                 " execute takes command as a string and an optional working-directory path.",
             );
+        }
+        if operations.contains(&"mcp_list_servers") {
+            guidance.push_str(" mcp_list_servers returns server ids and revisions. mcp_list_tools uses server_id and revision. mcp_call_tool also takes tool and parameters.");
         }
         functions.push(json!({"type":"function","function":{"name":"project_tool",
             "description":guidance,
@@ -118,11 +128,11 @@ fn project_arguments(name: &str, body: Value) -> Result<Value> {
     Ok(json!({"operation":op,"arguments":args}))
 }
 fn policy(mode: &str, yolo: bool, op: &str, bot: Option<&Value>) -> Result<&'static str> {
-    let category = if READ.contains(&op) {
+    let category = if READ.contains(&op) || op == "mcp_list_servers" {
         "read"
     } else if EDIT.contains(&op) {
         "write"
-    } else if op == "mcp_call_tool" {
+    } else if matches!(op, "mcp_call_tool" | "mcp_list_tools") {
         "mcp"
     } else if ACTION.contains(&op) {
         "execute"
@@ -202,8 +212,16 @@ pub(super) async fn decide(
     Ok(Json(json!({"state":state})))
 }
 async fn relay(app: &App, h: &HeaderMap, body: Value) -> Result<Value> {
+    if let Some(local) = &app.standalone {
+        let session = if body["action"] == "cancel" {
+            local.session_hash(h)?
+        } else {
+            local.authorize(app, h).await?
+        };
+        return local.runner.action(session, &body);
+    }
     let r = app
-        .control_request(h, Method::POST, "tool")
+        .control_request(h, Method::POST, "tool")?
         .json(&body)
         .send()
         .await
@@ -296,6 +314,9 @@ pub(super) async fn call(
     }
     let body = project_arguments(name, body)?;
     let op = body["operation"].as_str().ok_or_else(bad)?;
+    if LOCAL_MCP.contains(&op) && app.standalone.is_none() {
+        return Err(bad());
+    }
     let args = &body["arguments"];
     if !args.is_object() {
         return Err(bad());
@@ -468,7 +489,7 @@ pub(super) async fn call(
             let (status, summary) = if requires_upgrade {
                 (
                     "error",
-                    "Aggiorna e riavvia ventiharness per usare gli strumenti di progetto / Update and restart ventiharness to use project tools",
+                    "Aggiorna e riavvia venticode-harness per usare gli strumenti di progetto / Update and restart venticode-harness to use project tools",
                 )
             } else if !done {
                 (
@@ -507,13 +528,13 @@ mod tests {
     use super::*;
     #[test]
     fn schemas_only_offer_available_operations() {
-        let plan = definitions("plan", None);
+        let plan = definitions("plan", None, false);
         let operations = |schema: &Value| {
             schema[0]["function"]["parameters"]["properties"]["operation"]["enum"].clone()
         };
         assert_eq!(operations(&plan), json!(READ));
         let bot = json!({"tools":{"write":"review","execute":"review"}});
-        let available = operations(&definitions("ask", Some(&bot)));
+        let available = operations(&definitions("ask", Some(&bot), false));
         let available = available.as_array().unwrap();
         assert!(available.contains(&json!("write_file")));
         for excluded in [
@@ -524,7 +545,7 @@ mod tests {
         ] {
             assert!(!available.contains(&json!(excluded)));
         }
-        let tasks_only = definitions("plan", Some(&bot));
+        let tasks_only = definitions("plan", Some(&bot), false);
         assert_eq!(tasks_only.as_array().unwrap().len(), 1);
         assert_eq!(tasks_only[0]["function"]["name"], "update_tasks");
     }

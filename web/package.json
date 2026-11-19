@@ -1,13 +1,17 @@
 {
   "name": "@venticode/web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite --strictPort --host 127.0.0.1",
     "generate": "openapi-typescript ../api/openapi.yaml -o src/api/schema.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit && vite build"
+    "build": "npm run build:bundle",
+    "predev": "sh build-terminal.sh",
+    "prebuild": "sh build-terminal.sh",
+    "pretypecheck": "sh build-terminal.sh",
+    "build:bundle": "tsc --noEmit && vite build"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.0",
