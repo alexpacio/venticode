@@ -1,0 +1,129 @@
+name: Build Venticode
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Check and build the web app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install WebAssembly build tools
+        working-directory: tui/browser
+        run: |
+          rustup show active-toolchain
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: make setup
+      - run: make check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: venticode-web
+          path: web/dist/
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: web
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: macos-15-intel
+            platform: macos-x64
+          - runner: macos-15
+            platform: macos-arm64
+          - runner: windows-2025
+            platform: windows-x64
+    env:
+      PACKAGE: venticode-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build service and runner
+        run: cargo build --workspace --release --locked
+      - name: Build terminal client
+        working-directory: tui
+        run: cargo build --release --locked
+      - uses: actions/download-artifact@v8
+        with:
+          name: venticode-web
+          path: bundle/web/dist
+      - name: Package Linux and macOS
+        if: runner.os != 'Windows'
+        run: |
+          cp target/release/venticode target/release/venticode-harness tui/target/release/venticode-tui README.md bundle/
+          mkdir -p packages
+          tar -czf "packages/$PACKAGE.tar.gz" -C bundle .
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item target/release/venticode.exe, target/release/venticode-harness.exe, tui/target/release/venticode-tui.exe, README.md -Destination bundle/
+          New-Item -ItemType Directory -Path packages
+          Compress-Archive -Path bundle/* -DestinationPath "packages/$env:PACKAGE.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: packages/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: venticode-*-*
+          path: packages
+      - name: Publish archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          archives=(packages/*/*.tar.gz packages/*/*.zip)
+          if (( ${#archives[@]} != 4 )); then
+            echo 'Expected one archive for each of the four platforms' >&2
+            exit 1
+          fi
+          mkdir release
+          for archive in "${archives[@]}"; do
+            cp "$archive" release/
+          done
+          cd release
+          sha256sum -- * > ../SHA256SUMS
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber -- * ../SHA256SUMS
+          else
+            gh release create "$TAG" --verify-tag --generate-notes -- * ../SHA256SUMS
+          fi
