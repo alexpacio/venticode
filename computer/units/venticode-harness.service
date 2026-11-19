@@ -2,10 +2,11 @@
 Description=Managed Venticode harness
 Requires=venticode-desktop.service dbus.socket
 After=venticode-desktop.service dbus.socket
+StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=/run/venticode.env
-StandardError=append:/run/venticode-harness.log
+StandardError=journal
 Environment=HOME=/root
 RuntimeDirectory=venticode-harness
 RuntimeDirectoryMode=0711

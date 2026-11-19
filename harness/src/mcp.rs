@@ -205,22 +205,21 @@ fn expanded(value: &str, root: &Path) -> Result<String> {
     );
     Ok(value)
 }
-async fn invoke(
-    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    operation: &str,
-    args: &Value,
-) -> Result<Value> {
+async fn list_all_tools(service: &Service) -> Result<Vec<rmcp::model::Tool>> {
     let mut tools = Vec::new();
     let mut cursor = None;
     let mut seen = std::collections::HashSet::new();
     loop {
-        let page = service
-            .list_tools(
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            service.list_tools(
                 cursor
                     .clone()
                     .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor))),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .context("MCP list_tools timed out")??;
         tools.extend(page.tools);
         ensure!(tools.len() <= 4096, "Too many MCP tools");
         cursor = page.next_cursor;
@@ -230,29 +229,46 @@ async fn invoke(
             break;
         }
     }
+    Ok(tools)
+}
+
+async fn invoke(cached: &mut CachedService, operation: &str, args: &Value) -> Result<Value> {
+    if operation == "mcp_list_tools" || cached.tools.is_none() {
+        cached.tools = Some(list_all_tools(&cached.service).await?);
+    }
+    let tools = cached.tools.as_ref().unwrap();
     if operation == "mcp_list_tools" {
         return Ok(json!({"tools":tools}));
     }
     let name = args["tool"].as_str().context("Tool required")?;
     let tool = tools
-        .into_iter()
+        .iter()
         .find(|t| t.name == name)
         .context("Unknown MCP tool")?;
     let parameters = args["parameters"]
         .as_object()
         .context("Tool parameters must be an object")?;
-    let schema = serde_json::to_value(tool.input_schema)?;
+    let schema = serde_json::to_value(&tool.input_schema)?;
     ensure!(
         jsonschema::is_valid(&schema, &Value::Object(parameters.clone())),
         "Invalid MCP tool arguments"
     );
-    let result = service
-        .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(parameters.clone()))
-        .await?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        cached.service.call_tool(
+            CallToolRequestParams::new(name.to_owned()).with_arguments(parameters.clone()),
+        ),
+    )
+    .await
+    .context("MCP call_tool timed out")??;
     Ok(serde_json::to_value(result)?)
 }
 type Service = rmcp::service::RunningService<rmcp::RoleClient, ()>;
-type Slot = std::sync::Arc<tokio::sync::Mutex<Option<Service>>>;
+struct CachedService {
+    service: Service,
+    tools: Option<Vec<rmcp::model::Tool>>,
+}
+type Slot = std::sync::Arc<tokio::sync::Mutex<Option<CachedService>>>;
 #[derive(Default)]
 pub struct Clients(
     std::sync::Mutex<std::collections::HashMap<(uuid::Uuid, PathBuf, String), Slot>>,
@@ -261,17 +277,20 @@ impl Clients {
     pub fn release(&self, request: uuid::Uuid) {
         self.0
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|(id, _, _), _| *id != request);
     }
     #[cfg(feature = "ventic-relay")]
     pub fn retain(&self, consents: &[Value]) {
-        self.0.lock().unwrap().retain(|(id, _, _), _| {
-            consents
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|value| uuid::Uuid::parse_str(value).ok().as_ref() == Some(id))
-        });
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _, _), _| {
+                consents
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|value| uuid::Uuid::parse_str(value).ok().as_ref() == Some(id))
+            });
     }
     pub async fn call(
         &self,
@@ -283,7 +302,7 @@ impl Clients {
         let server = selected(
             root,
             args["server_id"].as_str().context("Server required")?,
-            true,
+            false,
         )?;
         ensure!(
             args["revision"] == server.revision,
@@ -295,12 +314,25 @@ impl Clients {
             root.to_owned(),
             format!("{}:{}", server.id, server.revision),
         );
-        let slot = self.0.lock().unwrap().entry(key).or_default().clone();
+        let slot = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
         let mut slot = slot.lock().await;
-        if slot.as_ref().is_none_or(|service| service.is_closed()) {
-            *slot = Some(connect(root, &server).await?);
+        if slot.as_ref().is_none_or(|c| c.service.is_closed()) {
+            let service =
+                tokio::time::timeout(std::time::Duration::from_secs(30), connect(root, &server))
+                    .await
+                    .context("MCP server connection timed out")??;
+            *slot = Some(CachedService {
+                service,
+                tools: None,
+            });
         }
-        invoke(slot.as_ref().unwrap(), operation, args).await
+        invoke(slot.as_mut().unwrap(), operation, args).await
     }
 }
 async fn connect(root: &Path, server: &Server) -> Result<Service> {
@@ -309,7 +341,10 @@ async fn connect(root: &Path, server: &Server) -> Result<Service> {
         ensure!(
             url.scheme() == "https"
                 || url.scheme() == "http"
-                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")),
+                    && matches!(
+                        url.host_str(),
+                        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+                    ),
             "HTTPS required for remote MCP"
         );
         ensure!(
@@ -591,7 +626,7 @@ pub async fn manage(command: &Mcp) -> Result<()> {
             let resolved = selected(&root, server, true)?;
             let started = std::time::Instant::now();
             let service = connect(&root, &resolved).await?;
-            let tools_val = invoke(&service, "mcp_list_tools", &json!({})).await?;
+            let tools_val = json!({"tools": list_all_tools(&service).await?});
             let elapsed_ms = started.elapsed().as_millis();
             let _ = service.cancel().await;
             let tools = tools_val["tools"].as_array().cloned().unwrap_or_default();
@@ -648,10 +683,13 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
             revision: "test".into(),
             config: json!({"command":"node","args":["-e",script]}),
         };
-        let service = connect(root.path(), &server).await.unwrap();
+        let mut service = CachedService {
+            service: connect(root.path(), &server).await.unwrap(),
+            tools: None,
+        };
         assert!(
             invoke(
-                &service,
+                &mut service,
                 "mcp_call_tool",
                 &json!({"tool":"counter","parameters":{"unexpected":true}})
             )
@@ -660,7 +698,7 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
         );
         for expected in ["1", "2"] {
             let result = invoke(
-                &service,
+                &mut service,
                 "mcp_call_tool",
                 &json!({"tool":"counter","parameters":{}}),
             )
@@ -668,7 +706,7 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
             .unwrap();
             assert_eq!(result["content"][0]["text"], expected);
         }
-        service.cancel().await.unwrap();
+        service.service.cancel().await.unwrap();
     }
     #[test]
     fn installs_require_exact_package_versions() {

@@ -232,6 +232,11 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     if (p === "/browser-agent" && method === "GET") return ok({ threads: browser.threads() });
     if (p === "/session" && method === "DELETE") {
       sessions.delete(cookie);
+      for (const set of listeners.values()) {
+        for (const listener of set) {
+          try { (listener as Listener & { expire?: () => void }).expire?.(); } catch { /* ignore */ }
+        }
+      }
       return { ...ok({ signed_out: true, redirect_url: portalOrigin + "/app" }), headers: { "Set-Cookie": "venticode_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" } };
     }
     if (p === "/models" && method === "GET") return ok({ items: models });
@@ -255,7 +260,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     if ((m = p.match(/^\/projects\/([^/]+)$/)) && method === "DELETE") {
       const index = projects.findIndex((x) => x.id === m![1]);
       if (index < 0) return fail(404, "Progetto non trovato / Project not found");
-      if (conversations.some((c) => c.project_id === m![1] && c.state !== "idle")) return fail(409, "Conversazione in corso / A conversation is running");
+      if (conversations.some((c) => c.project_id === m![1] && runs.has(c.id))) return fail(409, "Conversazione in corso / A conversation is running");
       projects.splice(index, 1);
       for (let i = conversations.length - 1; i >= 0; i--) if (conversations[i].project_id === m[1]) { events.delete(conversations[i].id); conversations.splice(i, 1); }
       return ok({ deleted: true });
@@ -287,7 +292,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!action && method === "GET") return ok(conversation);
       if (!action && method === "PATCH") {
         const keys = Object.keys(body.json);
-        if (body.runtime !== undefined && body.runtime !== "project" || !Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "permission_mode"].includes(k)) ||
+        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "permission_mode"].includes(k)) ||
             (body.title !== undefined && (typeof body.title !== "string" || !body.title.trim() || body.title.length > 200)) ||
             (body.model !== undefined && !models.some((x) => x.id === body.model)) ||
             (body.permission_mode !== undefined && !["ask", "auto_edit", "plan"].includes(body.permission_mode)))
@@ -299,7 +304,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
         return ok(conversation);
       }
       if (!action && method === "DELETE") {
-        if (conversation.state !== "idle") return fail(409, "Conversazione in corso / Conversation is running");
+        if (runs.has(conversation.id)) return fail(409, "Conversazione in corso / Conversation is running");
         conversations.splice(conversations.indexOf(conversation), 1);
         events.delete(conversation.id);
         return ok({ deleted: true });
@@ -354,7 +359,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     }
     if (p === "/connections" && method === "GET") return ok({ items: bots.map(b => ({
       id: b.id, kind: "slack", destination: "C_SYNTHETIC", identity: "@ventic", status: "connected",
-      project_id: projects[0].id, webhook_url: origin + "/hooks/slack/" + b.id,
+      project_id: projects[0]?.id ?? null, webhook_url: origin + "/hooks/slack/" + b.id,
     })) });
     if (p.startsWith("/connections")) return fail(501, "Connessione esterna non disponibile nel mock / External connection unavailable in the mock");
     if (p === "/bots" && method === "GET") return ok({ items: bots });
@@ -366,6 +371,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!m[2] && method === "PATCH") {
         const keys = Object.keys(body.json), policy = (v: unknown) => ["auto", "review", "off"].includes(v as string);
         if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "enabled", "triggers", "tools", "instructions", "rate_limit_per_hour", "runtime"].includes(k)) ||
+            (body.runtime !== undefined && !["project", "kitesurf", "computer"].includes(body.runtime)) ||
             (body.enabled !== undefined && typeof body.enabled !== "boolean") ||
             (body.triggers !== undefined && (typeof body.triggers?.mentions !== "boolean" || typeof body.triggers?.direct_messages !== "boolean" || Object.keys(body.triggers).length !== 2)) ||
             (body.tools !== undefined && (Object.keys(body.tools || {}).length !== 4 || !["read", "write", "execute", "mcp"].every((k) => policy(body.tools[k])))) ||
@@ -400,12 +406,15 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   function stream(req: IncomingMessage, res: ServerResponse, conversationId: string, after: number) {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" });
     res.flushHeaders();
-    const write = (event: Event) => res.write(`id: ${event.sequence}\nevent: transcript\ndata: ${JSON.stringify(event)}\n\n`);
+    const write = Object.assign(
+      (event: Event) => { if (!res.writableEnded) res.write(`id: ${event.sequence}\nevent: transcript\ndata: ${JSON.stringify(event)}\n\n`); },
+      { expire: () => { if (!res.writableEnded) { res.write("event: authorization_expired\ndata: {}\n\n"); res.end(); } } },
+    );
     for (const event of (events.get(conversationId) || []).slice(after)) write(event);
     const set = listeners.get(conversationId) || new Set<Listener>();
     listeners.set(conversationId, set);
     set.add(write);
-    const heartbeat = setInterval(() => res.write("event: heartbeat\ndata: {}\n\n"), 15000);
+    const heartbeat = setInterval(() => { if (!res.writableEnded) res.write("event: heartbeat\ndata: {}\n\n"); }, 15000);
     req.once("close", () => { set.delete(write); clearInterval(heartbeat); });
   }
 

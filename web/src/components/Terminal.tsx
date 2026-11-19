@@ -27,6 +27,7 @@ export function Terminal({
   const [failure, setFailure] = useState("");
   const [offset, setOffset] = useState(0);
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
   const touch = useRef(0);
   useEffect(() => {
     let active = true;
@@ -58,6 +59,7 @@ export function Terminal({
     const observer = new ResizeObserver(resize);
     observer.observe(area.current!);
     observer.observe(measure.current!);
+    void document.fonts?.ready?.then(() => { if (active) resize(); });
     return () => {
       active = false;
       observer.disconnect();
@@ -96,36 +98,61 @@ export function Terminal({
           },
         ];
   }, [blocks, notice, language]);
-  const frame = useMemo(
-    () =>
-      ready
-        ? (JSON.parse(
-            render(
-              JSON.stringify({
-                project,
-                chat,
-                model: chat?.model,
-                lines,
-                en: language === "en",
-                compact_tools: !expanded,
-                scroll: offset,
-              }),
-              size.width,
-              size.height + 2,
-            ),
-          ) as { rows: Cells; scroll: number })
-        : undefined,
-    [ready, project, chat, lines, language, expanded, offset, size],
-  );
+  const lastReply = useMemo(() => {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.kind === "text" && b.content.trim()) return b.content;
+    }
+    return "";
+  }, [blocks]);
+  const { frame, renderError } = useMemo(() => {
+    if (!ready) return { frame: undefined, renderError: "" };
+    try {
+      const parsed = JSON.parse(
+        render(
+          JSON.stringify({
+            project,
+            chat,
+            model: chat?.model,
+            lines,
+            en: language === "en",
+            compact_tools: !expanded,
+            scroll: offset,
+          }),
+          size.width,
+          size.height + 2,
+        ),
+      ) as { rows: Cells; scroll: number };
+      return { frame: parsed, renderError: "" };
+    } catch (err) {
+      return { frame: undefined, renderError: (err as Error).message };
+    }
+  }, [ready, project, chat, lines, language, expanded, offset, size]);
   const move = (n: number) =>
     setOffset(Math.max(0, Math.min(65535, (frame?.scroll ?? 0) + n)));
+  const copyLast = async () => {
+    if (!lastReply) return;
+    try {
+      await navigator.clipboard.writeText(lastReply);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch { /* clipboard unavailable */ }
+  };
+  const errMsg = failure || renderError;
   return (
     <section className="terminal" aria-label={t("Terminale")}>
       <div
         className="terminal-viewport"
+        role="log"
+        aria-live="off"
         tabIndex={0}
         ref={area}
-        onWheel={(e) => move(-Math.sign(e.deltaY) * 3)}
+        onWheel={(e) => {
+          e.preventDefault();
+          const linesDelta = e.deltaMode === 1 ? e.deltaY : e.deltaY / 24;
+          const step = Math.sign(linesDelta) * Math.max(1, Math.min(8, Math.round(Math.abs(linesDelta))));
+          move(-step);
+        }}
         onTouchStart={(e) => {
           touch.current = e.touches[0].clientY;
         }}
@@ -141,9 +168,15 @@ export function Terminal({
           if (e.key === "PageUp" || e.key === "PageDown") {
             e.preventDefault();
             move(size.height * (e.key === "PageUp" ? 1 : -1));
-          }
-          if (e.key === "End") setOffset(0);
-          if (e.ctrlKey && e.key.toLowerCase() === "o") {
+          } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            e.preventDefault();
+            move(e.key === "ArrowUp" ? 1 : -1);
+          } else if (e.key === "Home") {
+            e.preventDefault();
+            setOffset(65535);
+          } else if (e.key === "End") {
+            setOffset(0);
+          } else if (e.ctrlKey && e.key.toLowerCase() === "o") {
             e.preventDefault();
             setExpanded((v) => !v);
           }
@@ -152,8 +185,8 @@ export function Terminal({
         <span aria-hidden="true" className="cell-ruler" ref={measure}>
           M
         </span>
-        {failure ? (
-          <p role="alert">{failure}</p>
+        {errMsg ? (
+          <p role="alert">{errMsg}</p>
         ) : !frame ? (
           t("Caricamento…")
         ) : (
@@ -174,7 +207,7 @@ export function Terminal({
           ))
         )}
       </div>
-      {(blocks.some((b) => b.kind === "tool") || !!frame?.scroll) && (
+      {(blocks.some((b) => b.kind === "tool") || !!frame?.scroll || !!lastReply) && (
         <div className="terminal-keys">
           {blocks.some((b) => b.kind === "tool") && (
             <button
@@ -183,6 +216,11 @@ export function Terminal({
               onClick={() => setExpanded((v) => !v)}
             >
               {expanded ? t("Comprimi output") : t("Espandi output")}
+            </button>
+          )}
+          {!!lastReply && (
+            <button type="button" onClick={() => void copyLast()}>
+              {copied ? t("Copiato") : t("Copia risposta")}
             </button>
           )}
           {!!frame?.scroll && (

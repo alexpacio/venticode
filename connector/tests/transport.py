@@ -59,13 +59,15 @@ def main():
                     try:
                         with socket.create_connection(('127.0.0.1',port),.25): break
                     except OSError: time.sleep(.1)
+                with request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=4) as res:
+                    assert res.status == 200 and res.read() == b'ok'
                 def call(op, **fields):
                     body=dict(kind='gitlab',operation=op,destination='42',credentials={'token':'synthetic-token','webhook_secret':'fixture'},**fields)
                     req=request.Request(f'http://127.0.0.1:{port}/exchange',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
                     with request.urlopen(req,timeout=8) as res: return json.load(res)
                 assert call('identify')=={'id':17}
                 assert call('hooks',page='2')=={'id':17}
-                assert call('install',hook_id='3',webhook_url='https://fixture.invalid/hook')=={'id':17}
+                assert call('install',hook_id=3,webhook_url='https://fixture.invalid/hook')=={'id':17}
                 assert call('remove',hook_id='3')=={}
                 assert call('reply',object_type='issues',iid='4',thread='a123',text='Synthetic reply')=={'id':17}
                 assert [(verb,path) for verb,path,_ in upstream.received]==[
@@ -74,7 +76,7 @@ def main():
                     ('POST','/api/v4/projects/42/issues/4/discussions/a123/notes')],[(v,p) for v,p,_ in upstream.received]
                 assert upstream.received[-1][2]=={'body':'Synthetic reply'}
                 try: call('unsupported')
-                except error.HTTPError as err: assert err.code==502
+                except error.HTTPError as err: assert err.code==400
                 else: raise AssertionError('Unexpected connector operation accepted')
                 print('Camel HTTPS connector operations passed')
             finally:

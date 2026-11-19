@@ -1,17 +1,21 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import { LoaderCircle } from "lucide-react";
 import { base } from "../api/client.ts";
+import { useComputerStatus } from "../queries.ts";
 import { t } from "../i18n/index.ts";
 import { BrowserScreen, type BrowserFrame } from "./BrowserScreen.tsx";
 import { decodeFrame } from "./BrowserView.tsx";
 
 export function DesktopView({ menu }: { menu: ReactNode }) {
+  const status = useComputerStatus(true);
   const socket = useRef<WebSocket | null>(null);
   const lastMove = useRef(0);
   const control = useRef<HTMLButtonElement>(null);
   const [connected, setConnected] = useState(false);
   const [frame, setFrame] = useState<BrowserFrame | null>(null);
   const [human, setHuman] = useState(false);
-  const [error, setError] = useState(false);
+  const [changingControl, setChangingControl] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => () => {
     const ws = socket.current;
@@ -19,35 +23,55 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
     ws?.close();
   }, []);
 
-  function close(failed = false) {
+  function close(failed = false, message = "") {
     const ws = socket.current;
     socket.current = null;
+    if (ws?.readyState === WebSocket.OPEN && !failed) {
+      try { ws.send(JSON.stringify({ type: "end" })); } catch { /* closing */ }
+    }
     ws?.close();
     setConnected(false);
     setHuman(false);
+    setChangingControl(false);
     setFrame(null);
-    setError(failed);
+    setError(failed ? (message || t("Desktop non disponibile.")) : "");
   }
 
   function start() {
-    setError(false);
+    setError("");
     setConnected(true);
     const url = new URL(`${base}/computer/screen`, location.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(url);
     socket.current = ws;
     ws.binaryType = "arraybuffer";
-    ws.onerror = ws.onclose = () => { if (socket.current === ws) close(true); };
+    let ready = false;
+    const timeout = window.setTimeout(() => {
+      if (socket.current === ws && !ready) close(true);
+    }, 90_000);
+    ws.onerror = ws.onclose = () => {
+      window.clearTimeout(timeout);
+      if (socket.current === ws) close(true);
+    };
     ws.onmessage = event => {
       if (socket.current !== ws) return;
       try {
         if (event.data instanceof ArrayBuffer) {
           const next = decodeFrame(event.data);
-          if (next?.tab === "desktop") setFrame(next);
+          if (next?.tab === "desktop") {
+            ready = true;
+            window.clearTimeout(timeout);
+            setFrame(next);
+          }
         } else {
           const packet = JSON.parse(event.data);
-          if (packet.type === "control") setHuman(packet.human === true);
-          if (packet.type === "ended") close(true);
+          if (packet.type === "ready") { ready = true; window.clearTimeout(timeout); }
+          if (packet.type === "control") { setHuman(packet.human === true); setChangingControl(false); }
+          if (packet.type === "error") { setChangingControl(false); setError(t("Impossibile completare l’azione.")); }
+          if (packet.type === "ended") {
+            const normal = packet.reason === "closed";
+            close(!normal, packet.reason === "busy" ? t("Questa sessione è già aperta.") : "");
+          }
         }
       } catch {
         close(true);
@@ -57,32 +81,52 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
 
   function send(value: object) {
     const ws = socket.current;
-    if (ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 64 * 1024) ws.send(JSON.stringify(value));
+    if (ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 64 * 1024) {
+      ws.send(JSON.stringify(value));
+      return true;
+    }
+    return false;
   }
+
+  const statePill = status.data?.state === "ready"
+    ? <span className="pill pill-ok"><span className="dot" aria-hidden="true" />{t("online")}</span>
+    : status.data?.state === "starting"
+      ? <span className="pill pill-warn"><span className="dot" aria-hidden="true" />{t("Avvio del desktop…")}</span>
+      : status.data?.state === "stopped"
+        ? <span className="pill pill-off"><span className="dot" aria-hidden="true" />{t("fermo")}</span>
+        : null;
 
   return <main className="main">
     <header className="topbar">
       {menu}<h1>{t("Desktop remoto")}</h1>
+      {statePill}
       {connected && <>
-        <button className="btn" ref={control} disabled={!frame} onClick={() => send({ type: human ? "release" : "take" })}>
+        <button className="btn" ref={control} disabled={!frame || changingControl} onClick={() => {
+          if (send({ type: human ? "release" : "take" })) setChangingControl(true);
+        }}>
           {human ? t("Restituisci il controllo") : t("Prendi il controllo")}
         </button>
         <button className="btn" onClick={() => close()}>{t("Chiudi il desktop")}</button>
       </>}
     </header>
-    {connected ? <div className="desktop-surface">
-      {frame ? <BrowserScreen frame={frame} human={human} desktop exit={control}
-        onFailure={() => close(true)} onInput={(tab, input) => {
-          if ("kind" in input && input.kind === "move") {
-            const now = performance.now();
-            if (now - lastMove.current < 30) return;
-            lastMove.current = now;
-          }
-          send({ type: "input", tab, input });
-        }} /> :
-        <p className="empty" role="status">{t("Avvio del desktop…")}</p>}
-    </div> : <div className="empty">
-      {error && <p role="alert">{t("Desktop non disponibile.")}</p>}
+    {connected ? <>
+      <div className="desktop-surface">
+        <BrowserScreen frame={frame} human={human} desktop exit={control}
+          onFailure={() => close(true)} onInput={(tab, input) => {
+            if ("kind" in input && input.kind === "move") {
+              const now = performance.now();
+              if (now - lastMove.current < 30) return;
+              lastMove.current = now;
+            }
+            send({ type: "input", tab, input });
+          }} />
+        {!frame && <div className="browser-placeholder" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }} role="status">
+          <LoaderCircle className="spin" aria-hidden="true" />{t("Avvio del desktop…")}
+        </div>}
+      </div>
+      {human && <p className="browser-hint">{t("Fai clic sullo schermo per digitare. Maiusc+Tab torna ai comandi.")}</p>}
+    </> : <div className="empty">
+      {error && <p role="alert" className="error-line">{error}</p>}
       <button className="btn btn-primary" onClick={start}>{t("Avvia il desktop")}</button>
     </div>}
   </main>;

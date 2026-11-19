@@ -19,17 +19,31 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
   const [query, setQuery] = useState("");
   const [closed, setClosed] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState<Harness | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
   const online = harnesses.data?.filter((h) => h.online).length ?? 0;
   const needle = query.trim().toLowerCase();
+  const portalBase = session.portal_url.replace(/\/+$/, "");
+  const unattachedChats = (conversations.data || []).filter((c) => !c.project_id && (!needle || c.title.toLowerCase().includes(needle)));
+  const matchedAnyChat = needle
+    ? (conversations.data || []).some((c) => c.title.toLowerCase().includes(needle))
+    : true;
 
   const signOut = async () => {
-    const result = await api<{ redirect_url: string }>("/session", "DELETE");
-    if (window.parent !== window) {
-      window.parent.postMessage({ type: "venticode:signed-out" }, new URL(session.portal_url).origin);
-      window.location.replace("/");
-      return;
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      const result = await api<{ redirect_url: string }>("/session", "DELETE");
+      if (window.parent !== window) {
+        try {
+          window.parent.postMessage({ type: "venticode:signed-out" }, new URL(session.portal_url).origin);
+        } catch { /* ignore invalid portal_url */ }
+        window.location.replace("/");
+        return;
+      }
+      location.assign(result.redirect_url);
+    } catch {
+      setSigningOut(false);
     }
-    location.assign(result.redirect_url);
   };
 
   return (
@@ -48,16 +62,17 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
       </label>
       <div className="sidebar-scroll">
         {session.bot_runtimes?.includes("computer") && <NavLink to="/computer" className="bot-link" onClick={onNavigate}>
-          <AppWindow size={16} aria-hidden="true" />{t("Desktop remoto")}
+          <Monitor size={16} aria-hidden="true" />{t("Desktop remoto")}
         </NavLink>}
         {browser.data && <NavLink to="/browser" className="bot-link" onClick={onNavigate}>
           <AppWindow size={16} aria-hidden="true" />{t("Browser remoto")}
         </NavLink>}
         <div className="nav-head">
-          <h2 className="section-title">{t("Harness · {0}/{1} online", online, harnesses.data?.length ?? 0)}</h2>
-          <a className="btn" style={{ minHeight: 30, fontSize: 12, border: 0 }} href={`${session.portal_url}/app/harnesses`} target="_blank" rel="noreferrer">{t("Collega")}</a>
+          <h2 className="section-title">{harnesses.isPending ? t("Harness") : t("Harness · {0}/{1} online", online, harnesses.data?.length ?? 0)}</h2>
+          {!session.standalone && <a className="btn" style={{ minHeight: 30, fontSize: 12, border: 0 }} href={`${portalBase}/app/harnesses`} target="_blank" rel="noreferrer">{t("Collega")}</a>}
         </div>
         {harnesses.data?.length === 0 && <p className="muted" style={{ padding: "0 16px", fontSize: 12 }}>{t("Nessun harness collegato.")}</p>}
+        {needle && !matchedAnyChat && <p className="muted" style={{ padding: "0 16px", fontSize: 12 }}>{t("Nessun risultato.")}</p>}
         {harnesses.data?.map((harness) => {
           const open = !closed.has(harness.id) || Boolean(needle);
           const own = (projects.data || []).filter((p) => p.harness_id === harness.id);
@@ -76,7 +91,7 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
                     <span className="dot" aria-hidden="true" />{harness.online ? t("online") : t("offline")}
                   </span>
                 </button>
-                <button className="icon-btn" aria-label={t("Aggiungi progetto su {0}", harness.name)} onClick={() => setAdding(harness)}>
+                <button className="icon-btn" aria-label={t("Aggiungi progetto su {0}", harness.name)} title={t("Aggiungi progetto su {0}", harness.name)} onClick={() => setAdding(harness)}>
                   <FolderPlus size={15} aria-hidden="true" />
                 </button>
               </div>
@@ -97,7 +112,7 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
                         {items.map((c) => (
                           <NavLink key={c.id} to={`/c/${c.id}`} className="tree-link" onClick={onNavigate}>
                             <span>{c.title}</span>
-                            <small className={c.state === "idle" ? undefined : "running"}>
+                            <small className={c.state === "failed" ? "failed" : c.state === "idle" ? undefined : "running"} title={new Date(c.updated_at).toLocaleString()}>
                               {c.state === "running" ? t("in corso") : c.state === "waiting" ? t("attende") : c.state === "failed" ? t("errore") : relative(c.updated_at)}
                             </small>
                           </NavLink>
@@ -115,28 +130,48 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
             </div>
           );
         })}
+        {unattachedChats.length > 0 && (
+          <>
+            <div className="nav-head" style={{ marginTop: 8 }}>
+              <h2 className="section-title">{t("Conversazioni")}</h2>
+            </div>
+            <div className="tree" style={{ paddingLeft: 12 }}>
+              {unattachedChats.map((c) => (
+                <NavLink key={c.id} to={`/c/${c.id}`} className="tree-link" onClick={onNavigate}>
+                  <span>{c.title}</span>
+                  <small className={c.state === "failed" ? "failed" : c.state === "idle" ? undefined : "running"} title={new Date(c.updated_at).toLocaleString()}>
+                    {c.state === "running" ? t("in corso") : c.state === "waiting" ? t("attende") : c.state === "failed" ? t("errore") : relative(c.updated_at)}
+                  </small>
+                </NavLink>
+              ))}
+            </div>
+          </>
+        )}
         <div className="nav-head" style={{ marginTop: 8 }}>
           <h2 className="section-title">{t("Bot")}</h2>
           <NavLink to="/connections" className="btn" onClick={onNavigate}>{t("Connessioni bot")}</NavLink>
         </div>
-        {bots.data?.map((bot) => (
-          <NavLink key={bot.id} to={`/bots/${bot.id}`} className="bot-link" onClick={onNavigate}>
-            <BotIcon size={16} aria-hidden="true" style={{ flex: "none", color: "var(--text-2)" }} />
-            <span>
-              <b className="mono" style={{ fontWeight: 500 }}>{bot.handle}</b>
-              <small>{bot.name} · {bot.channels.map((c) => c.name).join(", ")}</small>
-            </span>
-            <span className={`status ${bot.enabled ? "status-online" : "status-offline"}`}><span className="dot" aria-hidden="true" />{bot.enabled ? t("attivo") : t("in pausa")}</span>
-          </NavLink>
-        ))}
+        {bots.data?.map((bot) => {
+          const channelSummary = bot.channels.map((c) => c.name).filter(Boolean).join(", ");
+          return (
+            <NavLink key={bot.id} to={`/bots/${bot.id}`} className="bot-link" onClick={onNavigate}>
+              <BotIcon size={16} aria-hidden="true" style={{ flex: "none", color: "var(--text-2)" }} />
+              <span>
+                <b className="mono" style={{ fontWeight: 500 }}>{bot.handle}</b>
+                <small>{channelSummary ? `${bot.name} · ${channelSummary}` : bot.name}</small>
+              </span>
+              <span className={`status ${bot.enabled ? "status-online" : "status-offline"}`}><span className="dot" aria-hidden="true" />{bot.enabled ? t("attivo") : t("in pausa")}</span>
+            </NavLink>
+          );
+        })}
       </div>
       <div className="sidebar-foot">
         <span className="avatar" aria-hidden="true">{session.user.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>
         <span style={{ flex: 1, minWidth: 0, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.user.name}</span>
-        <button className="icon-btn" aria-label={language === "it" ? "Switch to English" : "Passa all'italiano"} onClick={() => setLanguage(language === "it" ? "en" : "it")}>
+        <button className="icon-btn" title={language === "it" ? "Switch to English" : "Passa all'italiano"} aria-label={language === "it" ? "Switch to English" : "Passa all'italiano"} onClick={() => setLanguage(language === "it" ? "en" : "it")}>
           <Languages size={16} aria-hidden="true" />
         </button>
-        <button className="icon-btn" aria-label={t("Esci")} onClick={signOut}><LogOut size={16} aria-hidden="true" /></button>
+        <button className="icon-btn" disabled={signingOut} title={t("Esci")} aria-label={t("Esci")} onClick={() => void signOut()}><LogOut size={16} aria-hidden="true" /></button>
       </div>
       {adding && <AddProject harness={adding} onClose={() => setAdding(null)} onNavigate={onNavigate} />}
     </nav>
@@ -165,16 +200,16 @@ function AddProject({ harness, onClose, onNavigate }: { harness: Harness; onClos
     }
   };
   return (
-    <dialog ref={(node) => { ref.current = node; if (node && !node.open) node.showModal(); }} onClose={onClose} aria-labelledby="add-project-title">
+    <dialog ref={(node) => { ref.current = node; if (node && !node.open) node.showModal(); }} onClose={onClose} onClick={(e) => { if (e.target === ref.current) ref.current.close(); }} aria-labelledby="add-project-title">
       <form onSubmit={(e) => { e.preventDefault(); void submit(new FormData(e.currentTarget)); }}>
         <h2 id="add-project-title">{t("Nuovo progetto su {0}", harness.name)}</h2>
         <label className="field"><span>{t("Cartella autorizzata")}</span>
-          <select className="select" name="root" required defaultValue={harness.roots[0]}>
+          <select className="select" name="root" required defaultValue={harness.roots[0]} disabled={!harness.roots.length}>
             {harness.roots.map((root) => <option key={root} value={root}>{root}</option>)}
           </select>
         </label>
         <label className="field"><span>{t("Sottocartella (relativa, . per la radice)")}</span>
-          <input className="input mono" name="path" defaultValue="." maxLength={1024} pattern="^(\.|[^/\\][^\\]*)$" />
+          <input className="input mono" name="path" defaultValue="." maxLength={1024} pattern="^(\.|[^/\\][^\\]*)$" title={t("Percorso relativo senza ..")} />
         </label>
         <label className="field"><span>{t("Nome (facoltativo)")}</span>
           <input className="input" name="name" maxLength={80} />
@@ -182,7 +217,7 @@ function AddProject({ harness, onClose, onNavigate }: { harness: Harness; onClos
         {error && <p className="error-line" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button type="button" className="btn" onClick={() => ref.current?.close()}>{t("Annulla")}</button>
-          <button className="btn btn-primary" disabled={busy}>{t("Aggiungi progetto")}</button>
+          <button className="btn btn-primary" disabled={busy || !harness.roots.length}>{t("Aggiungi progetto")}</button>
         </div>
       </form>
     </dialog>

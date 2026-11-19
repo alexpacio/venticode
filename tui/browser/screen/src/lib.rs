@@ -44,6 +44,7 @@ impl RemoteScreen {
                         state,
                         texture: None,
                         send,
+                        last_move: -1.0,
                     }))
                 }),
             )
@@ -103,6 +104,7 @@ struct Screen {
     state: Rc<RefCell<ScreenState>>,
     texture: Option<egui::TextureHandle>,
     send: Function,
+    last_move: f64,
 }
 
 impl Screen {
@@ -154,13 +156,14 @@ impl eframe::App for Screen {
             return;
         }
         let point = |position: egui::Pos2| (position - rect.min) / scale;
-        let (focused, events, click, hover) = ui.input(|input| {
+        let (now, focused, events, click, hover) = ui.input(|input| {
             let click = input
                 .pointer
                 .primary_clicked()
                 .then(|| input.pointer.interact_pos())
                 .flatten();
             (
+                input.time,
                 input.focused,
                 input.events.clone(),
                 click,
@@ -171,11 +174,11 @@ impl eframe::App for Screen {
             let position = point(position);
             self.input(json!({"kind":"click", "x":position.x, "y":position.y}));
         }
+        let mut moved_pos = None;
         for event in events {
             match event {
                 Event::PointerMoved(position) if desktop && rect.contains(position) => {
-                    let position = point(position);
-                    self.input(json!({"kind":"move","x":position.x,"y":position.y}));
+                    moved_pos = Some(position);
                 }
                 Event::PointerButton {pos,button,pressed,..} if desktop && (rect.contains(pos) || !pressed) => {
                     let position = point(rect.clamp(pos));
@@ -213,7 +216,30 @@ impl eframe::App for Screen {
                     modifiers,
                     ..
                 } if desktop && focused => {
-                    if !modifiers.ctrl && !modifiers.command && !modifiers.alt && key.name().len() == 1 {
+                    let text_key = key.name().len() == 1
+                        || matches!(
+                            key,
+                            Key::Space
+                                | Key::Comma
+                                | Key::Period
+                                | Key::Minus
+                                | Key::Plus
+                                | Key::Equals
+                                | Key::Slash
+                                | Key::Backslash
+                                | Key::Semicolon
+                                | Key::Colon
+                                | Key::Quote
+                                | Key::Backtick
+                                | Key::OpenBracket
+                                | Key::CloseBracket
+                                | Key::OpenCurlyBracket
+                                | Key::CloseCurlyBracket
+                                | Key::Pipe
+                                | Key::Questionmark
+                                | Key::Exclamationmark
+                        );
+                    if !modifiers.ctrl && !modifiers.command && !modifiers.alt && text_key {
                         continue;
                     }
                     let mut shortcut = String::new();
@@ -249,6 +275,13 @@ impl eframe::App for Screen {
                 }
                 _ => {}
             }
+        }
+        if let Some(position) = moved_pos
+            && now - self.last_move >= 0.033
+        {
+            self.last_move = now;
+            let position = point(position);
+            self.input(json!({"kind":"move","x":position.x,"y":position.y}));
         }
     }
 }

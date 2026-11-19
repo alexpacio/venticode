@@ -86,6 +86,7 @@ pub(super) async fn checkpoint(
     }
     append(&mut tx, id, object).await?;
     tx.commit().await?;
+    let _ = app.events.send(id);
     Ok(())
 }
 
@@ -115,5 +116,6 @@ pub(super) async fn cancel_goal(
     }
     append(&mut tx, id, object).await?;
     tx.commit().await?;
+    let _ = app.events.send(id);
     Ok(StatusCode::NO_CONTENT)
 }

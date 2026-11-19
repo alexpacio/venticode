@@ -2,6 +2,7 @@
 Description=Venticode Xfce display and Helium bridge
 Requires=venticode-prepare.service
 After=venticode-prepare.service
+StartLimitIntervalSec=0
 
 [Service]
 User=desktop

@@ -1,6 +1,7 @@
 use crate::{protocol, runtime};
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
+use rich_rust::prelude::*;
 use serde_json::{Value, json};
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
@@ -8,6 +9,27 @@ use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
 use uuid::Uuid;
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
+}
 
 pub async fn run() -> Result<()> {
     let origin = env::var("VENTICODE_SERVER_URL").context("Set VENTICODE_SERVER_URL")?;
@@ -41,18 +63,48 @@ pub async fn run() -> Result<()> {
     let grants: std::collections::BTreeMap<String, String> = serde_json::from_str(
         &env::var("VENTICODE_HARNESS_MCP_GRANTS").unwrap_or_else(|_| "{}".into()),
     )?;
+    let console = Console::new();
+    let mut table = Table::new()
+        .title(format!("venticode-harness v{}", env!("CARGO_PKG_VERSION")))
+        .with_column(Column::new("Root").style(Style::parse("bold cyan").unwrap_or_default()))
+        .with_column(Column::new("Path"));
+    let mut sorted_roots: Vec<_> = roots.iter().collect();
+    sorted_roots.sort_by(|a, b| a.0.cmp(b.0));
+    for (label, path) in sorted_roots {
+        table.add_row_cells([label.as_str(), &path.display().to_string()]);
+    }
+    console.print_renderable(&table);
+    console.print(&format!(
+        "[bold green]Target:[/] {origin} [dim](MCP grants: {})[/]",
+        grants.len()
+    ));
+    let mut attempt = 0u32;
     loop {
+        let started = tokio::time::Instant::now();
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = shutdown_signal() => {
+                tracing::info!("venticode-harness shutting down");
+                return Ok(());
+            }
             result = connect(request.clone(), roots.clone(), &grants) => {
+                if started.elapsed() >= Duration::from_secs(30) {
+                    attempt = 0;
+                }
                 if let Err(error) = result {
-                    eprintln!("Venticode harness will reconnect: {error}");
+                    attempt = attempt.saturating_add(1);
+                    let delay = Duration::from_secs((2u64.saturating_pow(attempt.min(5))).min(30));
+                    tracing::warn!(error = %error, retry_secs = delay.as_secs(), "harness disconnected, will reconnect");
+                    tokio::select! {
+                        _ = shutdown_signal() => return Ok(()),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
             }
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = shutdown_signal() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
     }
 }
@@ -74,22 +126,27 @@ async fn connect(
     sink.send(Message::Text(json!({"type":"inventory", "roots":labels,
         "host_info":{"os":env::consts::OS,"arch":env::consts::ARCH,"version":env!("CARGO_PKG_VERSION")}
     }).to_string().into())).await?;
+    tracing::info!(roots = labels.len(), "connected to Venticode service");
     let runtime = runtime::Runtime::new()?;
     let (reply, mut frames) = mpsc::channel(16);
     let mut jobs = JoinSet::new();
-    let mut active = HashMap::new();
+    let mut active: HashMap<Uuid, (tokio::task::AbortHandle, Uuid)> = HashMap::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 ensure!(heard.elapsed() < Duration::from_secs(20), "Server heartbeat timed out");
-                sink.send(Message::Ping(Default::default())).await?;
+                tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Ping(Default::default()))).await??;
             }
-            Some(frame) = frames.recv() => sink.send(frame).await?,
+            Some(frame) = frames.recv() => {
+                tokio::time::timeout(Duration::from_secs(10), sink.send(frame)).await??;
+            }
             Some(job) = jobs.join_next(), if !jobs.is_empty() => {
                 if let Ok(id) = job {
-                    active.remove(&id);
+                    if let Some((_, consent)) = active.remove(&id) {
+                        runtime.release(consent);
+                    }
                     runtime.release(id);
                 }
             }
@@ -102,11 +159,21 @@ async fn connect(
                     Message::Ping(_) => { sink.flush().await?; continue; }
                     _ => continue,
                 };
-                let mut frame: Value = serde_json::from_str(&text)?;
-                let id: Uuid = serde_json::from_value(frame["id"].clone())?;
+                let Ok(mut frame) = serde_json::from_str::<Value>(&text) else {
+                    tracing::warn!("ignoring malformed WebSocket frame");
+                    continue;
+                };
+                let Ok(id) = serde_json::from_value::<Uuid>(frame["id"].clone()) else {
+                    tracing::warn!("ignoring frame without valid UUID id");
+                    continue;
+                };
                 match frame["type"].as_str() {
                     Some("execute") if active.len() < 32 && !active.contains_key(&id) => {
                         let mut payload = frame["payload"].take();
+                        let consent = payload["consent_id"]
+                            .as_str()
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                            .unwrap_or(id);
                         payload["mcp_grants"] = json!(grants);
                         let runtime = runtime.clone();
                         let reply = reply.clone();
@@ -119,7 +186,11 @@ async fn connect(
                             let _ = reply.send(Message::Text(json!({"type":"complete","id":id,"success":result.is_ok()}).to_string().into())).await;
                             id
                         });
-                        active.insert(id, handle);
+                        active.insert(id, (handle, consent));
+                    }
+                    Some("execute") if !active.contains_key(&id) => {
+                        let _ = runtime::output(&reply, id, json!({"type":"error","error":"Harness concurrency limit reached"})).await;
+                        let _ = reply.send(Message::Text(json!({"type":"complete","id":id,"success":false}).to_string().into())).await;
                     }
                     Some("input") if jobs.len() < 64 => {
                         let runtime = runtime.clone();
@@ -132,7 +203,10 @@ async fn connect(
                         });
                     }
                     Some("cancel") => {
-                        if let Some(handle) = active.remove(&id) { handle.abort(); }
+                        if let Some((handle, consent)) = active.remove(&id) {
+                            handle.abort();
+                            runtime.release(consent);
+                        }
                         runtime.release(id);
                     }
                     _ => {}

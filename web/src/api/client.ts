@@ -26,6 +26,11 @@ export class ApiError extends Error {
   }
 }
 
+let unauthorizedListener: (() => void) | undefined;
+export function onUnauthorized(listener: () => void) {
+  unauthorizedListener = listener;
+}
+
 export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(base + path, {
     method,
@@ -36,7 +41,10 @@ export async function api<T>(path: string, method = "GET", body?: unknown): Prom
   const text = await response.text();
   let value: any = null;
   try { value = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
-  if (!response.ok) throw new ApiError(response.status, value?.error?.message || response.statusText);
+  if (!response.ok) {
+    if (response.status === 401 && path !== "/session") unauthorizedListener?.();
+    throw new ApiError(response.status, value?.error?.message || response.statusText || `HTTP ${response.status}`);
+  }
   return value as T;
 }
 

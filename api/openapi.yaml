@@ -188,7 +188,8 @@ paths:
       summary: Start or watch the current member's desktop over a same-origin WebSocket
       description: |
         Uses Motion JPEG frame packets with the same framing as /browser-agent/{thread},
-        with `tab` set to `desktop`. Client messages are `take`, `release`, `input`, and `end`.
+        with `tab` set to `desktop`. Client messages are `take`, `release`, `input`
+        (`click`, `move`, `pointer`, `scroll`, `text`, or `key`), and `end`.
         The server sends `ready`, `control`, `error`, and `ended` events.
       responses:
         '101': { description: WebSocket upgrade }
@@ -430,6 +431,10 @@ paths:
         Clients reconnect with `after` set to the last received sequence.
       parameters:
         - $ref: '#/components/parameters/After'
+        - name: Last-Event-ID
+          in: header
+          description: Optional SSE resume cursor; the server resumes after max(after, Last-Event-ID).
+          schema: { type: integer, minimum: 0 }
       responses:
         '200':
           description: Event stream

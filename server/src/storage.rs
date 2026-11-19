@@ -16,12 +16,18 @@ pub(super) struct Storage {
 }
 impl Storage {
     pub fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let key = STANDARD.decode(env::var("VENTICODE_CONTENT_KEY")?)?;
+        let raw_key = require_env("VENTICODE_CONTENT_KEY")?;
+        let key = STANDARD
+            .decode(raw_key.trim())
+            .map_err(|e| format!("Invalid Base64 in VENTICODE_CONTENT_KEY: {e}"))?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| "Expected a 256-bit Venticode key")?;
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(env::var("S3_BUCKET")?);
-        if let Ok(endpoint) = env::var("S3_ENDPOINT") {
-            builder = builder.with_endpoint(endpoint);
+        let bucket_name = require_env("S3_BUCKET")?;
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
+        if let Ok(endpoint) = env::var("S3_ENDPOINT")
+            && !endpoint.trim().is_empty()
+        {
+            builder = builder.with_endpoint(endpoint.trim());
         }
         Ok(Self {
             bucket: builder.build()?,
@@ -72,7 +78,10 @@ impl Storage {
         self.bucket
             .put(&Self::path(id), body.into())
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|error| {
+                tracing::error!(object_id = %id, error = %error, "S3 put failed");
+                unavailable()
+            })?;
         Ok(())
     }
     pub async fn get(&self, id: Uuid) -> Result<Value> {
@@ -80,59 +89,108 @@ impl Storage {
             .bucket
             .get(&Self::path(id))
             .await
-            .map_err(|_| unavailable())?
+            .map_err(|error| {
+                tracing::error!(object_id = %id, error = %error, "S3 get failed");
+                unavailable()
+            })?
             .bytes()
             .await
-            .map_err(|_| unavailable())?;
-        self.open(id.as_bytes(), &bytes)
+            .map_err(|error| {
+                tracing::error!(object_id = %id, error = %error, "S3 read bytes failed");
+                unavailable()
+            })?;
+        self.open(id.as_bytes(), &bytes).inspect_err(|_| {
+            tracing::error!(object_id = %id, "failed to decrypt/parse stored object");
+        })
     }
 }
 pub(super) async fn maintain(app: App) {
+    let mut shutdown = app.shutdown.clone();
     loop {
-        if let Err(_error) = sweep(&app).await {
-            eprintln!("Venticode storage maintenance will retry");
+        if *shutdown.borrow() {
+            break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if let Err(error) = sweep(&app).await {
+            tracing::warn!(status = error.0.as_u16(), message = %error.1, "storage maintenance sweep failed, will retry");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            _ = shutdown.changed() => break,
+        }
     }
 }
 async fn sweep(app: &App) -> Result<()> {
-    if app.standalone.is_some() {
-        sqlx::query("DELETE FROM standalone_sessions WHERE expires_at<=now()")
+    if app.standalone.is_some()
+        && let Err(error) = sqlx::query("DELETE FROM standalone_sessions WHERE expires_at<=now()")
             .execute(&app.db)
-            .await?;
+            .await
+    {
+        tracing::warn!(error = %error, "failed to purge expired standalone sessions");
     }
-    let expired = sqlx::query("SELECT id,active_run FROM conversations WHERE lease_until<now() AND active_run IS NOT NULL LIMIT 50").fetch_all(&app.db).await?;
-    for row in expired {
-        runs::finish(
-            app,
-            row.get("id"),
-            row.get("active_run"),
-            runs::Completion::Expired,
-        )
-        .await?;
+    match sqlx::query(
+        "SELECT id,active_run FROM conversations WHERE lease_until<now() AND active_run IS NOT NULL LIMIT 50",
+    )
+    .fetch_all(&app.db)
+    .await
+    {
+        Ok(expired) => {
+            for row in expired {
+                let id: Uuid = row.get("id");
+                let run: Uuid = row.get("active_run");
+                if let Err(error) = runs::finish(app, id, run, runs::Completion::Expired).await
+                    && error.0 != StatusCode::CONFLICT
+                {
+                    tracing::warn!(conversation_id = %id, run_id = %run, status = error.0.as_u16(), "failed to expire stale run");
+                }
+            }
+        }
+        Err(error) => tracing::warn!(error = %error, "failed to query expired runs"),
     }
-    sqlx::query("UPDATE mentions SET state='uncertain',lease_until=NULL WHERE state='sending' AND lease_until<now()").execute(&app.db).await?;
-    sqlx::query("DELETE FROM link_challenges WHERE expires_at<=now()")
+    if let Err(error) = sqlx::query(
+        "UPDATE mentions SET state='uncertain',lease_until=NULL WHERE state='sending' AND lease_until<now()",
+    )
+    .execute(&app.db)
+    .await
+    {
+        tracing::warn!(error = %error, "failed to recover stale sending mentions");
+    }
+    if let Err(error) = sqlx::query("DELETE FROM link_challenges WHERE expires_at<=now()")
         .execute(&app.db)
-        .await?;
-    for _ in 0..50 {
+        .await
+    {
+        tracing::warn!(error = %error, "failed to purge expired link challenges");
+    }
+    for _ in 0..100 {
         let mut tx = app.db.begin().await?;
-        let id:Option<Uuid>=sqlx::query_scalar("SELECT object_id FROM object_cleanup WHERE due_at<=now() ORDER BY due_at LIMIT 1 FOR UPDATE SKIP LOCKED").fetch_optional(&mut *tx).await?;
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT object_id FROM object_cleanup WHERE due_at<=now() ORDER BY due_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(id) = id else {
             break;
         };
         match app.storage.bucket.delete(&Storage::path(id)).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(_) => return Err(unavailable()),
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                sqlx::query("DELETE FROM object_cleanup WHERE object_id=$1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM stored_objects WHERE object_id=$1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Err(error) => {
+                tracing::warn!(object_id = %id, error = %error, "S3 delete failed during GC, deferring");
+                sqlx::query(
+                    "UPDATE object_cleanup SET due_at=now()+interval '1 minute' WHERE object_id=$1",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
-        sqlx::query("DELETE FROM object_cleanup WHERE object_id=$1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM stored_objects WHERE object_id=$1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
     }
     Ok(())

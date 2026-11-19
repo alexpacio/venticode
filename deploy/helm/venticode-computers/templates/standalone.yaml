@@ -26,12 +26,17 @@ spec:
       serviceAccountName: {{ .Values.server.serviceAccount }}
       automountServiceAccountToken: false
       enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
       securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: venticode
           image: {{ $app.image | quote }}
           ports: [{name: http, containerPort: 8080}]
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          {{- with $app.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           envFrom:
             - secretRef: {name: {{ $app.secretName }}}
           env:
@@ -52,7 +57,9 @@ spec:
             {{- if .Values.kitesurf.image }}
             - {name: VENTICODE_KITESURF_IMAGE, value: {{ .Values.kitesurf.image | quote }}}
             {{- end }}
-          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 15}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5}
+          startupProbe: {httpGet: {path: /healthz, port: http}, failureThreshold: 30, periodSeconds: 2}
           {{- if or .Values.computer.image .Values.kitesurf.image }}
           volumeMounts:
             - {name: kube, mountPath: /var/run/secrets/venticode-kubernetes, readOnly: true}
@@ -60,6 +67,16 @@ spec:
         - name: connector
           image: {{ $app.connectorImage | quote }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          {{- with $app.connectorResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $app.gitlabOrigin }}
+          env:
+            - {name: GITLAB_ORIGIN, value: {{ . | quote }}}
+          {{- end }}
+          readinessProbe: {httpGet: {path: /healthz, port: 4190}, initialDelaySeconds: 3, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /healthz, port: 4190}, initialDelaySeconds: 10, periodSeconds: 20}
           volumeMounts:
             - {name: connector-tmp, mountPath: /tmp}
       volumes:
@@ -88,6 +105,11 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    {{- with $app.ingressAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   {{- with $app.ingressClassName }}
   ingressClassName: {{ . | quote }}

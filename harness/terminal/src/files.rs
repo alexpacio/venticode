@@ -389,9 +389,12 @@ impl Files {
                     );
                     let entry = entry?;
                     let ft = entry.file_type()?;
-                    let metadata = entry.metadata().unwrap_or_else(|_| {
-                        std::fs::symlink_metadata(entry.path()).expect("entry metadata")
-                    });
+                    let Ok(metadata) = entry
+                        .metadata()
+                        .or_else(|_| std::fs::symlink_metadata(entry.path()))
+                    else {
+                        continue;
+                    };
                     items.push(json!({
                         "name": entry.file_name().to_string_lossy(),
                         "directory": metadata.is_dir(),

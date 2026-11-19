@@ -20,7 +20,7 @@ enum Protocol {
 
 impl Provider {
     pub fn from_env() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let protocol = match env::var("VENTICODE_LLM_PROVIDER")?.as_str() {
+        let protocol = match require_env("VENTICODE_LLM_PROVIDER")?.as_str() {
             "openai" => Protocol::OpenAi,
             "anthropic" => Protocol::Anthropic,
             _ => return Err("Set VENTICODE_LLM_PROVIDER to openai or anthropic".into()),
@@ -30,7 +30,15 @@ impl Provider {
             Protocol::Anthropic => ("https://api.anthropic.com/v1", "messages"),
         };
         let base = env::var("VENTICODE_LLM_BASE_URL").unwrap_or_else(|_| default_base.into());
-        let endpoint = reqwest::Url::parse(&format!("{}/{suffix}", base.trim_end_matches('/')))?;
+        let trimmed_base = base.trim().trim_end_matches('/');
+        if trimmed_base.ends_with(&format!("/{suffix}")) {
+            return Err(format!(
+                "VENTICODE_LLM_BASE_URL should be the API base (e.g. ending in /v1), without '/{suffix}'"
+            )
+            .into());
+        }
+        let endpoint = reqwest::Url::parse(&format!("{trimmed_base}/{suffix}"))
+            .map_err(|e| format!("Invalid VENTICODE_LLM_BASE_URL: {e}"))?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || endpoint.host().is_none()
             || !endpoint.username().is_empty()
@@ -43,16 +51,23 @@ impl Provider {
         }
         let key = env::var("VENTICODE_LLM_API_KEY")
             .ok()
+            .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty());
-        if (base == default_base || matches!(protocol, Protocol::Anthropic)) && key.is_none() {
+        if (trimmed_base == default_base || matches!(protocol, Protocol::Anthropic))
+            && key.is_none()
+        {
             return Err("Set VENTICODE_LLM_API_KEY".into());
         }
-        let model = env::var("VENTICODE_MODEL")?;
-        let max_tokens =
-            env::var("VENTICODE_LLM_MAX_TOKENS").map_or(Ok(4096), |v| v.parse::<u32>())?;
-        let tools = env::var("VENTICODE_LLM_TOOLS").map_or(Ok(true), |v| v.parse::<bool>())?;
-        let vision =
-            env::var("VENTICODE_LLM_VISION").map_or(Ok(false), |value| value.parse::<bool>())?;
+        let model = require_env("VENTICODE_MODEL")?;
+        let max_tokens = env::var("VENTICODE_LLM_MAX_TOKENS")
+            .map_or(Ok(4096), |v| v.trim().parse::<u32>())
+            .map_err(|_| "VENTICODE_LLM_MAX_TOKENS must be a positive integer")?;
+        let tools = env::var("VENTICODE_LLM_TOOLS")
+            .map_or(Ok(true), |v| v.trim().parse::<bool>())
+            .map_err(|_| "VENTICODE_LLM_TOOLS must be true or false")?;
+        let vision = env::var("VENTICODE_LLM_VISION")
+            .map_or(Ok(false), |value| value.trim().parse::<bool>())
+            .map_err(|_| "VENTICODE_LLM_VISION must be true or false")?;
         if model.trim().is_empty() || max_tokens == 0 {
             return Err("Configure a model and a positive VENTICODE_LLM_MAX_TOKENS".into());
         }
@@ -74,57 +89,96 @@ impl Provider {
 
 type Events = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 
+fn retry_delay(attempt: u32, headers: Option<&HeaderMap>) -> Duration {
+    if let Some(secs) = headers
+        .and_then(|h| h.get(header::RETRY_AFTER))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs.clamp(1, 10));
+    }
+    Duration::from_millis(500 * (1u64 << attempt.min(3)))
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504 | 529)
+}
+
 pub(super) async fn infer(app: &App, h: &HeaderMap, request: &Value) -> Result<Events> {
-    let (res, protocol) = if let Some(local) = &app.standalone {
-        let p = &local.provider;
-        let mut builder = app.http.post(p.endpoint.clone());
-        let body = match p.protocol {
-            Protocol::OpenAi => {
-                if let Some(key) = &p.key {
-                    builder = builder.bearer_auth(key);
+    let mut attempt = 0u32;
+    let (res, protocol) = loop {
+        let send_result = if let Some(local) = &app.standalone {
+            let p = &local.provider;
+            let mut builder = app.http.post(p.endpoint.clone());
+            let body = match p.protocol {
+                Protocol::OpenAi => {
+                    if let Some(key) = &p.key {
+                        builder = builder.bearer_auth(key);
+                    }
+                    let mut body = request.clone();
+                    if p.endpoint.host_str() != Some("api.openai.com") {
+                        body.as_object_mut()
+                            .ok_or_else(bad)?
+                            .remove("parallel_tool_calls");
+                        body.as_object_mut()
+                            .ok_or_else(bad)?
+                            .remove("stream_options");
+                    }
+                    body
                 }
-                let mut body = request.clone();
-                if p.endpoint.host_str() != Some("api.openai.com") {
-                    body.as_object_mut()
-                        .ok_or_else(bad)?
-                        .remove("parallel_tool_calls");
-                    body.as_object_mut()
-                        .ok_or_else(bad)?
-                        .remove("stream_options");
+                Protocol::Anthropic => {
+                    builder = builder
+                        .header("x-api-key", p.key.as_deref().ok_or_else(unavailable)?)
+                        .header("anthropic-version", "2023-06-01");
+                    anthropic_request(request, p.max_tokens)?
                 }
-                body
-            }
-            Protocol::Anthropic => {
-                builder = builder
-                    .header("x-api-key", p.key.as_deref().ok_or_else(unavailable)?)
-                    .header("anthropic-version", "2023-06-01");
-                anthropic_request(request, p.max_tokens)?
-            }
+            };
+            (builder.json(&body).send().await, p.protocol)
+        } else {
+            (
+                app.control_request(h, Method::POST, "infer")?
+                    .json(request)
+                    .send()
+                    .await,
+                Protocol::OpenAi,
+            )
         };
-        (
-            builder
-                .json(&body)
-                .send()
-                .await
-                .map_err(|_| unavailable())?,
-            p.protocol,
-        )
-    } else {
-        (
-            app.control_request(h, Method::POST, "infer")?
-                .json(request)
-                .send()
-                .await
-                .map_err(|_| unavailable())?,
-            Protocol::OpenAi,
-        )
+        match send_result {
+            (Ok(res), _protocol) if is_retryable_status(res.status()) && attempt < 2 => {
+                let status = res.status();
+                let wait = retry_delay(attempt, Some(res.headers()));
+                tracing::warn!(
+                    status = status.as_u16(),
+                    attempt = attempt + 1,
+                    wait_ms = wait.as_millis() as u64,
+                    "retrying transient LLM response"
+                );
+                attempt += 1;
+                tokio::time::sleep(wait).await;
+            }
+            (Ok(res), protocol) => break (res, protocol),
+            (Err(err), _) if attempt < 2 => {
+                let wait = retry_delay(attempt, None);
+                tracing::warn!(error = %err, attempt = attempt + 1, wait_ms = wait.as_millis() as u64, "retrying transient LLM transport error");
+                attempt += 1;
+                tokio::time::sleep(wait).await;
+            }
+            (Err(err), _) => {
+                tracing::error!(error = %err, "LLM request failed");
+                return Err(unavailable());
+            }
+        }
     };
     if !res.status().is_success() {
         let status = res.status();
         let message = if app.standalone.is_some() {
+            let body = res.text().await.unwrap_or_default();
+            let preview: String = body.chars().take(400).collect();
+            tracing::error!(status = status.as_u16(), body = %preview, "standalone LLM provider returned error");
             "Provider LLM non disponibile / LLM provider unavailable".to_owned()
         } else {
             let body: Value = res.json().await.unwrap_or_default();
+            tracing::warn!(status = status.as_u16(), "control LLM inference error");
             body["error"]["message"]
                 .as_str()
                 .unwrap_or("Gateway unavailable")
@@ -184,9 +238,12 @@ fn anthropic_request(request: &Value, max_tokens: u32) -> Result<Value> {
         }
         if let Some(calls) = msg["tool_calls"].as_array() {
             for call in calls {
-                let input: Value =
-                    serde_json::from_str(call["function"]["arguments"].as_str().ok_or_else(bad)?)
-                        .map_err(|_| bad())?;
+                let raw_args = call["function"]["arguments"].as_str().ok_or_else(bad)?;
+                let input: Value = if raw_args.trim().is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(raw_args).map_err(|_| bad())?
+                };
                 blocks.push(json!({"type":"tool_use","id":call["id"],"name":call["function"]["name"],"input":input}));
             }
         }
@@ -266,8 +323,12 @@ impl AnthropicStream {
                     Some("input_json_delta") => {
                         let (number, fragments, _) =
                             self.open_tools.get_mut(&index()?).ok_or_else(unavailable)?;
+                        let partial = delta["partial_json"].as_str().unwrap_or("");
+                        if partial.is_empty() {
+                            return Ok(None);
+                        }
                         *fragments = true;
-                        json!({"choices":[{"delta":{"tool_calls":[{"index":number,"function":{"arguments":delta["partial_json"]}}]}}]})
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":number,"function":{"arguments":partial}}]}}]})
                     }
                     _ => return Ok(None),
                 }
@@ -288,7 +349,10 @@ impl AnthropicStream {
                         json!([{"finish_reason":"stop"}])
                     }
                     None => json!([]),
-                    _ => return Err(unavailable()),
+                    Some(other) => {
+                        tracing::warn!(stop_reason = %other, "unrecognized Anthropic stop_reason, treating as stop");
+                        json!([{"finish_reason":"stop"}])
+                    }
                 };
                 self.reason_seen |= event["delta"]["stop_reason"].is_string();
                 self.input_tokens = event["usage"]["input_tokens"]
@@ -395,6 +459,27 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("[DONE]")
+        );
+    }
+
+    #[test]
+    fn anthropic_zero_arg_tool_emits_empty_object_even_with_empty_delta() {
+        let mut stream = AnthropicStream::default();
+        let frames = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_0","name":"ls","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
+        ];
+        let chunks: Vec<Value> = frames
+            .iter()
+            .filter_map(|frame| stream.translate(frame).unwrap())
+            .map(|frame| serde_json::from_str(&frame).unwrap())
+            .collect();
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
         );
     }
 }

@@ -99,7 +99,7 @@ impl Browser {
         let computers = app.computers.clone().ok_or_else(unavailable)?;
         let image = computers.kitesurf.as_ref().ok_or_else(unavailable)?;
         let name = format!("kitesurf-{}", Uuid::new_v4().simple());
-        computers.create("pods", json!({
+        let created = computers.create("pods", json!({
             "apiVersion":"v1","kind":"Pod","metadata":{"name":name,"labels":{"app.kubernetes.io/name":"venticode-kitesurf"}},
             "spec":{"runtimeClassName":"gvisor","serviceAccountName":"computer","automountServiceAccountToken":false,
                 "enableServiceLinks":false,"restartPolicy":"Never","activeDeadlineSeconds":900,"terminationGracePeriodSeconds":5,
@@ -111,7 +111,10 @@ impl Browser {
                     "volumeMounts":[{"name":"tmp","mountPath":"/tmp"}]}],
                 "volumes":[{"name":"tmp","emptyDir":{"sizeLimit":"64Mi"}}]}
         })).await?;
-        let mut observed = computers.pod(&name).await?.ok_or_else(unavailable)?;
+        let mut observed = match created {
+            Some(pod) => pod,
+            None => computers.pod(&name).await?.ok_or_else(unavailable)?,
+        };
         let uid = observed["metadata"]["uid"]
             .as_str()
             .ok_or_else(unavailable)?
@@ -314,13 +317,11 @@ impl Browser {
             "browser_snapshot" => self.snapshot().await,
             "browser_follow_link" => {
                 let view = self.snapshot().await?;
-                if view["links"]
+                if !view["links"]
                     .as_array()
                     .ok_or_else(unavailable)?
                     .iter()
-                    .filter(|link| link["url"] == url && link["label"] == args["label"])
-                    .count()
-                    != 1
+                    .any(|link| link["url"] == url && link["label"] == args["label"])
                 {
                     return Err(conflict());
                 }

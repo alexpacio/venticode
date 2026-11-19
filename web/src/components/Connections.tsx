@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, list } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { useProjects, useSession } from "../queries.ts";
@@ -11,8 +11,21 @@ import { runtimeLabel } from "./BotView.tsx";
 type Connection = components["schemas"]["Connection"];
 const providers = { slack: "Slack", telegram: "Telegram", gitlab: "GitLab" };
 
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button type="button" className="btn" style={{ minHeight: 28, fontSize: 12 }} onClick={() => {
+      void navigator.clipboard?.writeText(value).then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1800);
+      }).catch(() => {});
+    }}>{copied ? t("Copiato") : t("Copia")}</button>
+  );
+}
+
 export function Connections({ menu, admin }: { menu: ReactNode; admin: boolean }) {
   const client = useQueryClient();
+  const [params] = useSearchParams();
   const connections = useQuery({ queryKey: ["connections"], refetchInterval: 15000, queryFn: () => list<Connection>("/connections") });
   const [editing, setEditing] = useState<Connection | "new" | null>(null);
   const refresh = async () => {
@@ -22,11 +35,12 @@ export function Connections({ menu, admin }: { menu: ReactNode; admin: boolean }
   return <main className="main">
     <header className="topbar">{menu}<h1>{t("Connessioni bot")}</h1></header>
     <div className="page">
-      {connections.isError && <p role="alert">{connections.error.message}</p>}
+      {params.get("error") === "oauth_cancelled" && <p role="alert" className="error-line">{t("Autorizzazione Slack annullata.")}</p>}
+      {connections.isError && <p role="alert" className="error-line">{connections.error.message}</p>}
       {connections.isPending && <p role="status">{t("Caricamento…")}</p>}
       {connections.data?.length === 0 && <p>{t("Nessuna connessione configurata.")}</p>}
       {connections.data?.map(c => <ConnectionCard key={c.id} connection={c} admin={admin} refresh={refresh} edit={() => setEditing(c)} />)}
-      {admin && !editing && <button className="btn" onClick={() => setEditing("new")}>{t("Aggiungi connessione")}</button>}
+      {admin && !editing && <div><button className="btn" onClick={() => setEditing("new")}>{t("Aggiungi connessione")}</button></div>}
       {admin && editing && <SetupForm key={editing === "new" ? editing : editing.id} connection={editing === "new" ? null : editing} done={refresh} cancel={() => setEditing(null)} />}
     </div>
   </main>;
@@ -34,6 +48,7 @@ export function Connections({ menu, admin }: { menu: ReactNode; admin: boolean }
 
 function ConnectionCard({ connection: c, admin, refresh, edit }: { connection: Connection; admin: boolean; refresh: () => Promise<void>; edit: () => void }) {
   const [command, setCommand] = useState("");
+  const [expiresMinutes, setExpiresMinutes] = useState(5);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const run = async (action: () => Promise<void>) => {
@@ -44,22 +59,23 @@ function ConnectionCard({ connection: c, admin, refresh, edit }: { connection: C
     event.preventDefault();
     const external_user_id = new FormData(event.currentTarget).get("identity");
     void run(async () => {
-      const proof = await api<{ command: string }>(`/connections/${c.id}/link`, "POST", { external_user_id });
+      const proof = await api<{ command: string; expires_in?: number }>(`/connections/${c.id}/link`, "POST", { external_user_id });
       setCommand(proof.command);
+      setExpiresMinutes(Math.max(1, Math.round((proof.expires_in ?? 300) / 60)));
     });
   };
   return <section className="card"><h2>{providers[c.kind]} · {c.destination}</h2>
-    <p>{c.status === "connected" ? t("Connesso") : c.status === "pending" ? t("In attesa di autorizzazione") : t("Disconnesso")}</p>
-    {admin && c.kind === "slack" && <p>{t("URL per gli eventi Slack")} <code>{c.webhook_url}</code></p>}
+    <p style={{ margin: 0 }}>{c.status === "connected" ? t("Connesso") : c.status === "pending" ? t("In attesa di autorizzazione") : t("Disconnesso")}</p>
+    {admin && c.kind === "slack" && <p className="copy-row" style={{ margin: 0 }}>{t("URL per gli eventi Slack")} <code>{c.webhook_url}</code><CopyButton value={c.webhook_url} /></p>}
     {c.status === "connected" && <>
-      <Link className="btn" to={`/bots/${c.id}`}>{t("Apri menzioni")}</Link>
-      {c.linked_user_id ? <p>{t("Account collegato: {0}", c.linked_user_id)} <button className="btn" disabled={busy} onClick={() => void run(async () => {
+      <div><Link className="btn" to={`/bots/${c.id}`}>{t("Apri menzioni")}</Link></div>
+      {c.linked_user_id ? <p className="copy-row" style={{ margin: 0 }}>{t("Account collegato: {0}", c.linked_user_id)} <button className="btn" disabled={busy} onClick={() => void run(async () => {
         await api(`/connections/${c.id}/link`, "DELETE"); await refresh();
-      })}>{t("Scollega il mio account")}</button></p> : <form onSubmit={link}><label className="field">{t("Il tuo ID utente su {0}", providers[c.kind])}
+      })}>{t("Scollega il mio account")}</button></p> : <form style={{ display: "flex", flexDirection: "column", gap: 10 }} onSubmit={link}><label className="field">{t("Il tuo ID utente su {0}", providers[c.kind])}
         <input name="identity" required className="input" maxLength={64} autoComplete="off" /></label>
-        <button className="btn" disabled={busy}>{t("Collega il mio account")}</button>
+        <div><button className="btn" disabled={busy}>{t("Collega il mio account")}</button></div>
       </form>}
-      {command && <p role="status">{t("Invia questo comando dal tuo account entro cinque minuti.")} <code>{command}</code></p>}
+      {command && <p role="status" className="copy-row" style={{ margin: 0 }}>{t("Invia questo comando dal tuo account entro {0} minuti.", expiresMinutes)} <code>{command}</code><CopyButton value={command} /></p>}
     </>}
     {admin && <div className="dialog-actions">{c.status !== "disconnected" && (c.project_id || c.runtime === "kitesurf" || c.runtime === "computer") && <button className="btn" disabled={busy} onClick={edit}>{t("Sostituisci credenziali")}</button>}
       {c.status !== "disconnected" && <button className="btn btn-danger" disabled={busy} onClick={() => {
@@ -75,9 +91,10 @@ function SetupForm({ connection, done, cancel }: { connection: Connection | null
   const [kind, setKind] = useState<Connection["kind"]>(connection?.kind ?? "slack");
   const projects = useProjects();
   const runtimes = useSession().data?.bot_runtimes ?? ["project"];
-  const [runtime, setRuntime] = useState<NonNullable<Connection["runtime"]>>(connection?.runtime ?? "project");
+  const [runtime, setRuntime] = useState<NonNullable<Connection["runtime"]>>(connection?.runtime ?? runtimes[0] ?? "project");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const redirectUrl = `${location.origin}/oauth/slack`;
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -106,10 +123,13 @@ function SetupForm({ connection, done, cancel }: { connection: Connection | null
       <select className="select" value={runtime} disabled={!!connection} onChange={e => setRuntime(e.target.value as NonNullable<Connection["runtime"]>)}>
         {runtimes.map(mode => <option value={mode} key={mode}>{runtimeLabel(mode)}</option>)}
       </select></label>}
-    {runtime === "project" && <label className="field">{t("Progetto")}<select className="select" name="project" required defaultValue={connection?.project_id ?? ""} disabled={!!connection}>
-      {projects.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.root}/{p.path}</option>)}</select></label>}
+    {runtime === "project" && <label className="field">{t("Progetto")}<select className="select" name="project" required defaultValue={connection?.project_id ?? ""} disabled={!!connection || !projects.data?.length}>
+      {projects.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.path === "." ? p.root : `${p.root}/${p.path}`}</option>)}</select></label>}
+    {runtime === "project" && !connection && !projects.isPending && !projects.data?.length && (
+      <p className="muted" style={{ margin: 0, fontSize: 12 }}>{t("Aggiungi prima un progetto da un harness per collegare un bot.")}</p>
+    )}
     {kind === "slack" ? <>
-      <p>{t("URL di reindirizzamento OAuth")} <code>{location.origin}/oauth/slack</code></p>
+      <p className="copy-row" style={{ margin: 0 }}>{t("URL di reindirizzamento OAuth")} <code>{redirectUrl}</code><CopyButton value={redirectUrl} /></p>
       <label className="field">{t("ID client")}<input className="input" name="client_id" required autoComplete="off" /></label>
       <label className="field">{t("Segreto client")}<input className="input" name="client_secret" type="password" required autoComplete="new-password" /></label>
       <label className="field">{t("Segreto di firma")}<input className="input" name="signing_secret" type="password" required autoComplete="new-password" /></label>

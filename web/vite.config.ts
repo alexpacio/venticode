@@ -11,6 +11,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api/v1/venticode/browser-agent": { target: api, ws: true },
+      "/api/v1/venticode/computer/screen": { target: api, ws: true },
       "/api": { target: api },
       "/venticode": { target: api },
       "/__dev": { target: api },

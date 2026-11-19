@@ -4,6 +4,7 @@ mod computer;
 mod connections;
 mod history;
 mod inference;
+mod log;
 mod mentions;
 mod privacy;
 mod projects;
@@ -23,8 +24,9 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
-use std::{env, sync::Arc};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::{env, sync::Arc, time::Duration};
+use tokio::sync::{broadcast, watch};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -36,6 +38,8 @@ struct App {
     ventic: Option<Arc<Ventic>>,
     standalone: Option<Arc<standalone::Standalone>>,
     computers: Option<Arc<computer::Computers>>,
+    events: broadcast::Sender<Uuid>,
+    shutdown: watch::Receiver<bool>,
 }
 
 struct Ventic {
@@ -82,10 +86,18 @@ impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
         match e {
             sqlx::Error::RowNotFound => missing(),
-            sqlx::Error::Database(ref e) if e.is_unique_violation() => conflict(),
-            _ => unavailable(),
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => conflict(),
+            sqlx::Error::Database(ref db) if db.message().contains("Subject erased") => forbidden(),
+            other => {
+                tracing::error!(error = %other, "database query failed");
+                unavailable()
+            }
         }
     }
+}
+
+fn require_env(name: &str) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    env::var(name).map_err(|_| format!("Missing required environment variable: {name}").into())
 }
 
 impl App {
@@ -150,8 +162,10 @@ impl Member {
                 .get(header::HOST)
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(forbidden)?;
-            if h.get(header::ORIGIN).and_then(|v| v.to_str().ok())
-                != Some(&format!("https://{host}"))
+            if !h
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|o| o.eq_ignore_ascii_case(&format!("https://{host}")))
             {
                 return Err(forbidden());
             }
@@ -232,37 +246,125 @@ async fn proxy(
     let headers = upstream.headers().clone();
     let mut result = (status, Body::from_stream(upstream.bytes_stream())).into_response();
     for name in [header::CONTENT_TYPE, header::SET_COOKIE, header::LOCATION] {
-        if let Some(v) = headers.get(&name) {
-            result.headers_mut().insert(name, v.clone());
+        for v in headers.get_all(&name) {
+            result.headers_mut().append(&name, v.clone());
         }
     }
     Ok(result)
 }
+
+async fn readyz(State(app): State<App>) -> impl IntoResponse {
+    if *app.shutdown.borrow() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining");
+    }
+    match sqlx::query("SELECT 1").execute(&app.db).await {
+        Ok(_) => (StatusCode::OK, "ok"),
+        Err(error) => {
+            tracing::warn!(error = %error, "readiness database check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        }
+    }
+}
+
+async fn security_headers(
+    req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let immutable_asset = req.uri().path().starts_with("/assets/");
+    let mut res = next.run(req).await;
+    let cache = if immutable_asset && res.status().is_success() {
+        "public, max-age=31536000, immutable"
+    } else {
+        "private, no-store"
+    };
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, cache.parse().unwrap());
+    res.headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    res.headers_mut()
+        .insert("referrer-policy", "no-referrer".parse().unwrap());
+    res
+}
+
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, draining"),
+        _ = terminate => tracing::info!("received SIGTERM, draining"),
+    }
+    let _ = shutdown_tx.send(true);
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (ventic, standalone) = match env::var("VENTICODE_MODE").as_deref() {
-        Ok("standalone") => (None, Some(Arc::new(standalone::Standalone::from_env()?))),
-        Ok("ventic") | Err(env::VarError::NotPresent) => (
-            Some(Arc::new(Ventic {
-                control: env::var("CONTROL_URL")?,
-                service_token: env::var("VENTICODE_SERVICE_TOKEN")?,
-                control_hash: hex::decode(env::var("CONTROL_SERVICE_TOKEN_HASH")?)?,
-            })),
-            None,
-        ),
+    log::init();
+    let mode = env::var("VENTICODE_MODE").unwrap_or_else(|_| "ventic".into());
+    let (ventic, standalone) = match mode.as_str() {
+        "standalone" => (None, Some(Arc::new(standalone::Standalone::from_env()?))),
+        "ventic" => {
+            let control = require_env("CONTROL_URL")?.trim_end_matches('/').to_owned();
+            let parsed = reqwest::Url::parse(&control)
+                .map_err(|_| "CONTROL_URL must be a valid HTTP or HTTPS URL")?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                return Err("CONTROL_URL must be an HTTP or HTTPS URL".into());
+            }
+            let service_token = require_env("VENTICODE_SERVICE_TOKEN")?;
+            let control_hash = hex::decode(require_env("CONTROL_SERVICE_TOKEN_HASH")?.trim())
+                .map_err(|_| "CONTROL_SERVICE_TOKEN_HASH must be valid hex")?;
+            if control_hash.len() != 32 {
+                return Err("CONTROL_SERVICE_TOKEN_HASH must decode to 32 bytes (SHA-256)".into());
+            }
+            (
+                Some(Arc::new(Ventic {
+                    control,
+                    service_token,
+                    control_hash,
+                })),
+                None,
+            )
+        }
         _ => return Err("Set VENTICODE_MODE to standalone or ventic".into()),
     };
-    let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
+    let database_url = require_env("DATABASE_URL")?;
+    let max_connections = env::var("DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map_or(20, |n| n.clamp(1, 200));
+    let db = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url)
+        .await
+        .map_err(|e| format!("Failed to connect to DATABASE_URL: {e}"))?;
     sqlx::migrate!("./server/migrations").run(&db).await?;
+    let (events, _) = broadcast::channel(512);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let app = App {
         db,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(60))
             .build()?,
         ventic,
         standalone,
         computers: computer::Computers::from_env()?.map(Arc::new),
         storage: Arc::new(storage::Storage::new()?),
+        events,
+        shutdown: shutdown_rx,
     };
     if let Some(local) = &app.standalone {
         local
@@ -286,6 +388,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .merge(computer::routes())
         .fallback(|| async { missing() });
     let assets = env::var("WEB_ROOT").unwrap_or_else(|_| "web/dist".into());
+    if !std::path::Path::new(&assets).exists() {
+        tracing::warn!(web_root = %assets, "WEB_ROOT directory does not exist");
+    }
     let frame_ancestor = app
         .ventic
         .as_ref()
@@ -305,6 +410,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let router = router
         .route("/internal/computer/{id}/ws", get(computer::enroll))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/hooks/{kind}/{id}", post(mentions::hook))
         .route("/oauth/slack", get(connections::callback))
         .route(
@@ -319,29 +425,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             header::CONTENT_SECURITY_POLICY,
             frame_policy,
         ))
-        .layer(axum::middleware::map_response(
-            |mut res: Response| async move {
-                res.headers_mut()
-                    .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
-                res.headers_mut()
-                    .insert("x-content-type-options", "nosniff".parse().unwrap());
-                res
-            },
-        ))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(app.clone());
-    tokio::spawn(mentions::worker(app.clone()));
-    if app.computers.is_some() {
-        tokio::spawn(computer::maintain(app.clone()));
-    }
-    tokio::spawn(storage::maintain(app));
-    let listener = tokio::net::TcpListener::bind(
-        env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:4189".into()),
-    )
-    .await?;
+    let mentions_task = tokio::spawn(mentions::worker(app.clone()));
+    let computer_task = app
+        .computers
+        .as_ref()
+        .map(|_| tokio::spawn(computer::maintain(app.clone())));
+    let storage_task = tokio::spawn(storage::maintain(app.clone()));
+    let listen = env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:4189".into());
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    tracing::info!(
+        mode = %mode,
+        listen = %listen,
+        web_root = %assets,
+        max_db_connections = max_connections,
+        computers = app.computers.is_some(),
+        "venticode server started"
+    );
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = mentions_task.await;
+        if let Some(task) = computer_task {
+            let _ = task.await;
+        }
+        let _ = storage_task.await;
+    })
+    .await;
+    tracing::info!("venticode server stopped");
     Ok(())
 }

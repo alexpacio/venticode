@@ -40,11 +40,13 @@ export function fold(events: TranscriptEvent[]): Transcript {
       case "user_message":
         blocks.push({ kind: "user", id: event.message_id || String(event.sequence), content: event.content || "" });
         break;
-      case "text":
+      case "text": {
         // Assistant text resumes as a new block after tool calls, like a terminal transcript.
-        if (last?.kind === "text" && last.id.startsWith(event.message_id + ":")) last.content += event.delta || "";
-        else blocks.push({ kind: "text", id: `${event.message_id}:${event.sequence}`, content: event.delta || "" });
+        const msgId = event.message_id || `seq-${event.sequence}`;
+        if (last?.kind === "text" && last.id.startsWith(msgId + ":")) last.content += event.delta || "";
+        else blocks.push({ kind: "text", id: `${msgId}:${event.sequence}`, content: event.delta || "" });
         break;
+      }
       case "tool_call": {
         const block: ToolBlock = { kind: "tool", id: event.call_id!, operation: event.operation || "", target: event.target || "", output: "", status: "running" };
         tools.set(block.id, block);
@@ -82,8 +84,11 @@ export function fold(events: TranscriptEvent[]): Transcript {
       case "question":
       case "plan":
       case "goal_completed":
-        if (event.content && !(blocks.at(-1)?.kind === "text" && (blocks.at(-1) as {content?:string})?.content === event.content))
-          blocks.push({kind:"text",id:String(event.sequence),content:event.content});
+        if (event.content && !(blocks.at(-1)?.kind === "text" && (blocks.at(-1) as { content?: string })?.content?.trim() === event.content.trim()))
+          blocks.push({ kind: "text", id: String(event.sequence), content: event.content });
+        break;
+      case "goal_cancelled":
+        blocks.push({ kind: "text", id: String(event.sequence), content: event.content || "Obiettivo annullato / Goal cancelled" });
         break;
       case "todo":
         todos = event.todos || [];

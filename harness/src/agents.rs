@@ -89,7 +89,7 @@ impl Session {
     pub fn receive(&mut self, event: &Value) -> Result<Vec<Value>> {
         let id = event["id"].as_str().unwrap_or("");
         if id == "ventiharness:init" && self.stage == 1 {
-            ensure!(event.get("error").is_none(), "Agent initialization failed");
+            ensure!(event["error"].is_null(), "Agent initialization failed");
             self.stage = 2;
             return Ok(if self.agent == Agent::Codex {
                 vec![
@@ -107,10 +107,7 @@ impl Session {
             });
         }
         if id == "ventiharness:session" && self.stage == 2 {
-            ensure!(
-                event.get("error").is_none(),
-                "Agent session creation failed"
-            );
+            ensure!(event["error"].is_null(), "Agent session creation failed");
             self.stage = 3;
             if self.agent == Agent::Codex {
                 let thread = event["result"]["thread"]["id"]

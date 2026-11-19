@@ -31,8 +31,11 @@ pub async fn run() -> Result<()> {
         .set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("Invalid relay scheme"))?;
     origin.set_path(&format!("/internal/computer/{id}/ws"));
+    let mut attempt = 0u32;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        let attempt = async {
+        let started = tokio::time::Instant::now();
+        let attempt_fut = async {
             let mut request = origin.as_str().into_client_request()?;
             let token = tokio::fs::read_to_string(IDENTITY).await?;
             request
@@ -40,10 +43,34 @@ pub async fn run() -> Result<()> {
                 .insert("authorization", format!("Bearer {}", token.trim()).parse()?);
             connect(request).await
         };
-        if let Err(error) = attempt.await {
-            eprintln!("Managed harness relay reconnecting: {error}");
+        tokio::select! {
+            _ = term.recv() => {
+                tracing::info!("managed harness received SIGTERM, exiting");
+                return Ok(());
+            }
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            res = attempt_fut => {
+                if started.elapsed() >= Duration::from_secs(30) {
+                    attempt = 0;
+                }
+                if let Err(error) = res {
+                    attempt = attempt.saturating_add(1);
+                    let delay = Duration::from_secs((2u64.saturating_pow(attempt.min(4))).min(15));
+                    tracing::warn!(error = %error, retry_secs = delay.as_secs(), "managed harness relay reconnecting");
+                    tokio::select! {
+                        _ = term.recv() => return Ok(()),
+                        _ = tokio::signal::ctrl_c() => return Ok(()),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::select! {
+            _ = term.recv() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
     }
 }
 
@@ -239,7 +266,7 @@ async fn execute(
         .args(["--", "/usr/local/bin/venticode-harness", "worker"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
     let mut stdin = child.stdin.take().context("Worker stdin unavailable")?;
@@ -248,7 +275,9 @@ async fn execute(
         .await?;
     drop(stdin);
     let mut stdout = BufReader::new(child.stdout.take().context("Worker stdout unavailable")?);
+    let mut stderr = child.stderr.take();
     let work = async {
+        let mut saw_error = false;
         loop {
             let mut bytes = Vec::new();
             if (&mut stdout)
@@ -261,13 +290,39 @@ async fn execute(
             }
             ensure!(bytes.ends_with(b"\n"), "Oversized worker frame");
             let data: Value = serde_json::from_slice(&bytes)?;
+            if data["type"] == "error" {
+                saw_error = true;
+            }
             runtime::output(tx, id, data).await?;
         }
-        ensure!(child.wait().await?.success(), "Managed command failed");
+        let status = child.wait().await?;
+        if !status.success() {
+            let mut err_buf = Vec::new();
+            if let Some(se) = stderr.take() {
+                let _ = se.take(4096).read_to_end(&mut err_buf).await;
+            }
+            let detail = String::from_utf8_lossy(&err_buf).trim().to_owned();
+            if !detail.is_empty() {
+                tracing::warn!(job_id = %id, stderr = %detail, "managed worker failed");
+            }
+            if saw_error {
+                anyhow::bail!("Managed worker reported an error");
+            }
+            if detail.is_empty() {
+                anyhow::bail!("Managed command failed");
+            }
+            anyhow::bail!("Managed command failed: {detail}");
+        }
+        ensure!(!saw_error, "Managed worker reported an error");
         Ok(())
     };
     if let Some(listener) = listener {
-        tokio::select! { result = work => result, result = broker(listener, &unit, id, tx, inbox) => result }
+        tokio::select! {
+            result = work => result,
+            _ = broker(listener, &unit, id, tx, inbox) => {
+                anyhow::bail!("Model broker stopped unexpectedly")
+            }
+        }
     } else {
         work.await
     }
@@ -324,18 +379,26 @@ async fn broker(
             continue;
         };
         let query = Uuid::new_v4();
+        let query_str = query.to_string();
+        while inbox.try_recv().is_ok() {}
         runtime::output(
             tx,
             id,
             json!({"type":"model_request","query":query,"prompt":prompt}),
         )
         .await?;
-        let response = tokio::time::timeout(Duration::from_secs(25), inbox.recv())
-            .await
-            .ok()
-            .flatten()
-            .filter(|frame| frame["query"] == query.to_string())
-            .unwrap_or_else(|| json!({"error":"Model request timed out"}));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break json!({"error":"Model request timed out"});
+            }
+            match tokio::time::timeout(remaining, inbox.recv()).await {
+                Ok(Some(frame)) if frame["query"] == query_str => break frame,
+                Ok(Some(_)) => continue,
+                _ => break json!({"error":"Model request timed out"}),
+            }
+        };
         let _ = peer
             .get_mut()
             .write_all(format!("{}\n", response).as_bytes())
@@ -345,7 +408,7 @@ async fn broker(
 
 pub async fn worker() -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin());
-    let mut request = line(&mut input, 256 * 1024).await?;
+    let mut request = line(&mut input, LIMIT).await?;
     let id: Uuid = serde_json::from_value(request["id"].clone())?;
     let payload = request["payload"].take();
     let (tx, mut rx) = mpsc::channel(8);
@@ -360,7 +423,7 @@ pub async fn worker() -> Result<()> {
                 .args(["ask", "--json"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()?;
             cli.stdin
@@ -369,7 +432,13 @@ pub async fn worker() -> Result<()> {
                 .write_all(prompt.as_bytes())
                 .await?;
             let reply = cli.wait_with_output().await?;
-            ensure!(reply.status.success(), "Model request failed");
+            if !reply.status.success() {
+                let err = String::from_utf8_lossy(&reply.stderr).trim().to_owned();
+                if err.is_empty() {
+                    anyhow::bail!("Model request failed");
+                }
+                anyhow::bail!("Model request failed: {err}");
+            }
             return runtime::output(&tx, id, serde_json::from_slice(&reply.stdout)?).await;
         }
         runtime::Runtime::new()?
@@ -394,6 +463,8 @@ pub async fn worker() -> Result<()> {
                 while let Ok(frame) = rx.try_recv() { stdout.write_all(&forward(frame)?).await?; }
                 if let Err(error) = result {
                     stdout.write_all(format!("{}\n",json!({"type":"error","error":error.to_string()})).as_bytes()).await?;
+                    stdout.flush().await?;
+                    std::process::exit(1);
                 }
                 stdout.flush().await?;
                 return Ok(());

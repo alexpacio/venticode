@@ -130,20 +130,29 @@ impl Computers {
     }
 
     pub fn runner(&self, id: Uuid) -> Option<Arc<runner::Runner>> {
-        self.runners.lock().unwrap().get(&id).cloned()
+        self.runners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
     }
 
     pub fn request_runner(&self, id: Uuid) -> Option<Arc<runner::Runner>> {
         self.runners
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .find(|runner| runner.has_request(id))
             .cloned()
     }
 
     pub fn display(&self, id: Uuid) -> Arc<tokio::sync::RwLock<()>> {
-        self.displays.lock().unwrap().entry(id).or_default().clone()
+        self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_default()
+            .clone()
     }
 
     pub async fn inventory(
@@ -199,21 +208,25 @@ impl Computers {
         format!("/api/v1/namespaces/{}/{path}", self.namespace)
     }
 
-    pub async fn create(&self, kind: &str, body: Value) -> Result<()> {
+    pub async fn create(&self, kind: &str, body: Value) -> Result<Option<Value>> {
         let response = self
             .request(Method::POST, &self.namespaced(kind))
             .await?
             .json(&body)
             .send()
             .await
-            .map_err(|_| unavailable())?;
-        if response.status().is_success() || response.status() == StatusCode::CONFLICT {
-            return Ok(());
+            .map_err(|err| {
+                tracing::error!(kind = %kind, error = %err, "Kubernetes create transport error");
+                unavailable()
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await.ok());
         }
-        eprintln!(
-            "Kubernetes denied creation of {kind}: {}",
-            response.status()
-        );
+        if status == StatusCode::CONFLICT {
+            return Ok(None);
+        }
+        tracing::error!(kind = %kind, status = status.as_u16(), "Kubernetes denied creation");
         Err(unavailable())
     }
 
@@ -338,6 +351,10 @@ impl Computers {
         Err(missing())
     }
 
+    pub async fn touch_if_present(&self, app: &App, id: Uuid) {
+        let _ = self.touch(app, id).await;
+    }
+
     pub async fn ready(
         &self,
         app: &App,
@@ -345,11 +362,39 @@ impl Computers {
         owner: Uuid,
     ) -> Result<Arc<runner::Runner>> {
         let id = self.ensure(app, workspace, owner).await?;
+        let pod_name = name(id);
         for step in 0..75 {
             if let Some(runner) = self.runner(id).filter(|runner| runner.online()) {
                 return Ok(runner);
             }
             if step > 0 && step % 8 == 0 {
+                if let Ok(Some(pod)) = self.pod(&pod_name).await
+                    && let Some(reason) =
+                        pod["status"]["containerStatuses"]
+                            .as_array()
+                            .and_then(|list| {
+                                list.iter().find_map(|c| {
+                                    c["state"]["waiting"]["reason"].as_str().filter(|r| {
+                                        matches!(
+                                            *r,
+                                            "ImagePullBackOff"
+                                                | "ErrImagePull"
+                                                | "CrashLoopBackOff"
+                                                | "CreateContainerConfigError"
+                                                | "InvalidImageName"
+                                        )
+                                    })
+                                })
+                            })
+                {
+                    tracing::error!(pod = %pod_name, reason = %reason, "managed computer pod stuck in error state");
+                    return Err(Error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "Avvio del computer non riuscito ({reason}) / Computer failed to start ({reason})"
+                        ),
+                    ));
+                }
                 self.ensure(app, workspace, owner).await?;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -387,8 +432,14 @@ impl Computers {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        self.runners.lock().unwrap().remove(&id);
-        self.displays.lock().unwrap().remove(&id);
+        self.runners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         Ok(true)
     }
 }
@@ -435,7 +486,7 @@ pub(super) async fn enroll(
     let runner = computers
         .runners
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(id)
         .or_insert_with(|| Arc::new(runner::Runner::new(id, "")))
         .clone();
@@ -451,10 +502,17 @@ pub(super) async fn maintain(app: App) {
     let Some(computers) = &app.computers else {
         return;
     };
+    let mut shutdown = app.shutdown.clone();
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = shutdown.changed() => break,
+        }
         if let Err(error) = reap(&app, computers).await {
-            eprintln!("Managed workload reconciliation failed: {}", error.0);
+            tracing::warn!(
+                status = error.0.as_u16(),
+                "managed workload reconciliation failed"
+            );
         }
     }
 }
@@ -513,14 +571,24 @@ async fn reap(app: &App, computers: &Computers) -> Result<()> {
     .bind(live)
     .fetch_all(&mut *tx)
     .await?;
-    for id in ids {
+    for id in &ids {
         computers
-            .delete(&format!("pods/{}", name(id)), Some(machines[&id]))
+            .delete(&format!("pods/{}", name(*id)), Some(machines[id]))
             .await?;
-        computers.runners.lock().unwrap().remove(&id);
-        computers.displays.lock().unwrap().remove(&id);
     }
     tx.commit().await?;
+    for id in ids {
+        computers
+            .runners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        computers
+            .displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
     Ok(())
 }
 
@@ -595,7 +663,7 @@ pub(super) async fn rpc(runner: &runner::Runner, op: &str, args: Value) -> Resul
             match poll["state"].as_str() {
                 Some("done") => return result.ok_or_else(unavailable),
                 Some("failed" | "cancelled") => return Err(unavailable()),
-                _ => tokio::time::sleep(Duration::from_millis(35)).await,
+                _ => runner.wait(Duration::from_millis(35)).await,
             }
         }
     })
@@ -668,22 +736,30 @@ async fn view(
             tokio::select! {
                 packet = ws.recv() => {
                     let Some(Ok(packet)) = packet else { break };
-                    let Message::Text(text) = packet else { continue };
-                    let value: Value = serde_json::from_str(&text).map_err(|_| bad())?;
-                    match value["type"].as_str() {
-                        Some("end") => break,
-                        Some("take") if human.is_none() => {
-                            human = display.clone().try_write_owned().ok();
-                            send(ws, Message::Text(json!({"type":"control","human":human.is_some()}).to_string().into())).await?;
+                    match packet {
+                        Message::Text(text) => {
+                            let value: Value = serde_json::from_str(&text).map_err(|_| bad())?;
+                            match value["type"].as_str() {
+                                Some("end") => break,
+                                Some("take") if human.is_none() => {
+                                    human = display.clone().try_write_owned().ok();
+                                    send(ws, Message::Text(json!({"type":"control","human":human.is_some()}).to_string().into())).await?;
+                                }
+                                Some("release") if human.is_some() => {
+                                    rpc(&runner, "desktop_release", json!({})).await?;
+                                    human = None;
+                                    send(ws, Message::Text(json!({"type":"control","human":false}).to_string().into())).await?;
+                                }
+                                Some("input") if human.is_some() && value["tab"] == DESKTOP => {
+                                    rpc(&runner, "desktop_input", value["input"].clone()).await?;
+                                }
+                                _ => {}
+                            }
                         }
-                        Some("release") if human.is_some() => {
-                            rpc(&runner, "desktop_release", json!({})).await?;
-                            human = None;
-                            send(ws, Message::Text(json!({"type":"control","human":false}).to_string().into())).await?;
+                        Message::Ping(payload) => {
+                            let _ = send(ws, Message::Pong(payload)).await;
                         }
-                        Some("input") if human.is_some() && value["tab"] == DESKTOP => {
-                            rpc(&runner, "desktop_input", value["input"].clone()).await?;
-                        }
+                        Message::Close(_) => break,
                         _ => {}
                     }
                 }
@@ -793,10 +869,11 @@ async fn subcompletion(
     tx.commit().await?;
     let request = json!({"model":model,"messages":[{"role":"user","content":prompt}],
         "stream":true,"stream_options":{"include_usage":true},"max_tokens":2048});
-    let result = tokio::time::timeout(Duration::from_secs(19), async {
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
         let mut events = inference::infer(app, h, &request).await?;
         let mut result = String::new();
         let mut usage = Value::Null;
+        let mut finish_seen = false;
         while let Some(event) = events.next().await {
             let event = event?;
             if event == "[DONE]" {
@@ -805,6 +882,9 @@ async fn subcompletion(
             let value: Value = serde_json::from_str(&event).map_err(|_| unavailable())?;
             if value.get("error").is_some() {
                 return Err(unavailable());
+            }
+            if value["choices"][0]["finish_reason"].is_string() {
+                finish_seen = true;
             }
             if let Some(text) = value["choices"][0]["delta"]["content"].as_str() {
                 if result.len() + text.len() > 128 * 1024 {
@@ -815,6 +895,9 @@ async fn subcompletion(
             if !value["usage"].is_null() {
                 usage = value["usage"].clone();
             }
+        }
+        if finish_seen {
+            return Ok(json!({"model":model,"text":result,"usage":usage}));
         }
         Err(unavailable())
     })

@@ -19,7 +19,7 @@ pub(super) fn tool_content(status: &str, summary: &str, output: &str) -> String 
 
 struct Tool {
     id: String,
-    name: &'static str,
+    name: String,
     arguments: Value,
     output: String,
 }
@@ -66,9 +66,14 @@ impl History {
                         .push(json!({"role":"assistant","content":content}));
                 }
             }
-            Some("goal_cancelled") => self
-                .messages
-                .push(json!({"role":"user","content":"The previous goal was cancelled."})),
+            Some("goal_cancelled") => {
+                self.finish_pending(
+                    "error",
+                    "Outcome unknown. Verify the project before retrying.",
+                );
+                self.messages
+                    .push(json!({"role":"user","content":"The previous goal was cancelled."}));
+            }
             Some("text") => {
                 if let Some(Value::String(text)) = self
                     .messages
@@ -92,10 +97,20 @@ impl History {
                     event["operation"].as_str(),
                     event["arguments"].as_object(),
                 ) {
+                    let is_direct = crate::browser::is_browser_tool(operation)
+                        || crate::tools::is_computer_operation(operation);
+                    let (name, args) = if is_direct {
+                        (operation.to_owned(), Value::Object(arguments.clone()))
+                    } else {
+                        (
+                            "project_tool".to_owned(),
+                            json!({"operation":operation,"arguments":arguments}),
+                        )
+                    };
                     self.pending = Some(Tool {
                         id: id.to_owned(),
-                        name: "project_tool",
-                        arguments: json!({"operation":operation,"arguments":arguments}),
+                        name,
+                        arguments: args,
                         output: String::new(),
                     });
                 }
@@ -110,7 +125,7 @@ impl History {
                     );
                     self.pending = Some(Tool {
                         id: format!("todo_{sequence}"),
-                        name: "update_tasks",
+                        name: "update_tasks".to_owned(),
                         arguments: json!({"todos":todos}),
                         output: "Task list updated".into(),
                     });
@@ -224,5 +239,40 @@ mod tests {
         append_output(&mut output, "ignored");
         assert_eq!(output.len(), TOOL_OUTPUT_LIMIT);
         assert!(output.ends_with('é'));
+    }
+
+    #[test]
+    fn direct_browser_and_computer_tools_keep_their_declared_names() {
+        let mut history = History::default();
+        for event in [
+            json!({"type":"user_message","content":"Open the page"}),
+            json!({"type":"tool_call","call_id":"b1","operation":"browser_open","arguments":{"url":"https://example.test"}}),
+            json!({"type":"tool_output","call_id":"b1","data":"{\"navigation\":\"started\"}"}),
+            json!({"type":"tool_result","call_id":"b1","status":"ok"}),
+            json!({"type":"tool_call","call_id":"d1","operation":"desktop_screenshot","arguments":{}}),
+            json!({"type":"goal_cancelled"}),
+        ] {
+            history.push(event, true);
+        }
+        let messages = history.into_messages();
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "browser_open"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                messages[1]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"url":"https://example.test"})
+        );
+        assert_eq!(
+            messages[3]["tool_calls"][0]["function"]["name"],
+            "desktop_screenshot"
+        );
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[5]["role"], "user");
     }
 }

@@ -119,7 +119,8 @@ export interface paths {
         /**
          * Start or watch the current member's desktop over a same-origin WebSocket
          * @description Uses Motion JPEG frame packets with the same framing as /browser-agent/{thread},
-         *     with `tab` set to `desktop`. Client messages are `take`, `release`, `input`, and `end`.
+         *     with `tab` set to `desktop`. Client messages are `take`, `release`, `input`
+         *     (`click`, `move`, `pointer`, `scroll`, `text`, or `key`), and `end`.
          *     The server sends `ready`, `control`, `error`, and `ended` events.
          */
         get: operations["connectComputerScreen"];
@@ -1465,7 +1466,10 @@ export interface operations {
             query?: {
                 after?: components["parameters"]["After"];
             };
-            header?: never;
+            header?: {
+                /** @description Optional SSE resume cursor; the server resumes after max(after, Last-Event-ID). */
+                "Last-Event-ID"?: number;
+            };
             path: {
                 id: components["parameters"]["Id"];
             };

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 const FRAME_LIMIT: usize = 8 * 1024 * 1024;
 const LEASE: Duration = Duration::from_secs(30);
@@ -17,6 +17,7 @@ pub(super) struct Runner {
     id: Uuid,
     token: [u8; 32],
     state: Mutex<StateData>,
+    notify: Notify,
 }
 
 #[derive(Default)]
@@ -50,29 +51,38 @@ impl Runner {
             id,
             token: Sha256::digest(secret.as_bytes()).into(),
             state: Mutex::default(),
+            notify: Notify::new(),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, StateData> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub async fn wait(&self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, self.notify.notified()).await;
+    }
+
     pub fn inventory(&self) -> Value {
-        let state = self.state.lock().unwrap();
+        let state = self.lock();
         json!({"items":[{"id":self.id,"name":"Venticode","roots":state.roots,
             "online":state.connection.is_some(),"mode":"sandboxed","owned":true,"revision":1,"host_info":state.host_info}]})
     }
 
     pub fn online(&self) -> bool {
-        self.state.lock().unwrap().connection.is_some()
+        self.lock().connection.is_some()
     }
 
     pub fn has_request(&self, id: Uuid) -> bool {
-        self.state.lock().unwrap().requests.contains_key(&id)
+        self.lock().requests.contains_key(&id)
     }
 
     pub fn forget(&self, id: Uuid) {
-        self.state.lock().unwrap().requests.remove(&id);
+        self.lock().requests.remove(&id);
     }
 
     pub fn respond(&self, id: Uuid, frame: Value) -> Result<()> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock();
         if !state.requests.get(&id).is_some_and(|r| r.state == "sent") {
             return Err(missing());
         }
@@ -94,7 +104,7 @@ impl Runner {
             "SELECT roots,host_info FROM standalone_runner_inventory WHERE workspace=$1 AND runner_id=$2",
         ).bind(workspace).bind(self.id).fetch_optional(db).await?;
         if let Some((roots, host_info)) = row {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock();
             state.roots = roots.0;
             state.host_info = host_info;
         }
@@ -102,7 +112,10 @@ impl Runner {
     }
 
     pub fn action(&self, session: String, body: &Value) -> Result<Value> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
+        state
+            .requests
+            .retain(|_, r| r.state == "sent" || r.last_poll.elapsed() < LEASE);
         let id = uuid(body, "request_id")?;
         let sender = state.connection.as_ref().map(|(_, tx)| tx.clone());
         match body["action"].as_str() {
@@ -244,7 +257,7 @@ impl Runner {
     }
 
     fn expire(&self, connection: Uuid) -> Vec<Uuid> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         if state
             .connection
             .as_ref()
@@ -267,7 +280,7 @@ impl Runner {
 
     fn receive(&self, connection: Uuid, size: usize, frame: Value) -> Option<Uuid> {
         let id = uuid(&frame, "id").ok()?;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         if state
             .connection
             .as_ref()
@@ -283,11 +296,13 @@ impl Runner {
         }
         if r.frames.len() >= 256 || r.bytes + size > 16 * 1024 * 1024 {
             r.state = "failed";
+            self.notify.notify_waiters();
             return Some(id);
         }
         r.sequence += 1;
         r.bytes += size;
         r.frames.push_back((r.sequence, size, frame));
+        self.notify.notify_waiters();
         None
     }
 }
@@ -364,8 +379,9 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
     }
     let (tx, mut rx) = mpsc::channel::<Value>(64);
     let connection = Uuid::new_v4();
+    let root_count = inventory.roots.len();
     {
-        let mut state = runner.state.lock().unwrap();
+        let mut state = runner.lock();
         for request in state.requests.values_mut().filter(|r| r.state == "sent") {
             request.state = "failed";
         }
@@ -373,9 +389,11 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
         state.roots = inventory.roots;
         state.host_info = inventory.host_info;
     }
+    runner.notify.notify_waiters();
+    tracing::info!(runner_id = %runner.id, roots = root_count, "runner connected");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut heard = Instant::now();
-    loop {
+    'outer: loop {
         tokio::select! {
             frame = rx.recv() => {
                 let Some(frame) = frame else { break; };
@@ -396,12 +414,12 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
             _ = heartbeat.tick() => {
                 if heard.elapsed() >= Duration::from_secs(20) || send(&mut socket, Message::Ping(Default::default())).await.is_err() { break; }
                 for id in runner.expire(connection) {
-                    if send(&mut socket, Message::Text(json!({"type":"cancel","id":id}).to_string().into())).await.is_err() { break; }
+                    if send(&mut socket, Message::Text(json!({"type":"cancel","id":id}).to_string().into())).await.is_err() { break 'outer; }
                 }
             }
         }
     }
-    let mut state = runner.state.lock().unwrap();
+    let mut state = runner.lock();
     if state
         .connection
         .as_ref()
@@ -411,6 +429,8 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
         for request in state.requests.values_mut().filter(|r| r.state == "sent") {
             request.state = "failed";
         }
+        runner.notify.notify_waiters();
+        tracing::info!(runner_id = %runner.id, "runner disconnected");
     }
 }
 

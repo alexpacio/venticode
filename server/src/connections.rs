@@ -81,15 +81,26 @@ pub(super) async fn private(app: &App, h: &HeaderMap, b: Value) -> Result<Value>
     Ok(v)
 }
 pub(super) async fn provider(app: &App, b: Value) -> Result<Value> {
+    let url = env::var("CONNECTOR_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:4190/exchange".into());
     let res = app
         .http
-        .post("http://127.0.0.1:4190/exchange")
+        .post(&url)
         .json(&b)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|err| {
+            tracing::error!(error = %err, "connector request failed");
+            unavailable()
+        })?;
     if !res.status().is_success() {
+        tracing::warn!(
+            status = res.status().as_u16(),
+            "connector returned error status"
+        );
         return Err(unavailable());
     }
     res.json().await.map_err(|_| unavailable())
@@ -359,22 +370,29 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
 }
 #[derive(Deserialize)]
 pub(super) struct OAuth {
-    state: String,
-    code: String,
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
 }
 pub(super) async fn callback(
     State(app): State<App>,
     h: HeaderMap,
     Query(q): Query<OAuth>,
 ) -> Result<Redirect> {
+    if let Some(error) = q.error.as_deref() {
+        tracing::info!(oauth_error = %error, "Slack OAuth cancelled or denied");
+        return Ok(Redirect::to("/connections?error=oauth_cancelled"));
+    }
+    let state = q.state.as_deref().ok_or_else(bad)?;
+    let code = q.code.as_deref().ok_or_else(bad)?;
     let (w, u) = member(&app, &h, false, true).await?;
     let mut tx = app.db.begin().await?;
     let r=sqlx::query("SELECT id,destination,external_id,identity FROM connections WHERE kind='slack' AND workspace=$1 AND oauth_user=$2 AND state_hash=$3 AND state_until>now() FOR UPDATE")
-        .bind(w).bind(u).bind(digest(&q.state)).fetch_one(&mut *tx).await?;
+        .bind(w).bind(u).bind(digest(state)).fetch_one(&mut *tx).await?;
     let id: Uuid = r.get("id");
     let mut c = creds(&app, &h, id).await?;
     let public_origin = origin(&app, &h)?;
-    let result=provider(&app,json!({"kind":"slack","operation":"exchange","code":q.code,"credentials":c,"redirect_uri":format!("{public_origin}/oauth/slack")})).await?;
+    let result=provider(&app,json!({"kind":"slack","operation":"exchange","code":code,"credentials":c,"redirect_uri":format!("{public_origin}/oauth/slack")})).await?;
     c["token"] = json!(result["access_token"].as_str().ok_or_else(forbidden)?);
     let team = result["team"]["id"].as_str().ok_or_else(forbidden)?;
     let bot = result["bot_user_id"].as_str().ok_or_else(forbidden)?;
@@ -421,10 +439,19 @@ async fn disconnect(
             .await?;
         match creds(&app, &h, id).await {
             Ok(c) => {
-                provider(&app,json!({"kind":kind,"operation":"remove","credentials":c,"destination":destination,"hook_id":r.get::<Option<String>,_>("hook_id")})).await?;
+                if let Err(err) = provider(
+                    &app,
+                    json!({"kind":kind,"operation":"remove","credentials":c,"destination":destination,"hook_id":r.get::<Option<String>,_>("hook_id")}),
+                )
+                .await
+                {
+                    tracing::warn!(connection_id = %id, kind = %kind, status = err.0.as_u16(), "remote webhook removal failed during disconnect; proceeding with local cleanup");
+                }
             }
             Err(Error(StatusCode::NOT_FOUND, _)) => {}
-            Err(e) => return Err(e),
+            Err(err) => {
+                tracing::warn!(connection_id = %id, status = err.0.as_u16(), "could not read credentials during disconnect; proceeding with local cleanup");
+            }
         }
     }
     if app.standalone.is_some() {
@@ -448,6 +475,7 @@ async fn disconnect(
     Ok(Json(json!({"deleted":true})))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Link {
     external_user_id: String,
 }
@@ -544,7 +572,7 @@ async fn bots(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
 async fn bot(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Result<Json<Value>> {
     let (w, _) = member(&app, &h, false, false).await?;
     Ok(Json(bot_document(
-        &sqlx::query(&format!("{BOT} AND c.id=$2"))
+        &sqlx::query(&format!("{BOT} AND c.id=$2 AND c.status='connected'"))
             .bind(w)
             .bind(id)
             .fetch_one(&app.db)
@@ -574,13 +602,16 @@ async fn edit_bot(
         .is_some_and(|v| v.chars().count() > 8000)
         || b.rate_limit_per_hour
             .is_some_and(|n| !(1..=1000).contains(&n))
-        || b.triggers
-            .as_ref()
-            .is_some_and(|v| !v["mentions"].is_boolean() || !v["direct_messages"].is_boolean())
+        || b.triggers.as_ref().is_some_and(|v| {
+            v.as_object().is_none_or(|o| o.len() != 2)
+                || !v["mentions"].is_boolean()
+                || !v["direct_messages"].is_boolean()
+        })
         || b.tools.as_ref().is_some_and(|v| {
-            ["read", "write", "execute", "mcp"]
-                .iter()
-                .any(|k| !matches!(v[*k].as_str(), Some("auto" | "review" | "off")))
+            v.as_object().is_none_or(|o| o.len() != 4)
+                || ["read", "write", "execute", "mcp"]
+                    .iter()
+                    .any(|k| !matches!(v[*k].as_str(), Some("auto" | "review" | "off")))
         })
     {
         return Err(bad());

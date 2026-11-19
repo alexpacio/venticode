@@ -1,5 +1,5 @@
 use crate::mcp::Server;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, CredentialRefreshGuard, CredentialStore,
     OAuthState, StoredCredentials,
@@ -62,10 +62,16 @@ impl CredentialStore for Store {
             .write(true)
             .open(path)
             .map_err(store_error)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Some(CredentialRefreshGuard::new(file))),
                 Err(std::fs::TryLockError::WouldBlock) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(AuthError::InternalError(
+                            "Timed out waiting for OAuth credential refresh lock".into(),
+                        ));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await
                 }
                 Err(error) => return Err(store_error(error)),
@@ -110,17 +116,35 @@ pub async fn login(server: &Server) -> Result<()> {
     let _ = open::that_detached(&url);
     tokio::time::timeout(std::time::Duration::from_secs(300),async {
         loop {
-            let (stream,peer)=listener.accept().await?;
-            ensure!(peer.ip().is_loopback(),"Nonlocal OAuth callback");
-            let mut stream=BufReader::new(stream);
-            let mut line=String::new();
-            (&mut stream).take(8192).read_line(&mut line).await?;
-            let target=line.split_whitespace().nth(1).context("Invalid callback")?;
-            if !line.starts_with("GET /callback?") { stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;continue; }
-            let callback=format!("http://127.0.0.1:{}{target}",listener.local_addr()?.port());
-            state.handle_callback_url(&callback).await?;
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSigned in. Close window.").await?;
-            return Ok::<_,anyhow::Error>(());
+            let (stream, peer) = listener.accept().await?;
+            if !peer.ip().is_loopback() {
+                continue;
+            }
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            if (&mut stream).take(8192).read_line(&mut line).await.is_err() {
+                continue;
+            }
+            let Some(target) = line.split_whitespace().nth(1) else {
+                continue;
+            };
+            if !line.starts_with("GET /callback?") {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+            let callback = format!("http://127.0.0.1:{}{target}", listener.local_addr()?.port());
+            if let Err(err) = state.handle_callback_url(&callback).await {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nSign-in failed.")
+                    .await;
+                return Err(err.into());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nSigned in. Close window.")
+                .await?;
+            return Ok::<_, anyhow::Error>(());
         }
     }).await??;
     eprintln!("Accesso MCP completato / MCP signed in");

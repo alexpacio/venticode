@@ -1,25 +1,66 @@
+# Standalone Venticode service deployment (optional; omit when managed by Ventic control).
 standalone:
   enabled: false
+  # Digest-pinned images: registry/repo@sha256:<64-hex>
   image: ""
   connectorImage: ""
   secretName: venticode-standalone
+  # External HTTPS hostname without scheme (e.g. code.example.org)
   host: ""
+  # Optional self-managed GitLab origin for the connector sidecar (e.g. https://gitlab.example.org)
+  gitlabOrigin: ""
   ingressClassName: ""
   tlsSecretName: ""
+  ingressAnnotations: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  connectorResources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 
 server:
+  # Namespace hosting the Venticode server (defaults to the Helm release namespace)
   namespace: ""
   serviceAccount: venticode
+  # Value of app.kubernetes.io/name on the Venticode server pod
   podLabel: venticode
 
+# Isolated namespace for managed computers and Kitesurf browser pods (must differ from server.namespace)
 workerNamespace: venticode-computers
+createWorkerNamespace: true
+
+quota:
+  pods: "32"
+  persistentvolumeclaims: "32"
+  storage: 320Gi
+
 computer:
+  # Digest-pinned computer image: registry/repo@sha256:<64-hex>
   image: ""
   runtimeClass: venticode-computer
   storageClass: ""
   seccompProfile: venticode/desktop.json
+
 kitesurf:
+  # Digest-pinned Kitesurf browser image: registry/repo@sha256:<64-hex>
   image: ""
+
 network:
+  # Exact HTTP/HTTPS origins allowed in managed browsers (e.g. ["https://docs.example.org"])
   origins: []
+  # Public IPv4 /32 CIDRs reachable from worker pods on ports 80/443 (private/metadata ranges rejected)
   destinationCIDRs: []
+  # Cluster DNS NetworkPolicy selector (override for coredns/OpenShift)
+  dns:
+    namespace: kube-system
+    podLabels:
+      k8s-app: kube-dns

@@ -3,10 +3,14 @@ import asyncio
 import base64
 import fcntl
 import json
+import logging
 import os
 import re
 import secrets
 from urllib.parse import urlsplit
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("venticode-desktop")
 
 WIDTH, HEIGHT = 1280, 800
 RUNTIME = "/run/venticode-desktop"
@@ -53,7 +57,7 @@ def allowed(url):
         return False
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None:
         return False
-    if parsed.hostname == "127.0.0.1" and parsed.scheme == "http" and port and port >= 1024:
+    if parsed.hostname in ("127.0.0.1", "localhost") and parsed.scheme == "http" and port and port >= 1024:
         return True
     default = 80 if parsed.scheme == "http" else 443
     origin = f"{parsed.scheme}://{parsed.hostname}" + (f":{port}" if port and port != default else "")
@@ -65,6 +69,7 @@ class Browser:
         self.sequence = 0
         self.active = None
         self.sessions = {}
+        self.pid = None
 
     def start(self):
         browser_in, relay_out = os.pipe()
@@ -78,7 +83,7 @@ class Browser:
             "--user-data-dir=/data/desktop/helium", "--window-size=1280,760", "about:blank",
         ]
         try:
-            os.posix_spawn(exe, argv, os.environ, file_actions=[
+            self.pid = os.posix_spawn(exe, argv, os.environ, file_actions=[
                 (os.POSIX_SPAWN_DUP2, source[0], 3), (os.POSIX_SPAWN_DUP2, source[1], 4),
             ])
             self.read = os.fdopen(os.dup(relay_in), "rb", buffering=0)
@@ -87,20 +92,40 @@ class Browser:
             for fd in descriptors + source:
                 os.close(fd)
 
+    async def wait_exit(self):
+        if self.pid is None:
+            return 1
+        while True:
+            pid, status = await asyncio.to_thread(os.waitpid, self.pid, os.WNOHANG)
+            if pid == self.pid:
+                return status
+            await asyncio.sleep(0.5)
+
     async def connect(self):
-        self.reader = asyncio.StreamReader(limit=1024 * 1024)
+        self.reader = asyncio.StreamReader(limit=2 * 1024 * 1024)
         protocol = asyncio.StreamReaderProtocol(self.reader)
         await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, self.read)
 
-    async def call(self, method, params=None, session=None):
+    async def call(self, method, params=None, session=None, timeout_sec=6):
         self.sequence += 1
         request = {"id": self.sequence, "method": method, "params": params or {}}
         if session:
             request["sessionId"] = session
-        self.write.write(json.dumps(request).encode() + b"\0")
-        async with asyncio.timeout(6):
+        payload = json.dumps(request).encode() + b"\0"
+        await asyncio.to_thread(self.write.write, payload)
+        async with asyncio.timeout(timeout_sec):
             while True:
-                reply = json.loads((await self.reader.readuntil(b"\0"))[:-1])
+                try:
+                    raw = await self.reader.readuntil(b"\0")
+                except asyncio.LimitOverrunError as err:
+                    # Drain the oversized message up to the NUL terminator so future CDP calls stay in sync.
+                    await self.reader.readexactly(err.consumed)
+                    while True:
+                        chunk = await self.reader.read(65536)
+                        if not chunk or b"\0" in chunk:
+                            break
+                    raise RequestError("Browser response exceeded size limit") from err
+                reply = json.loads(raw[:-1])
                 if reply.get("id") == request["id"]:
                     if "error" in reply:
                         raise RequestError("Helium rejected a browser operation")
@@ -183,8 +208,8 @@ class Browser:
         if op == "browser_follow_link":
             matches = [item for item in (await self.snapshot())["links"]
                        if item == {"url": args["url"], "label": args["label"]}]
-            if len(matches) != 1:
-                raise RequestError("The link changed or is ambiguous")
+            if not matches:
+                raise RequestError("The link changed or is no longer present")
             return await self.navigate(args["url"])
         if op == "browser_open_preview":
             port = args["port"]
@@ -198,7 +223,8 @@ class Browser:
 class Desktop:
     def __init__(self):
         self.buttons = set()
-        self.lock = asyncio.Lock()
+        self.input_lock = asyncio.Lock()
+        self.browser_lock = asyncio.Lock()
         self.browser = Browser()
 
     async def release(self):
@@ -246,8 +272,7 @@ class Desktop:
             text = args["text"]
             if not isinstance(text, str) or not 1 <= len(text.encode()) <= 4096:
                 raise RequestError("Invalid pasted text")
-            await command("xclip", "-selection", "clipboard", "-loops", "2", data=text.encode())
-            await command("xdotool", "key", "--clearmodifiers", "ctrl+v")
+            await command("xdotool", "type", "--clearmodifiers", "--delay", "1", "--", text)
         elif kind == "key":
             key = args["key"]
             parts = key.split("+")
@@ -260,27 +285,31 @@ class Desktop:
         return True
 
     async def handle(self, reader, writer):
+        op = "<unknown>"
         try:
             request = json.loads(await asyncio.wait_for(reader.readline(), 3))
             op, args = request["operation"], request["arguments"]
-            async with self.lock:
-                if op == "desktop_frame":
-                    frame = await command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "x11grab",
-                                          "-video_size", f"{WIDTH}x{HEIGHT}", "-i", ":0", "-frames:v", "1",
-                                          "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
-                    if not frame or len(frame) > 1024 * 1024:
-                        raise RequestError("Invalid desktop frame")
-                    value = {"width": WIDTH, "height": HEIGHT, "jpeg": base64.b64encode(frame).decode()}
-                elif op == "desktop_input":
+            if op == "desktop_frame":
+                frame = await command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "x11grab",
+                                      "-video_size", f"{WIDTH}x{HEIGHT}", "-i", ":0", "-frames:v", "1",
+                                      "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
+                if not frame or len(frame) > 1024 * 1024:
+                    raise RequestError("Invalid desktop frame")
+                value = {"width": WIDTH, "height": HEIGHT, "jpeg": base64.b64encode(frame).decode()}
+            elif op == "desktop_input":
+                async with self.input_lock:
                     value = await self.input(args)
-                elif op == "desktop_release":
+            elif op == "desktop_release":
+                async with self.input_lock:
                     value = await self.release()
-                else:
+            else:
+                async with self.browser_lock:
                     value = await self.browser.dispatch(op, args)
             reply = {"value": value}
         except RequestError as error:
             reply = {"error": str(error)}
-        except (TypeError, ValueError, KeyError, AttributeError, OSError, TimeoutError, EOFError):
+        except (TypeError, ValueError, KeyError, AttributeError, OSError, TimeoutError, EOFError, asyncio.LimitOverrunError) as error:
+            LOG.warning("operation %s failed: %s: %s", op, type(error).__name__, error)
             reply = {"error": "Desktop or browser operation unavailable"}
         try:
             writer.write(json.dumps(reply).encode() + b"\n")
@@ -312,12 +341,17 @@ async def main():
     desktop = Desktop()
     desktop.browser.start()
     await desktop.browser.connect()
-    await desktop.browser.call("Browser.getVersion")
+    await desktop.browser.call("Browser.getVersion", timeout_sec=20)
     if os.path.exists(SOCKET):
         os.unlink(SOCKET)
     server = await asyncio.start_unix_server(desktop.handle, SOCKET, limit=64 * 1024)
+    LOG.info("desktop bridge ready on %s", SOCKET)
     async with server:
-        tasks = [asyncio.create_task(service.wait()) for service in (x11, xfce)]
+        tasks = [
+            asyncio.create_task(x11.wait()),
+            asyncio.create_task(xfce.wait()),
+            asyncio.create_task(desktop.browser.wait_exit()),
+        ]
         _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()

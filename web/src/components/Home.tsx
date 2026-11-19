@@ -35,14 +35,14 @@ export function Home({ session, menu }: { session: Session; menu: ReactNode }) {
               </option>
               {options.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} · {p.root}/{p.path}
+                  {p.name} · {p.path === "." ? p.root : `${p.root}/${p.path}`}
                 </option>
               ))}
             </select>
           </label>
         )}
         {!session.standalone && !harnesses.isPending && !harnesses.data?.length && (
-          <a className="btn" href={session.portal_url + "/app/harnesses"} target={window.parent === window ? "_self" : "_blank"} rel="noreferrer">
+          <a className="btn" href={session.portal_url.replace(/\/+$/, "") + "/app/harnesses"} target={window.parent === window ? "_self" : "_blank"} rel="noreferrer">
             {t("Apri gli harness nel portale")}
           </a>
         )}

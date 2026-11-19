@@ -80,6 +80,7 @@ pub(super) async fn record(app: &App, id: Uuid, run: Uuid, event: Value) -> Resu
         .await?;
     append(&mut tx, id, object).await?;
     tx.commit().await?;
+    let _ = app.events.send(id);
     Ok(())
 }
 pub(super) async fn read_events(app: &App, id: Uuid, after: i64, limit: i64) -> Result<Vec<Value>> {
@@ -141,21 +142,71 @@ async fn stream(
     let mut cursor = q.after.max(last);
     let m = Member::load(&app, &h, false).await?;
     projects::owned(&app, &m, id).await?;
+    let mut updates = app.events.subscribe();
+    let mut shutdown = app.shutdown.clone();
     let feed = async_stream::stream! {
-        let mut heartbeat=tokio::time::Instant::now();
+        let mut heartbeat = tokio::time::Instant::now();
+        let mut last_auth = tokio::time::Instant::now();
         loop {
-            match Member::load(&app,&h,false).await {
-                Ok(m) if projects::owned(&app,&m,id).await.is_ok()=>{},
-                _=>{yield Ok::<_,Infallible>(Event::default().event("authorization_expired").data("{}"));break;}
+            if *shutdown.borrow() {
+                break;
             }
-            let Ok(items)=read_events(&app,id,cursor,64).await else{break;};
-            let full=items.len()==64;
+            if last_auth.elapsed() >= Duration::from_secs(15) {
+                match Member::load(&app, &h, false).await {
+                    Ok(m) => match projects::owned(&app, &m, id).await {
+                        Ok(_) => last_auth = tokio::time::Instant::now(),
+                        Err(e) if matches!(e.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+                            yield Ok::<_, Infallible>(Event::default().event("authorization_expired").data("{}"));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(conversation_id = %id, status = e.0.as_u16(), "transient SSE ownership check error");
+                        }
+                    },
+                    Err(e) if matches!(e.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                        yield Ok::<_, Infallible>(Event::default().event("authorization_expired").data("{}"));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(conversation_id = %id, status = e.0.as_u16(), "transient SSE auth revalidation error");
+                    }
+                }
+            }
+            let items = match read_events(&app, id, cursor, 64).await {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::warn!(conversation_id = %id, status = error.0.as_u16(), "SSE read_events failed, retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                        _ = shutdown.changed() => break,
+                    }
+                }
+            };
+            let full = items.len() == 64;
             for event in items {
-                cursor=event["sequence"].as_i64().expect("stored sequence");
+                cursor = event["sequence"].as_i64().expect("stored sequence");
                 yield Ok(Event::default().event("transcript").id(cursor.to_string()).data(event.to_string()));
             }
-            if heartbeat.elapsed()>=Duration::from_secs(15){yield Ok(Event::default().event("heartbeat").data("{}"));heartbeat=tokio::time::Instant::now();}
-            if !full {tokio::time::sleep(Duration::from_millis(750)).await;}
+            if heartbeat.elapsed() >= Duration::from_secs(15) {
+                yield Ok(Event::default().event("heartbeat").data("{}"));
+                heartbeat = tokio::time::Instant::now();
+            }
+            if !full {
+                let deadline = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        res = updates.recv() => match res {
+                            Ok(changed) if changed == id => break,
+                            Ok(_) => continue,
+                            Err(broadcast::error::RecvError::Lagged(_)) => break,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = &mut deadline => break,
+                        _ = shutdown.changed() => break,
+                    }
+                }
+            }
         }
     };
     Ok(([("x-accel-buffering", "no")], Sse::new(feed)).into_response())
@@ -233,7 +284,10 @@ pub(super) async fn send(
     if let Some(harness_id) = row.get::<Option<Uuid>, _>("harness_id") {
         let harness = m.harness(harness_id, row.get("root"))?;
         if harness["online"] != true && harness["managed"] != true {
-            return Err(Error(StatusCode::LOCKED, "Harness offline".into()));
+            return Err(Error(
+                StatusCode::LOCKED,
+                "Harness non in linea / Harness offline".into(),
+            ));
         }
     }
     let mut message = json!({"type":"user_message","message_id":body.id,"content":body.content,"intent":body.intent});
@@ -271,6 +325,7 @@ pub(super) async fn send(
     append(&mut tx, id, text).await?;
     append(&mut tx, id, started).await?;
     tx.commit().await?;
+    let _ = app.events.send(id);
     tokio::spawn(work(app, h, id, run, updated.get("model")));
     Ok((
         StatusCode::ACCEPTED,
@@ -312,6 +367,7 @@ pub(super) async fn finish(app: &App, id: Uuid, run: Uuid, reason: Completion) -
         .await?;
     append(&mut tx, id, object).await?;
     tx.commit().await?;
+    let _ = app.events.send(id);
     Ok(())
 }
 async fn interrupt(
@@ -322,7 +378,11 @@ async fn interrupt(
     let m = Member::load(&app, &h, true).await?;
     let row = projects::owned(&app, &m, id).await?;
     if let Some(run) = row.get::<Option<Uuid>, _>("active_run") {
-        finish(&app, id, run, Completion::Interrupted).await?;
+        match finish(&app, id, run, Completion::Interrupted).await {
+            Ok(()) => {}
+            Err(Error(StatusCode::CONFLICT, _)) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(Json(json!({"state":"idle"})))
 }
@@ -330,9 +390,21 @@ async fn interrupt(
 async fn work(app: App, h: HeaderMap, id: Uuid, run: Uuid, model: String) {
     // Keep polling inference even when lease renewal waits for a row held by its recorder.
     let keep_alive = async {
+        let mut transient_errors = 0u32;
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let member = Member::load(&app, &h, false).await?;
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let member = match Member::load(&app, &h, false).await {
+                Ok(m) => {
+                    transient_errors = 0;
+                    m
+                }
+                Err(e) if e.0.is_server_error() && transient_errors < 3 => {
+                    transient_errors += 1;
+                    tracing::warn!(conversation_id = %id, run_id = %run, status = e.0.as_u16(), "transient keep_alive auth error");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             projects::owned(&app, &member, id).await?;
             crate::mentions::bot_context(&app, id).await?;
             let renewed=sqlx::query("UPDATE conversations SET lease_until=now()+interval '90 seconds' WHERE id=$1 AND active_run=$2 AND lease_until>now()")
@@ -346,12 +418,25 @@ async fn work(app: App, h: HeaderMap, id: Uuid, run: Uuid, model: String) {
         result=generate(&app,&h,id,run,model)=>result,
         lost=keep_alive=>lost,
     };
+    // Avoid staging orphaned S3 error/run objects when the run was already interrupted.
+    let still_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT FROM conversations WHERE id=$1 AND active_run=$2)",
+    )
+    .bind(id)
+    .bind(run)
+    .fetch_one(&app.db)
+    .await
+    .unwrap_or(false);
+    if !still_active {
+        return;
+    }
     let reason = if outcome.is_ok() {
         Completion::Answered
     } else {
         Completion::Failed
     };
     if let Err(e) = outcome {
+        tracing::warn!(conversation_id = %id, run_id = %run, status = e.0.as_u16(), message = %e.1, "run failed");
         let _ = record(&app, id, run, json!({"type":"error","message":e.1})).await;
     }
     let _ = finish(&app, id, run, reason).await;
@@ -409,7 +494,42 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
     let model_access = computer_runner
         .as_ref()
         .is_some_and(|r| r.inventory()["items"][0]["host_info"]["model_access"] == true);
+    let computer_id = computer_runner.as_ref().map(|r| r.id());
     let _preview_cleanup = computer_runner.map(|runner| computer::PreviewCleanup { runner, run });
+    let result = generate_turns(
+        app,
+        h,
+        id,
+        run,
+        &model,
+        mode,
+        use_tools,
+        vision,
+        model_access,
+        conversation.get::<Value, _>("document")["goal_id"].is_string(),
+        &mut kitesurf,
+    )
+    .await;
+    if let (Some(computers), Some(cid)) = (&app.computers, computer_id) {
+        computers.touch_if_present(app, cid).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_turns(
+    app: &App,
+    h: &HeaderMap,
+    id: Uuid,
+    run: Uuid,
+    model: &str,
+    mode: &str,
+    use_tools: bool,
+    vision: bool,
+    model_access: bool,
+    goal: bool,
+    kitesurf: &mut Option<browser::Browser>,
+) -> Result<()> {
     let mut history = crate::history::History::default();
     let mut cursor = 0;
     loop {
@@ -422,7 +542,6 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
             history.push(e, use_tools);
         }
     }
-    let goal = conversation.get::<Value, _>("document")["goal_id"].is_string();
     let mut messages = history.into_messages();
     let mut repairs = 0;
     // Reserve the first message for the current connection instructions on each model call.
@@ -457,22 +576,50 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         let mut stream = inference::infer(app, h, &request).await?;
         let msg = Uuid::new_v4();
         let mut done = false;
+        let mut finish_seen = false;
         let mut truncated = false;
-        while let Some(event) = stream.next().await {
+        let mut pending_delta = String::new();
+        let mut last_flush = tokio::time::Instant::now();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(120), stream.next())
+            .await
+            .map_err(|_| {
+                tracing::warn!(conversation_id = %id, run_id = %run, "LLM stream read timed out");
+                unavailable()
+            })?
+        {
             let data = event?;
             if data == "[DONE]" {
                 done = true;
                 break;
             }
             let v: Value = serde_json::from_str(&data).map_err(|_| unavailable())?;
-            if v.get("error").is_some() {
-                return Err(unavailable());
+            if let Some(err) = v.get("error") {
+                let msg = err["message"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Servizio non disponibile / Service unavailable");
+                tracing::warn!(conversation_id = %id, run_id = %run, error = %msg, "LLM stream emitted error event");
+                return Err(Error(StatusCode::SERVICE_UNAVAILABLE, msg.to_owned()));
+            }
+            if v["choices"][0]["finish_reason"].is_string() {
+                finish_seen = true;
             }
             truncated |= v["choices"][0]["finish_reason"] == "length";
             if let (Some(input), Some(output)) = (
                 v["usage"]["prompt_tokens"].as_u64(),
                 v["usage"]["completion_tokens"].as_u64(),
             ) {
+                if !pending_delta.is_empty() {
+                    let chunk = std::mem::take(&mut pending_delta);
+                    record(
+                        app,
+                        id,
+                        run,
+                        json!({"type":"text","run_id":run,"message_id":msg,"delta":chunk}),
+                    )
+                    .await?;
+                    last_flush = tokio::time::Instant::now();
+                }
                 record(app,id,run,json!({"type":"run","run_id":run,"state":"running","usage":{"input_tokens":input,"output_tokens":output}})).await?;
             }
             if let Some(parts) = v["choices"][0]["delta"]["tool_calls"].as_array() {
@@ -498,21 +645,38 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
                 .filter(|s| !s.is_empty())
             {
                 answer.push_str(delta);
-                record(
-                    app,
-                    id,
-                    run,
-                    json!({"type":"text","run_id":run,"message_id":msg,"delta":delta}),
-                )
-                .await?;
+                pending_delta.push_str(delta);
+                if pending_delta.len() >= 2048 || last_flush.elapsed() >= Duration::from_millis(150)
+                {
+                    let chunk = std::mem::take(&mut pending_delta);
+                    record(
+                        app,
+                        id,
+                        run,
+                        json!({"type":"text","run_id":run,"message_id":msg,"delta":chunk}),
+                    )
+                    .await?;
+                    last_flush = tokio::time::Instant::now();
+                }
             }
         }
-        if !done {
+        if !pending_delta.is_empty() {
+            let chunk = std::mem::take(&mut pending_delta);
+            record(
+                app,
+                id,
+                run,
+                json!({"type":"text","run_id":run,"message_id":msg,"delta":chunk}),
+            )
+            .await?;
+        }
+        if !done && !finish_seen {
             return Err(unavailable());
         }
         if calls.is_empty() && !truncated {
             if bot.is_none() && mode == "plan" && !answer.trim().is_empty() {
-                return crate::agent::checkpoint(app, id, run, "plan", &json!({"content":answer}))
+                let summary: String = answer.trim().chars().take(8000).collect();
+                return crate::agent::checkpoint(app, id, run, "plan", &json!({"content":summary}))
                     .await;
             }
             if goal && use_tools && bot.is_none() {
@@ -531,6 +695,9 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         {
             if !calls.is_empty() && repairs < 2 {
                 repairs += 1;
+                if !answer.is_empty() {
+                    messages.push(json!({"role":"assistant","content":answer}));
+                }
                 messages.push(json!({"role":"user","content":"The previous function request was incomplete or invalid. No operation in that batch was executed. Send one smaller call with complete JSON arguments."}));
                 continue;
             }
@@ -575,7 +742,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
                 run,
                 &name,
                 serde_json::from_str(&args).map_err(|_| bad())?,
-                &mut kitesurf,
+                kitesurf,
             )
             .await?;
             if name == "desktop_screenshot"

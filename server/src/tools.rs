@@ -25,6 +25,10 @@ pub(super) fn is_project_operation(op: &str) -> bool {
     READ.contains(&op) || EDIT.contains(&op) || ACTION.contains(&op) || LOCAL_MCP.contains(&op)
 }
 
+pub(super) fn is_computer_operation(op: &str) -> bool {
+    COMPUTER_OPERATIONS.contains(&op)
+}
+
 pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> Value {
     let runtime = bot.and_then(|b| b["runtime"].as_str()).unwrap_or("project");
     let operations: Vec<_> = READ
@@ -296,6 +300,7 @@ pub(super) async fn decide(
     }
     append(&mut tx, conversation, event).await?;
     tx.commit().await?;
+    let _ = app.events.send(conversation);
     Ok(Json(json!({"state":state})))
 }
 async fn relay(app: &App, h: &HeaderMap, mut body: Value) -> Result<Value> {
@@ -399,12 +404,13 @@ pub(super) async fn call(
     kitesurf: &mut Option<browser::Browser>,
 ) -> Result<String> {
     if name == "update_tasks" {
-        let todos = body["todos"]
-            .as_array()
-            .filter(|v| v.len() <= 64)
-            .ok_or_else(bad)?;
+        let Some(todos) = body["todos"].as_array().filter(|v| v.len() <= 64) else {
+            return Ok(
+                "Invalid update_tasks arguments: expected a todos array (max 64 items).".into(),
+            );
+        };
         if body.as_object().is_none_or(|b| b.len() != 1) {
-            return Err(bad());
+            return Ok("Invalid update_tasks arguments: only the 'todos' field is allowed.".into());
         }
         for todo in todos {
             if !todo.as_object().is_some_and(|t| t.len() == 2)
@@ -416,7 +422,7 @@ pub(super) async fn call(
                     Some("pending" | "in_progress" | "completed")
                 )
             {
-                return Err(bad());
+                return Ok("Invalid update_tasks item: each todo must have non-empty 'content' (<=512 chars) and 'status' in pending|in_progress|completed.".into());
             }
         }
         let member = Member::load(app, h, true).await?;
@@ -427,15 +433,26 @@ pub(super) async fn call(
     let body = if browser::is_browser_tool(name) || COMPUTER_OPERATIONS.contains(&name) {
         json!({"operation":name,"arguments":body})
     } else {
-        project_arguments(name, body)?
+        match project_arguments(name, body) {
+            Ok(body) => body,
+            Err(_) => {
+                return Ok(format!(
+                    "Invalid arguments for tool '{name}'. Check required fields and types."
+                ));
+            }
+        }
     };
-    let op = body["operation"].as_str().ok_or_else(bad)?;
+    let Some(op) = body["operation"].as_str() else {
+        return Ok("Invalid tool call: missing 'operation' string.".into());
+    };
     if LOCAL_MCP.contains(&op) && app.standalone.is_none() {
         return Err(bad());
     }
     let args = &body["arguments"];
     if !args.is_object() {
-        return Err(bad());
+        return Ok(format!(
+            "Invalid arguments for operation '{op}': expected a JSON object."
+        ));
     }
     let member = Member::load(app, h, true).await?;
     let c = projects::owned(app, &member, id).await?;
@@ -455,8 +472,10 @@ pub(super) async fn call(
     {
         return Err(forbidden());
     }
-    if browser_tool {
-        browser::validate(op, args)?;
+    if browser_tool && browser::validate(op, args).is_err() {
+        return Ok(format!(
+            "Invalid arguments for browser tool '{op}'. Check required string fields."
+        ));
     }
     let project = c.get::<Option<Uuid>, _>("project_id");
     let decision = policy(
@@ -506,12 +525,16 @@ pub(super) async fn call(
                 append(&mut tx, id, event).await?;
                 append(&mut tx, id, waiting).await?;
                 tx.commit().await?;
+                let _ = app.events.send(id);
                 loop {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     let s: String = sqlx::query_scalar("SELECT state FROM approvals WHERE id=$1")
                         .bind(call)
                         .fetch_one(&app.db)
                         .await?;
+                    if s == "expired" {
+                        return Err(conflict());
+                    }
                     if s != "pending" {
                         break s == "allowed";
                     }
@@ -605,6 +628,13 @@ pub(super) async fn call(
     let mut failed = false;
     let mut requires_upgrade = false;
     let mut diff = Value::Null;
+    let mut interactive_registered = false;
+    let mut pending_stdout = Vec::<u8>::new();
+    let mut pending_stderr = Vec::<u8>::new();
+    let local_runner = managed
+        .as_ref()
+        .map(Arc::as_ref)
+        .or_else(|| app.standalone.as_ref().map(|local| &local.runner));
     loop {
         let frame = relay(
             app,
@@ -655,6 +685,7 @@ pub(super) async fn call(
                 .bind(run)
                 .execute(&app.db)
                 .await?;
+                interactive_registered = true;
                 record(app,id,run,json!({"type":"tool_output","call_id":call,"interactive":interactive,"stream":"stdout","data":""})).await?;
                 continue;
             }
@@ -668,7 +699,17 @@ pub(super) async fn call(
                 } else {
                     "stdout"
                 };
-                (stream, String::from_utf8_lossy(&bytes).into_owned())
+                let buf = if stream == "stderr" {
+                    &mut pending_stderr
+                } else {
+                    &mut pending_stdout
+                };
+                buf.extend_from_slice(&bytes);
+                let decoded = take_utf8_prefix(buf, false);
+                if decoded.is_empty() {
+                    continue;
+                }
+                (stream, decoded)
             } else {
                 (
                     "stdout",
@@ -689,6 +730,31 @@ pub(super) async fn call(
         }
         cursor = frame["after"].as_i64().ok_or_else(unavailable)?;
         if !matches!(frame["state"].as_str(), Some("pending" | "sent")) && entries.len() < 32 {
+            for (stream, buf) in [
+                ("stdout", &mut pending_stdout),
+                ("stderr", &mut pending_stderr),
+            ] {
+                let tail = take_utf8_prefix(buf, true);
+                if !tail.is_empty() {
+                    record(
+                        app,
+                        id,
+                        run,
+                        json!({"type":"tool_output","call_id":call,"stream":stream,"data":tail}),
+                    )
+                    .await?;
+                    append_output(&mut result, &tail);
+                }
+            }
+            if interactive_registered {
+                let _ = sqlx::query("DELETE FROM interactive_calls WHERE id=$1")
+                    .bind(call)
+                    .execute(&app.db)
+                    .await;
+            }
+            if let Some(runner) = local_runner {
+                runner.forget(call);
+            }
             let done = frame["state"] == "done";
             let (status, summary) = if requires_upgrade {
                 (
@@ -723,8 +789,50 @@ pub(super) async fn call(
             }
             return Ok(tool_content(status, summary, &result));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if entries.len() < 32 {
+            if let Some(runner) = local_runner {
+                runner.wait(Duration::from_millis(200)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
     }
+}
+
+fn take_utf8_prefix(buf: &mut Vec<u8>, flush: bool) -> String {
+    if buf.is_empty() {
+        return String::new();
+    }
+    if flush {
+        let out = String::from_utf8_lossy(buf).into_owned();
+        buf.clear();
+        return out;
+    }
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(buf) {
+            Ok(valid) => {
+                out.push_str(valid);
+                buf.clear();
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    out.push_str(std::str::from_utf8(&buf[..valid_len]).unwrap());
+                    buf.drain(..valid_len);
+                }
+                match err.error_len() {
+                    Some(invalid_len) => {
+                        out.push('\u{FFFD}');
+                        buf.drain(..invalid_len);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    out
 }
 
 async fn surface_result(

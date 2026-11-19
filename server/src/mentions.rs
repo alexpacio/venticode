@@ -217,12 +217,23 @@ pub(super) async fn hook(
         let mut tx = app.db.begin().await?;
         let row=sqlx::query("DELETE FROM link_challenges WHERE code_hash=$1 AND connection_id=$2 AND external_id=$3 AND expires_at>now() RETURNING user_id,control_grant")
             .bind(digest(code)).bind(id).bind(&ev.sender).fetch_optional(&mut *tx).await?;
-        if let Some(row) = row {
+        let linked = if let Some(row) = row {
             let user: Uuid = row.get("user_id");
             sqlx::query("INSERT INTO external_links VALUES($1,$2,$3,$4) ON CONFLICT(connection_id,external_id) DO UPDATE SET control_grant=excluded.control_grant WHERE external_links.user_id=excluded.user_id")
                 .bind(id).bind(&ev.sender).bind(user).bind(row.get::<Uuid,_>("control_grant")).execute(&mut *tx).await?;
-        }
+            true
+        } else {
+            false
+        };
         tx.commit().await?;
+        let feedback = if linked {
+            "Account collegato con successo / Account linked successfully."
+        } else {
+            "Codice non valido o scaduto. Genera un nuovo codice in Venticode / Invalid or expired code. Generate a new code in Venticode."
+        };
+        if let Err(err) = reply(&app, &r, &c, &ev.address, feedback).await {
+            tracing::warn!(connection_id = %id, status = err.0.as_u16(), "failed to send link feedback reply");
+        }
         return Ok(Json(json!({"ok":true})));
     }
     let triggers: Value = r.get("triggers");
@@ -346,16 +357,22 @@ async fn document(app: &App, r: &PgRow) -> Result<Value> {
     )
 }
 async fn list(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    use futures_util::{StreamExt, TryStreamExt};
     let (w, u) = member(&app, &h, false, false).await?;
     let rows=sqlx::query(&format!("SELECT v.*,to_jsonb(v.created_at)#>>'{{}}' AS created FROM ({SELECT}) v WHERE workspace=$1 AND owner_id=$2 AND connection_id=$3 ORDER BY created_at DESC LIMIT 100"))
         .bind(w).bind(u).bind(id).fetch_all(&app.db).await?;
-    let mut items = Vec::new();
-    for r in rows {
-        items.push(document(&app, &r).await?)
-    }
+    let items: Vec<Value> = futures_util::stream::iter(rows)
+        .map(|r| {
+            let app = app.clone();
+            async move { document(&app, &r).await }
+        })
+        .buffered(8)
+        .try_collect()
+        .await?;
     Ok(Json(json!({"items":items})))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Review {
     decision: String,
 }
@@ -394,15 +411,20 @@ async fn review(
     if let Some(conversation) = r.get::<Option<Uuid>, _>("conversation_id") {
         projects::owned(&app, &actor, conversation).await?;
     }
-    let c = creds(&app, &h, id).await?;
-    let body = app.storage.get(r.get("reply_object")).await?;
-    sqlx::query("UPDATE mentions SET state=$2,lease_until=now()+interval '2 minutes' WHERE id=$1")
+    let payload = if state == "sending" {
+        let c = creds(&app, &h, id).await?;
+        let body = app.storage.get(r.get("reply_object")).await?;
+        Some((c, body))
+    } else {
+        None
+    };
+    sqlx::query("UPDATE mentions SET state=$2,lease_until=CASE WHEN $2='sending' THEN now()+interval '2 minutes' ELSE NULL END WHERE id=$1")
         .bind(mention)
         .bind(state)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    if state == "sending" {
+    if let Some((c, body)) = payload {
         let result = reply(
             &app,
             &r,
@@ -422,9 +444,12 @@ async fn review(
                         .to_string()
                 }),
             ),
-            Err(_) => ("uncertain", String::new()),
+            Err(err) => {
+                tracing::warn!(mention_id = %mention, connection_id = %id, status = err.0.as_u16(), "bot reply delivery failed");
+                ("uncertain", String::new())
+            }
         };
-        sqlx::query("UPDATE mentions SET state=$2,remote_id=$3,replied_at=CASE WHEN $2='replied' THEN now() END WHERE id=$1 AND state='sending'").bind(mention).bind(next).bind(remote).execute(&app.db).await?;
+        sqlx::query("UPDATE mentions SET state=$2,remote_id=$3,lease_until=NULL,replied_at=CASE WHEN $2='replied' THEN now() END WHERE id=$1 AND state IN ('sending','uncertain')").bind(mention).bind(next).bind(remote).execute(&app.db).await?;
         result?;
     }
     let row = sqlx::query(&format!(
@@ -437,16 +462,55 @@ async fn review(
 }
 
 pub(super) async fn worker(app: App) {
+    let mut shutdown = app.shutdown.clone();
+    let mut retries = std::collections::HashMap::<Uuid, u32>::new();
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let lease = Uuid::new_v4();
         let claimed=sqlx::query_scalar::<_,Uuid>("UPDATE mentions SET lease_id=$1, lease_until=now()+interval '2 minutes' WHERE id=(
             SELECT id FROM mentions WHERE state IN ('pending','answering') AND (lease_until IS NULL OR lease_until<now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id").bind(lease).fetch_optional(&app.db).await;
-        if let Ok(Some(id)) = claimed {
-            if process(&app, id, lease).await.is_err() {
-                let _=sqlx::query("UPDATE mentions SET state='failed',lease_until=NULL WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')").bind(id).bind(lease).execute(&app.db).await;
+        match claimed {
+            Ok(Some(id)) => {
+                match process(&app, id, lease).await {
+                    Ok(()) => {
+                        retries.remove(&id);
+                    }
+                    Err(err) => {
+                        let transient = err.0.is_server_error()
+                            || matches!(err.0, StatusCode::LOCKED | StatusCode::TOO_MANY_REQUESTS);
+                        let count = retries.entry(id).or_insert(0);
+                        if transient && *count < 3 {
+                            *count += 1;
+                            let delay = 5i64 * (1i64 << (*count - 1));
+                            tracing::warn!(mention_id = %id, status = err.0.as_u16(), attempt = *count, delay_secs = delay, "transient mention error, scheduling retry");
+                            let _ = sqlx::query("UPDATE mentions SET lease_until=now()+make_interval(secs => $3) WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')")
+                                .bind(id).bind(lease).bind(delay as f64).execute(&app.db).await;
+                        } else {
+                            retries.remove(&id);
+                            tracing::error!(mention_id = %id, status = err.0.as_u16(), message = %err.1, "mention processing failed");
+                            let _ = sqlx::query("UPDATE mentions SET state='failed',lease_until=NULL WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')").bind(id).bind(lease).execute(&app.db).await;
+                        }
+                    }
+                }
+                if retries.len() > 512 {
+                    retries.clear();
+                }
             }
-        } else {
-            tokio::time::sleep(Duration::from_secs(1)).await
+            Ok(None) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = shutdown.changed() => break,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "mention worker poll failed");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    _ = shutdown.changed() => break,
+                }
+            }
         }
     }
 }

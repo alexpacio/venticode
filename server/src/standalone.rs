@@ -4,6 +4,7 @@ use axum::{
     response::{Html, Redirect},
 };
 use sha2::{Digest, Sha256};
+use std::{collections::VecDeque, sync::Mutex, time::Instant};
 use subtle::ConstantTimeEq;
 
 pub(super) struct Standalone {
@@ -15,11 +16,14 @@ pub(super) struct Standalone {
     pub workspace: Uuid,
     pub user: Uuid,
     login_hash: [u8; 32],
+    failed_logins: Mutex<VecDeque<Instant>>,
 }
 
 impl Standalone {
     pub fn from_env() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let url = reqwest::Url::parse(&env::var("VENTICODE_ORIGIN")?)?;
+        let origin_raw = require_env("VENTICODE_ORIGIN")?;
+        let url = reqwest::Url::parse(origin_raw.trim())
+            .map_err(|e| format!("Invalid VENTICODE_ORIGIN: {e}"))?;
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
         let secure = url.scheme() == "https";
         if !(secure || url.scheme() == "http" && loopback)
@@ -38,11 +42,19 @@ impl Standalone {
             Some(port) => format!("{}:{port}", url.host_str().unwrap()),
             None => url.host_str().unwrap().to_owned(),
         };
-        let workspace = env::var("VENTICODE_WORKSPACE_ID")?.parse()?;
-        let user = env::var("VENTICODE_USER_ID")?.parse()?;
-        let harness_id = env::var("VENTICODE_HARNESS_ID").map_or(Ok(workspace), |id| id.parse())?;
-        let harness_secret = env::var("VENTICODE_HARNESS_TOKEN")?;
-        let login_secret = env::var("VENTICODE_LOGIN_TOKEN")?;
+        let workspace = require_env("VENTICODE_WORKSPACE_ID")?
+            .trim()
+            .parse()
+            .map_err(|_| "VENTICODE_WORKSPACE_ID must be a UUID")?;
+        let user = require_env("VENTICODE_USER_ID")?
+            .trim()
+            .parse()
+            .map_err(|_| "VENTICODE_USER_ID must be a UUID")?;
+        let harness_id = env::var("VENTICODE_HARNESS_ID")
+            .map_or(Ok(workspace), |id| id.trim().parse())
+            .map_err(|_| "VENTICODE_HARNESS_ID must be a UUID")?;
+        let harness_secret = require_env("VENTICODE_HARNESS_TOKEN")?;
+        let login_secret = require_env("VENTICODE_LOGIN_TOKEN")?;
         let valid_token = |token: &str| {
             (32..=1024).contains(&token.len()) && token.bytes().all(|v| v.is_ascii_graphic())
         };
@@ -64,17 +76,46 @@ impl Standalone {
             workspace,
             user,
             login_hash: Sha256::digest(login_secret.as_bytes()).into(),
+            failed_logins: Mutex::default(),
         })
     }
 
     pub fn validate_host(&self, h: &HeaderMap, write: bool) -> Result<()> {
-        if h.get(header::HOST).and_then(|s| s.to_str().ok()) != Some(self.host.as_str())
-            || write
-                && h.get(header::ORIGIN).and_then(|s| s.to_str().ok()) != Some(self.origin.as_str())
-        {
+        let host_ok = h
+            .get(header::HOST)
+            .and_then(|s| s.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case(&self.host));
+        let origin_ok = !write
+            || h.get(header::ORIGIN)
+                .and_then(|s| s.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case(&self.origin));
+        if !host_ok || !origin_ok {
+            tracing::warn!(expected_host = %self.host, write, "rejected request due to host/origin mismatch");
             return Err(forbidden());
         }
         Ok(())
+    }
+
+    fn record_failed_login(&self) -> bool {
+        let mut attempts = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        while attempts.front().is_some_and(|t| *t < cutoff) {
+            attempts.pop_front();
+        }
+        if attempts.len() >= 10 {
+            return true;
+        }
+        attempts.push_back(Instant::now());
+        false
+    }
+
+    fn login_rate_limited(&self) -> bool {
+        let mut attempts = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        while attempts.front().is_some_and(|t| *t < cutoff) {
+            attempts.pop_front();
+        }
+        attempts.len() >= 10
     }
 
     pub fn session_hash(&self, h: &HeaderMap) -> Result<String> {
@@ -101,8 +142,23 @@ impl Standalone {
 
     async fn active_session(&self, app: &App, h: &HeaderMap) -> Result<(String, bool)> {
         let hash = self.session_hash(h)?;
-        let delegated: bool = sqlx::query_scalar("SELECT bot_grant IS NOT NULL FROM standalone_sessions WHERE token_hash=$1 AND workspace=$2 AND owner_id=$3 AND expires_at>now()")
-            .bind(&hash).bind(self.workspace).bind(self.user).fetch_optional(&app.db).await?.ok_or_else(unauthorized)?;
+        let (delegated, needs_refresh): (bool, bool) = sqlx::query_as(
+            "SELECT bot_grant IS NOT NULL, bot_grant IS NULL AND expires_at < now()+interval '6 hours' FROM standalone_sessions WHERE token_hash=$1 AND workspace=$2 AND owner_id=$3 AND expires_at>now()",
+        )
+        .bind(&hash)
+        .bind(self.workspace)
+        .bind(self.user)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or_else(unauthorized)?;
+        if needs_refresh {
+            let _ = sqlx::query(
+                "UPDATE standalone_sessions SET expires_at=now()+interval '12 hours' WHERE token_hash=$1 AND bot_grant IS NULL",
+            )
+            .bind(&hash)
+            .execute(&app.db)
+            .await;
+        }
         Ok((hash, delegated))
     }
 
@@ -155,7 +211,7 @@ impl Standalone {
                     serde_json::from_value::<Uuid>(body["grant"].clone()).map_err(|_| bad())?;
                 let token = session_token();
                 let result = sqlx::query("INSERT INTO standalone_sessions(token_hash,workspace,owner_id,expires_at,bot_grant)
-                    SELECT $1,c.workspace,g.owner_id,now()+interval '10 minutes',g.id
+                    SELECT $1,c.workspace,g.owner_id,now()+interval '30 minutes',g.id
                     FROM standalone_bot_grants g JOIN connections c ON c.id=g.connection_id
                     WHERE g.id=$2 AND c.id=$3 AND g.owner_id=$4 AND c.workspace=$5 AND c.status='connected' AND c.enabled
                       AND EXISTS(SELECT FROM external_links l WHERE l.connection_id=c.id AND l.user_id=g.owner_id AND l.control_grant=g.id)")
@@ -192,7 +248,12 @@ pub(super) async fn form(
     Query(request): Query<SignIn>,
 ) -> Result<Response> {
     let Some(local) = &app.standalone else {
-        let portal = env::var("PORTAL_ORIGIN").map_err(|_| missing())?;
+        let portal = env::var("PORTAL_ORIGIN")
+            .ok()
+            .and_then(|origin| reqwest::Url::parse(origin.trim()).ok())
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .map(|url| url.origin().ascii_serialization())
+            .ok_or_else(missing)?;
         if request.browser.as_deref() == Some("1")
             && let Some(workspace) = h
                 .get(header::HOST)
@@ -201,8 +262,7 @@ pub(super) async fn form(
                 .and_then(|(id, _)| id.parse::<Uuid>().ok())
         {
             return Ok(Redirect::to(&format!(
-                "{}/app/venticode?standalone=1&browser=1&workspace={workspace}",
-                portal.trim_end_matches('/')
+                "{portal}/app/venticode?standalone=1&browser=1&workspace={workspace}",
             ))
             .into_response());
         }
@@ -259,6 +319,13 @@ pub(super) async fn login(
 ) -> Result<Response> {
     let local = app.standalone.as_ref().ok_or_else(missing)?;
     local.validate_host(&h, true)?;
+    if local.login_rate_limited() {
+        tracing::warn!("standalone login rate limit reached");
+        return Err(Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Troppi tentativi di accesso. Riprova tra un minuto / Too many sign-in attempts. Try again in a minute".into(),
+        ));
+    }
     if body.token.len() > 1024
         || !bool::from(
             local
@@ -266,6 +333,8 @@ pub(super) async fn login(
                 .ct_eq(Sha256::digest(body.token.as_bytes()).as_slice()),
         )
     {
+        local.record_failed_login();
+        tracing::warn!("standalone login rejected: invalid access token");
         return Ok((StatusCode::UNAUTHORIZED, login_page(&h, true)).into_response());
     }
     let token = session_token();

@@ -16,8 +16,20 @@ impl Terminal {
         let size = size(rows, cols)?;
         let pair = native_pty_system().openpty(size)?;
         #[cfg(unix)]
-        let mut cmd =
-            CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+        let mut cmd = {
+            let shell = std::env::var("SHELL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/bin/sh".into());
+            let mut cmd = CommandBuilder::new(shell);
+            if std::env::var("TERM")
+                .ok()
+                .is_none_or(|t| t.trim().is_empty())
+            {
+                cmd.env("TERM", "xterm-256color");
+            }
+            cmd
+        };
         #[cfg(windows)]
         let mut cmd = CommandBuilder::new("powershell.exe");
         cmd.cwd(cwd);

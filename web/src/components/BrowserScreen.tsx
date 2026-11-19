@@ -125,7 +125,7 @@ export function BrowserScreen({ frame, human, desktop = false, exit, onInput, on
     ref={canvas}
     className="browser-canvas"
     data-controlled={human}
-    aria-label={t("Schermo del browser remoto")}
+    aria-label={desktop ? t("Schermo del desktop remoto") : t("Schermo del browser remoto")}
     tabIndex={-1}
     data-remote-desktop={desktop ? "" : undefined}
     onKeyDownCapture={(event) => {

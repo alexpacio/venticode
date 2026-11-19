@@ -24,7 +24,12 @@ export function decodeFrame(packet: ArrayBuffer): BrowserFrame | null {
   const bytes = new Uint8Array(packet);
   const end = bytes.subarray(0, 1024).indexOf(0x0a);
   if (end < 0 || end + 1 === bytes.length) return null;
-  const header = JSON.parse(utf8.decode(bytes.subarray(0, end)));
+  let header: any;
+  try {
+    header = JSON.parse(utf8.decode(bytes.subarray(0, end)));
+  } catch {
+    return null;
+  }
   if (header?.type !== "frame" || typeof header.tab !== "string" ||
       typeof header.width !== "number" || typeof header.height !== "number" ||
       !(header.width > 0 && header.width <= 4096 && header.height > 0 && header.height <= 4096)) return null;
@@ -42,7 +47,7 @@ export function BrowserView({ menu }: { menu: ReactNode }) {
   if (threads.data) {
     content = <BrowserSession threads={threads.data.threads} />;
   } else if (threads.isPending) {
-    content = <div className="empty" role="status"><LoaderCircle className="spin" />{t("Caricamento…")}</div>;
+    content = <div className="empty" role="status"><LoaderCircle className="spin" aria-hidden="true" />{t("Caricamento…")}</div>;
   } else if (threads.isError) {
     const unavailable = threads.error instanceof ApiError && [403, 404].includes(threads.error.status);
     content = <div className="empty" role="status">
@@ -110,7 +115,12 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
         if (next?.tab === activeTab.current) setFrame(next);
         return;
       }
-      const packet = JSON.parse(event.data) as BrowserEvent;
+      let packet: BrowserEvent;
+      try {
+        packet = JSON.parse(event.data) as BrowserEvent;
+      } catch {
+        return;
+      }
       switch (packet.type) {
         case "ready":
           ready = true;
@@ -167,16 +177,21 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
   }
 
   function send(packet: object) {
-    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(packet));
+    if (socket.current?.readyState === WebSocket.OPEN) {
+      socket.current.send(JSON.stringify(packet));
+      return true;
+    }
+    return false;
   }
 
   function ask(event: FormEvent) {
     event.preventDefault();
     if (!canAsk || !prompt.trim()) return;
     setError("");
-    setPending(true);
-    send({ type: "ask", prompt });
-    setPrompt("");
+    if (send({ type: "ask", prompt })) {
+      setPending(true);
+      setPrompt("");
+    }
   }
 
   const canAsk = status === "ready" && !human && !pending && !changingControl;
@@ -203,7 +218,9 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
             return;
           }
           setStatus("closing");
-          send({ type: "end" });
+          const ws = socket.current;
+          if (!send({ type: "end" })) ws?.close();
+          else window.setTimeout(() => { if (socket.current === ws) ws?.close(); }, 3000);
         }}>{t("Termina sessione")}</button>}
     </div>
     {error && <p className="error-line" role="alert">{error}</p>}
@@ -226,18 +243,21 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
           <form onSubmit={(event) => {
             event.preventDefault();
             if (!canInput) return;
+            const raw = address.trim();
+            if (!raw) return;
+            const normalized = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) ? raw : `https://${raw}`;
+            setAddress(normalized);
             setError("");
-            send({ type: "open", url: address });
+            send({ type: "open", url: normalized });
           }}>
-            <input className="input mono" type="url" required maxLength={4096} value={address}
+            <input className="input mono" type="text" inputMode="url" required maxLength={4096} value={address}
               readOnly={!canInput} onChange={(event) => setAddress(event.target.value)} aria-label={t("Indirizzo del browser")} />
             <button className="btn" disabled={!canInput}>{t("Apri")}</button>
           </form>
           <button type="button" className="btn" ref={controlButton} disabled={status !== "ready" || changingControl}
             onClick={() => {
               setError("");
-              setChangingControl(true);
-              send({ type: human ? "release" : "take" });
+              if (send({ type: human ? "release" : "take" })) setChangingControl(true);
             }}>{human ? t("Restituisci il controllo") : t("Prendi il controllo")}</button>
         </div>
         <div className="browser-stage">
@@ -271,7 +291,13 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
           <label className="field">
             <span>{t("Richiesta per l’assistente")}</span>
             <textarea className="textarea" value={prompt} rows={3} maxLength={6000}
-              onChange={(event) => setPrompt(event.target.value)} />
+              onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  ask(event);
+                }
+              }} />
           </label>
           <button className="btn btn-primary" disabled={!canAsk || !prompt.trim()}>{t("Invia")}</button>
         </form>

@@ -14,15 +14,26 @@ ARCHITECTURES = {
     "amd64": ("SCMP_ARCH_X86_64", "amd64"),
     "arm64": ("SCMP_ARCH_AARCH64", "arm64"),
 }
-CROSS_PROCESS = {"ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd"}
+CROSS_PROCESS = {"ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd", "clone3"}
 
 
-def desktop_profile(profile, architecture):
+def _kernel_tuple(raw):
+    parts = []
+    for part in str(raw).split("-")[0].split("."):
+        if part.isdigit():
+            parts.append(int(part))
+        else:
+            break
+    return tuple(parts or (0, 0))
+
+
+def desktop_profile(profile, architecture, kernel=None):
     if profile.get("defaultAction") != "SCMP_ACT_ERRNO" or not isinstance(profile.get("syscalls"), list):
         raise ValueError("an OCI default-deny allowlist is required")
     native, arch = ARCHITECTURES[architecture]
     arch_map = profile.get("archMap", [])
     valid_arches = {arch, native, native.removeprefix("SCMP_ARCH_")}
+    target_kernel = _kernel_tuple(kernel or platform.release())
     result = {key: profile[key] for key in ("defaultAction", "defaultErrnoRet") if key in profile}
     arches = profile.get("architectures") or next(
         ([native, *entry.get("subArchitectures", [])] for entry in arch_map if entry["architecture"] == native),
@@ -32,8 +43,12 @@ def desktop_profile(profile, architecture):
     syscalls = []
     for rule in profile["syscalls"]:
         includes, excludes = rule.get("includes", {}), rule.get("excludes", {})
-        if set(includes) - {"caps", "arches"} or set(excludes) - {"caps", "arches"}:
+        if set(includes) - {"caps", "arches", "minKernel"} or set(excludes) - {"caps", "arches", "minKernel"}:
             raise ValueError("unsupported architecture or capability filter in base profile")
+        if includes.get("minKernel") and target_kernel < _kernel_tuple(includes["minKernel"]):
+            continue
+        if excludes.get("minKernel") and target_kernel >= _kernel_tuple(excludes["minKernel"]):
+            continue
         if includes.get("arches") and not valid_arches.intersection(includes["arches"]):
             continue
         if excludes.get("arches") and valid_arches.intersection(excludes["arches"]):
@@ -58,7 +73,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_profile")
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="arm64" if platform.machine() == "aarch64" else "amd64")
+    parser.add_argument("--kernel", default=None, help="Target kernel version for minKernel filters (defaults to host kernel)")
     args = parser.parse_args()
     with open(args.base_profile, encoding="utf-8") as source:
-        json.dump(desktop_profile(json.load(source), args.architecture), sys.stdout, indent=2)
+        json.dump(desktop_profile(json.load(source), args.architecture, args.kernel), sys.stdout, indent=2)
     print()
