@@ -8,6 +8,7 @@ import { Home } from "./components/Home.tsx";
 import { ProjectView } from "./components/ProjectView.tsx";
 import { ConversationView } from "./components/ConversationView.tsx";
 import { BotView } from "./components/BotView.tsx";
+import { BrowserView } from "./components/BrowserView.tsx";
 
 import { Connections } from "./components/Connections.tsx";
 
@@ -39,6 +40,7 @@ export function App() {
         <Route path="/c/:id" element={<ConversationView menu={menu} />} />
         <Route path="/bots/:id" element={<BotView menu={menu} admin={admin} />} />
         <Route path="/connections" element={<Connections menu={menu} admin={admin} />} />
+        <Route path="/browser" element={<BrowserView menu={menu} />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </div>
@@ -46,12 +48,13 @@ export function App() {
 }
 
 function SignedOut() {
+  const browser = useLocation().pathname === "/browser";
   return (
     <main className="empty">
       <div className="brand-mark" aria-hidden="true">&gt;_</div>
       <h1>{t("Accedi a Venticode")}</h1>
-      <a className="btn btn-primary btn-lg" href="/venticode/login">{t("Accedi")}</a>
-      {import.meta.env.DEV && <a className="btn btn-primary btn-lg" href="/__dev/login">{t("Accesso di sviluppo (dati sintetici)")}</a>}
+      <a className="btn btn-primary btn-lg" href={browser ? "/venticode/login?browser=1" : "/venticode/login"}>{t("Accedi")}</a>
+      {import.meta.env.DEV && <a className="btn btn-primary btn-lg" href={browser ? "/__dev/login?browser=1" : "/__dev/login"}>{t("Accesso di sviluppo (dati sintetici)")}</a>}
     </main>
   );
 }

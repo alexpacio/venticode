@@ -1,6 +1,6 @@
 use super::*;
 use axum::{
-    extract::Form,
+    extract::{Form, Query},
     response::{Html, Redirect},
 };
 use sha2::{Digest, Sha256};
@@ -181,9 +181,31 @@ fn unauthorized() -> Error {
     )
 }
 
-pub(super) async fn form(State(app): State<App>, h: HeaderMap) -> Result<Response> {
+#[derive(Deserialize)]
+pub(super) struct SignIn {
+    browser: Option<String>,
+}
+
+pub(super) async fn form(
+    State(app): State<App>,
+    h: HeaderMap,
+    Query(request): Query<SignIn>,
+) -> Result<Response> {
     let Some(local) = &app.standalone else {
         let portal = env::var("PORTAL_ORIGIN").map_err(|_| missing())?;
+        if request.browser.as_deref() == Some("1")
+            && let Some(workspace) = h
+                .get(header::HOST)
+                .and_then(|host| host.to_str().ok())
+                .and_then(|host| host.split_once('.'))
+                .and_then(|(id, _)| id.parse::<Uuid>().ok())
+        {
+            return Ok(Redirect::to(&format!(
+                "{}/app/venticode?standalone=1&browser=1&workspace={workspace}",
+                portal.trim_end_matches('/')
+            ))
+            .into_response());
+        }
         return Ok(Redirect::to(&portal).into_response());
     };
     local.validate_host(&h, false)?;

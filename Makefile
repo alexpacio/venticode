@@ -11,7 +11,7 @@ help:
 	  'make build      production build of the web app into web/dist' \
 	  'make test       mock, transcript and translation tests' \
 	  'make check      generate, type check, tests and build' \
-	  'make demo-tui-web  build the WebAssembly TUI demo and serve it on loopback' \
+	  'make demo-tui-web  serve the WebAssembly terminal and browser demos on loopback' \
 	  'make check-tui  format, lint and test the Rust terminal client' \
 	  'make build-tui-windows  build the Windows x64 binary with the MSVC toolchain'
 

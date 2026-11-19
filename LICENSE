@@ -1,0 +1,67 @@
+Venticode Source-Available License 1.0
+
+1. Scope
+
+This license covers versions of Venticode made available under these terms by
+the Venticode copyright holders (the Licensor). It applies only to material the
+Licensor has the right to license. Third-party components and material carrying
+separate license notices remain governed by their respective terms. Rights
+already granted under a separate license or written agreement are preserved.
+
+2. Permission for internal use
+
+Subject to these terms, the Licensor grants you a worldwide, non-exclusive,
+royalty-free, non-transferable and non-sublicensable copyright license to
+inspect, copy, build, install, run and modify Venticode for your own internal
+purposes, including internal business use in production. You may make copies
+available to personnel within your organization solely for those purposes.
+
+3. Branding and notices
+
+Keep the original Venticode logo in the parts of the product where the official
+version displays it. You must preserve its appearance and must keep copyright,
+license and trademark notices intact. Removing, obscuring, altering or replacing
+the logo requires the Licensor's prior written permission. This license permits
+use of the logo as supplied with Venticode for the permitted uses in section 2.
+All other trademark rights are reserved.
+
+4. Distribution and third-party access
+
+You must obtain the Licensor's prior written permission to distribute, resell,
+sublicense or otherwise make copies of Venticode available to third parties,
+including source code, builds and modified versions. The same permission is
+required to offer Venticode as a hosted or managed service to third parties.
+You may submit patches to the official repository as described in section 5.
+Rights to view and fork a public repository within GitHub under GitHub's Terms
+of Service are preserved. Those platform rights do not grant permission to
+redistribute copies elsewhere.
+
+5. Contributions
+
+Before deploying a modified version of Venticode for production use, submit the
+changes to the official repository at https://github.com/alexpacio/venticode
+through a pull request. The maintainer's acceptance or merge of the pull
+request is at their discretion and is not a condition of production use.
+Testing and evaluation of modifications may take place before submission.
+
+By submitting a patch intended for inclusion, you grant the Licensor a
+worldwide, perpetual, irrevocable, non-exclusive, royalty-free and sublicensable
+copyright license to use, reproduce, modify, integrate and distribute the patch
+as part of Venticode under terms of the Licensor's choice. You retain ownership
+of your contribution and represent that you have the right to grant these
+permissions. Submit only changes you are entitled to share. Keep credentials,
+private data and deployment configuration outside the patch.
+
+6. Reserved rights and termination
+
+All rights not expressly granted are reserved. Your permissions under this
+license end if you breach its conditions. After termination you must cease use
+under this license. Contribution grants under section 5 survive termination.
+This license does not limit rights or remedies that cannot be waived under
+applicable law.
+
+7. Warranty and liability
+
+To the extent permitted by applicable law, Venticode is provided as is, without
+express or implied warranties. The Licensor disclaims liability for damages
+arising from the use of Venticode to the extent permitted by applicable law.

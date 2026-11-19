@@ -2,8 +2,16 @@ import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, base, list, ApiError } from "./api/client.ts";
 import type { Bot, Conversation, Harness, Mention, Model, Project, Session, TranscriptEvent } from "./api/client.ts";
+import type { operations } from "./api/schema.ts";
 
 export const useSession = () => useQuery({ queryKey: ["session"], queryFn: () => api<Session>("/session"), retry: false });
+type BrowserThreads = operations["listBrowserThreads"]["responses"][200]["content"]["application/json"];
+export const useBrowserThreads = () => useQuery({
+  queryKey: ["browser-threads"],
+  queryFn: () => api<BrowserThreads>("/browser-agent"),
+  retry: false,
+  staleTime: 30_000,
+});
 export const useModels = () => useQuery({ queryKey: ["models"], queryFn: () => list<Model>("/models"), staleTime: 300_000 });
 // shortcut: harness presence is polled; switch to a pushed inventory stream when the backend has one.
 export const useHarnesses = () => useQuery({ queryKey: ["harnesses"], queryFn: () => list<Harness>("/harnesses"), refetchInterval: 10_000 });

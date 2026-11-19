@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Venticode API
-  version: 0.2.1
+  version: 0.3.0
   description: |
     Browser API of Venticode, the coding and bot agent that runs tools on
     connected venticode-harness instances.
@@ -68,9 +68,10 @@ paths:
               required: [ticket]
               properties:
                 ticket: { type: string }
+                browser: { type: string, enum: ['1'], description: Open the browser viewer after sign-in }
       responses:
         '303':
-          description: Session cookie set; redirect to the application root
+          description: Session cookie set; redirect to the application root or browser viewer
           headers:
             Location: { schema: { type: string } }
             Set-Cookie: { schema: { type: string } }
@@ -83,6 +84,11 @@ paths:
       operationId: loginPage
       tags: [session]
       summary: Open the standalone sign-in page or the configured Ventic portal
+      parameters:
+        - name: browser
+          in: query
+          description: Open the browser viewer after Ventic sign-in
+          schema: { type: string, enum: ['1'] }
       responses:
         '200':
           description: Standalone sign-in form
@@ -139,6 +145,60 @@ paths:
                 properties:
                   signed_out: { type: boolean }
                   redirect_url: { type: string, format: uri }
+  /browser-agent:
+    get:
+      operationId: listBrowserThreads
+      summary: List the signed-in user's saved browser conversations
+      description: Available in a Ventic workspace with the Kitesurf browser pilot enabled.
+      responses:
+        '200':
+          description: Browser conversations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [threads]
+                properties:
+                  threads:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, updated_at]
+                      properties:
+                        id: { type: string, format: uuid }
+                        updated_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /browser-agent/{thread}:
+    get:
+      operationId: connectBrowser
+      summary: Open a Kitesurf session over a same-origin WebSocket
+      description: |
+        The workspace cookie and exact workspace Origin are required. A new UUID
+        starts a new conversation. Reopening a saved conversation restores its
+        messages in a fresh browser. Only one connection per conversation can
+        run at a time. Closing the socket ends the live browser.
+
+        Client messages are JSON with a `type` of `ask`, `take`, `release`,
+        `open`, `new_tab`, `tab`, `input` or `end`. An `input` carries
+        the target tab ID and a `click`, `scroll`, `text` or `key` payload.
+        Server `tabs` messages identify the active tab. Live Motion JPEG frames
+        are binary WebSocket messages with one UTF-8 JSON header followed by a
+        newline and the JPEG bytes. The header contains `type: frame`, `tab`,
+        `width` and `height` (the remote viewport dimensions used for input).
+        Text events are `history`, `ready`, `working`, `idle`, `control`,
+        `heartbeat`, `error` and `ended`.
+      parameters:
+        - name: thread
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '101': { description: WebSocket upgrade }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
   /models:
     get:
       operationId: listModels

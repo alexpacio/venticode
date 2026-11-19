@@ -2,7 +2,7 @@
 name = "ventiharness-terminal"
 version = "1.0.0"
 edition = "2024"
-license = "UNLICENSED"
+license-file = "../../LICENSE"
 
 [dependencies]
 anyhow = "1"

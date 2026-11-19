@@ -72,6 +72,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/browser-agent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the signed-in user's saved browser conversations
+         * @description Available in a Ventic workspace with the Kitesurf browser pilot enabled.
+         */
+        get: operations["listBrowserThreads"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/browser-agent/{thread}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Open a Kitesurf session over a same-origin WebSocket
+         * @description The workspace cookie and exact workspace Origin are required. A new UUID
+         *     starts a new conversation. Reopening a saved conversation restores its
+         *     messages in a fresh browser. Only one connection per conversation can
+         *     run at a time. Closing the socket ends the live browser.
+         *
+         *     Client messages are JSON with a `type` of `ask`, `take`, `release`,
+         *     `open`, `new_tab`, `tab`, `input` or `end`. An `input` carries
+         *     the target tab ID and a `click`, `scroll`, `text` or `key` payload.
+         *     Server `tabs` messages identify the active tab. Live Motion JPEG frames
+         *     are binary WebSocket messages with one UTF-8 JSON header followed by a
+         *     newline and the JPEG bytes. The header contains `type: frame`, `tab`,
+         *     `width` and `height` (the remote viewport dimensions used for input).
+         *     Text events are `history`, `ready`, `working`, `idle`, `control`,
+         *     `heartbeat`, `error` and `ended`.
+         */
+        get: operations["connectBrowser"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/models": {
         parameters: {
             query?: never;
@@ -842,11 +895,16 @@ export interface operations {
             content: {
                 "application/x-www-form-urlencoded": {
                     ticket: string;
+                    /**
+                     * @description Open the browser viewer after sign-in
+                     * @enum {string}
+                     */
+                    browser?: "1";
                 };
             };
         };
         responses: {
-            /** @description Session cookie set; redirect to the application root */
+            /** @description Session cookie set; redirect to the application root or browser viewer */
             303: {
                 headers: {
                     Location?: string;
@@ -861,7 +919,10 @@ export interface operations {
     };
     loginPage: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Open the browser viewer after Ventic sign-in */
+                browser?: "1";
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -963,6 +1024,59 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    listBrowserThreads: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Browser conversations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        threads: {
+                            /** Format: uuid */
+                            id: string;
+                            /** Format: date-time */
+                            updated_at: string;
+                        }[];
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    connectBrowser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                thread: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     listModels: {

@@ -43,4 +43,4 @@ createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end();
   }
-}).listen(port, "127.0.0.1", () => console.log(origin));
+}).on("upgrade", api.upgrade).listen(port, "127.0.0.1", () => console.log(origin));

@@ -13,6 +13,14 @@ synthetic API during UI development. In Ventic mode, Ventic control authorizes
 the workspace and relays member-scoped requests. In standalone mode, Venticode
 issues its own sessions, connects directly to its runner, and calls the LLM API.
 
+## License
+
+The [Venticode Source-Available License 1.0](LICENSE) allows self-hosting for
+internal business use. Keep the original logo intact and obtain written
+permission before distributing source or builds to third parties. Submit any
+production-bound changes through a pull request to this repository before
+deploying them. A maintainer's merge is optional.
+
 ## Layout
 
 | Path | Contents |
@@ -132,6 +140,29 @@ The Docker build prepares its own compiler and bindings generator.
 Run `make demo-tui-web` to serve the compiled workspace UI with the
 loopback-only synthetic API. Open `http://127.0.0.1:4287/__dev/login`
 for a demo session. Stopping the server discards demo conversations.
+
+### Remote browser
+
+In a Ventic workspace with the Kitesurf pilot enabled, open **Remote browser**
+in the Venticode sidebar and select **Start Kitesurf**. The egui WebAssembly
+viewer projects live pixels from Kitesurf's active tab as Motion JPEG over
+the workspace WebSocket. Select **Take
+control** to click, scroll, type, paste, open a URL, or switch tabs. Select
+**Give control back** to resume a paused assistant task. The **End session**
+button closes the browser. Selecting a saved conversation opens a fresh
+browser with its previous messages.
+
+From the desktop terminal client, enter `/browser` to launch the same
+workspace page in your system browser. The terminal also prints the URL for
+headless use. If the web session has expired, the Ventic portal signs you in
+and opens the viewer. The browser worker and WebSocket are both self-hosted.
+
+To try this locally, run `make demo-tui-web` and open
+`http://127.0.0.1:4287/__dev/login?browser=1`. Start the session and ask
+`What is the status of release 2.18.4?`. Take control, click the **Release
+note** field, type a note and save it. Switch to the **Metrics** tab and give
+control back. The demo uses scripted assistant replies and an interactive
+synthetic screen with no external network calls from the mock.
 
 ## API summary
 

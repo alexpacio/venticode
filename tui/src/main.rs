@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 const COMMANDS: &[&str] = &[
     "/help",
+    "/browser",
     "/new",
     "/resume",
     "/model",
@@ -436,9 +437,15 @@ impl App {
             }
             "/status" => self.note(format!("{} · {} · {} · {}", self.remote.workspace, self.model, string(&self.chat,"permission_mode"), string(&self.chat,"state"))),
             "/quit" | "/exit" => return Ok(true),
+            "/browser" => {
+                ensure!(argument.is_empty(), "/browser");
+                let url = format!("{}/browser", self.remote.workspace);
+                let _ = open::that_detached(&url);
+                self.note(format!("{} · {url}", self.msg("Browser remoto", "Remote browser")));
+            }
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit\nAlt+Invio a capo · Ctrl+L modello · Ctrl+O strumenti · PgSu/PgGiù scorri · Fine segue · Esc interrompe · Ctrl+C esci",
-                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /logout · /exit\nAlt+Enter newline · Ctrl+L model · Ctrl+O tools · PgUp/PgDn scroll · End follow · Esc interrupt · Ctrl+C quit",
+                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /browser · /logout · /exit\nAlt+Invio a capo · Ctrl+L modello · Ctrl+O strumenti · PgSu/PgGiù scorri · Fine segue · Esc interrompe · Ctrl+C esci",
+                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /rename · /browser · /logout · /exit\nAlt+Enter newline · Ctrl+L model · Ctrl+O tools · PgUp/PgDn scroll · End follow · Esc interrupt · Ctrl+C quit",
             )),
             "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model" if argument.is_empty() => {
                 self.refresh().await?;

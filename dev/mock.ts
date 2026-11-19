@@ -6,6 +6,8 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import type { Duplex } from "node:stream";
+import { createBrowserDemo } from "./browser-demo.ts";
 
 type Json = Record<string, any>;
 type Event = Json & { sequence: number; type: string; created_at: string };
@@ -25,6 +27,8 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   const workspace = { id: "0b3a7c5e-1f2d-4e6a-9b8c-7d6e5f4a3b2c", name: "Workspace sintetico" };
   const user = { id: "5c4b3a29-1807-4f6e-8d5c-4b3a29180706", name: "Utente sintetico", email: "user@example.invalid" };
   const sessions = new Set<string>();
+  const browser = createBrowserDemo();
+  const sessionCookie = (cookie = "") => cookie.match(/(?:^|;\s*)venticode_session=([a-f0-9]{64})/)?.[1] || "";
   const tickets = new Map<string, number>();
   const models = [
     { id: "opus-5.5", name: "Opus 5.5", default: true },
@@ -194,7 +198,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   }
 
   function route(method: string, path: string, body: Json, headers: Json): Json | undefined {
-    const cookie = headers.cookie?.match(/(?:^|;\s*)venticode_session=([a-f0-9]{64})/)?.[1] || "";
+    const cookie = sessionCookie(headers.cookie);
     const authed = sessions.has(cookie);
     if (method === "POST" && path === "/api/v1/venticode/access") {
       if (headers.origin !== portalOrigin) return fail(403, "Origine non consentita / Origin not allowed");
@@ -205,15 +209,16 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     }
     if (method === "POST" && path === "/venticode/bootstrap") {
       if (headers.origin !== portalOrigin) return fail(403, "Origine non consentita / Origin not allowed");
-      const ticket = new URLSearchParams(body.raw || "").get("ticket") || "";
+      const fields = new URLSearchParams(body.raw || "");
+      const ticket = fields.get("ticket") || "";
       const expires = tickets.get(ticket);
       tickets.delete(ticket);
       if (!expires || expires < Date.now()) return fail(409, "Ticket scaduto o già usato / Ticket expired or already used");
-      return login();
+      return login(fields.get("browser") === "1" ? "/browser" : "/");
     }
     if (method === "GET" && path === "/__dev/login") {
       const id = body.query.get("conversation");
-      const result = login();
+      const result = login(body.query.get("browser") === "1" ? "/browser" : "/");
       if (isUuid(id) && conversations.some(c => c.id === id)) result.headers.Location = "/c/" + id;
       return result;
     }
@@ -224,6 +229,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     let m: RegExpMatchArray | null;
 
     if (p === "/session" && method === "GET") return ok({ user, workspace, role: "tenant_admin", portal_url: portalOrigin });
+    if (p === "/browser-agent" && method === "GET") return ok({ threads: browser.threads() });
     if (p === "/session" && method === "DELETE") {
       sessions.delete(cookie);
       return { ...ok({ signed_out: true, redirect_url: portalOrigin + "/app" }), headers: { "Set-Cookie": "venticode_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" } };
@@ -384,10 +390,10 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     }
     return fail(404, "Not found");
 
-    function login() {
+    function login(destination = "/") {
       const token = randomBytes(32).toString("hex");
       sessions.add(token);
-      return { status: 303, headers: { Location: "/", "Set-Cookie": `venticode_session=${token}; Path=/; HttpOnly; SameSite=Lax` } };
+      return { status: 303, headers: { Location: destination, "Set-Cookie": `venticode_session=${token}; Path=/; HttpOnly; SameSite=Lax` } };
     }
   }
 
@@ -403,7 +409,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     req.once("close", () => { set.delete(write); clearInterval(heartbeat); });
   }
 
-  return async function handle(req: IncomingMessage, res: ServerResponse) {
+  async function handle(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const chunks: Buffer[] = [];
     let size = 0;
@@ -421,14 +427,31 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     }
     res.writeHead(result!.status, { "Cache-Control": "no-store", ...(result!.json ? { "Content-Type": "application/json" } : {}), ...result!.headers });
     res.end(result!.json ? JSON.stringify(result!.json) : undefined);
-  };
+  }
+
+  function upgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
+    const path = new URL(req.url || "/", origin).pathname;
+    const thread = path.match(/^\/api\/v1\/venticode\/browser-agent\/([0-9a-f-]+)$/)?.[1];
+    if (!isUuid(thread) || req.headers.origin !== origin || !sessions.has(sessionCookie(req.headers.cookie))) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    browser.upgrade(req, socket, head, (client) => browser.connected(client, thread));
+  }
+
+  return Object.assign(handle, { upgrade, close: browser.close });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.VENTICODE_MOCK_PORT || 4189);
   const origin = process.env.VENTICODE_ORIGIN || "http://127.0.0.1:4175";
   const portalOrigin = process.env.VENTICODE_PORTAL_ORIGIN || "http://127.0.0.1:4174";
-  const server = createServer(createMock({ origin, portalOrigin }));
+  const api = createMock({ origin, portalOrigin });
+  const server = createServer(api).on("upgrade", api.upgrade);
   server.listen(port, "127.0.0.1", () => console.log(`Venticode synthetic API on http://127.0.0.1:${port} (app origin ${origin}); sign in at ${origin}/__dev/login`));
-  for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => { server.closeAllConnections(); server.close(() => process.exit(0)); });
+  for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => {
+    api.close();
+    server.closeAllConnections();
+    server.close(() => process.exit(0));
+  });
 }

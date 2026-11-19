@@ -75,7 +75,7 @@ jobs:
       - name: Package Linux and macOS
         if: runner.os != 'Windows'
         run: |
-          cp target/release/venticode target/release/venticode-harness tui/target/release/venticode-tui README.md bundle/
+          cp target/release/venticode target/release/venticode-harness tui/target/release/venticode-tui README.md LICENSE bundle/
           mkdir -p packages
           tar -czf "packages/$PACKAGE.tar.gz" -C bundle .
       - name: Package Windows
@@ -83,7 +83,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item target/release/venticode.exe, target/release/venticode-harness.exe, tui/target/release/venticode-tui.exe, README.md -Destination bundle/
+          Copy-Item target/release/venticode.exe, target/release/venticode-harness.exe, tui/target/release/venticode-tui.exe, README.md, LICENSE -Destination bundle/
           New-Item -ItemType Directory -Path packages
           Compress-Archive -Path bundle/* -DestinationPath "packages/$env:PACKAGE.zip"
       - uses: actions/upload-artifact@v7

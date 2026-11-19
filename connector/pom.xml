@@ -1,6 +1,6 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>io.ventic</groupId><artifactId>venticode-connector</artifactId><version>0.2.1</version>
+  <groupId>io.ventic</groupId><artifactId>venticode-connector</artifactId><version>0.3.0</version>
   <properties>
     <maven.compiler.release>21</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <camel.version>4.18.3</camel.version>

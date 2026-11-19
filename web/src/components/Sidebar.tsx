@@ -1,10 +1,10 @@
 import { useRef, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Bot as BotIcon, ChevronRight, Folder, FolderPlus, Languages, LogOut, Monitor, Search } from "lucide-react";
+import { AppWindow, Bot as BotIcon, ChevronRight, Folder, FolderPlus, Languages, LogOut, Monitor, Search } from "lucide-react";
 import { api } from "../api/client.ts";
 import type { Harness, Project, Session } from "../api/client.ts";
-import { useBots, useConversations, useHarnesses, useProjects } from "../queries.ts";
+import { useBots, useBrowserThreads, useConversations, useHarnesses, useProjects } from "../queries.ts";
 import { setLanguage, t, useLanguage } from "../i18n/index.ts";
 import venticMark from "../design/assets/ventic-icon.svg";
 import { relative } from "./format.ts";
@@ -14,6 +14,7 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
   const projects = useProjects();
   const conversations = useConversations();
   const bots = useBots();
+  const browser = useBrowserThreads();
   const language = useLanguage();
   const [query, setQuery] = useState("");
   const [closed, setClosed] = useState<Set<string>>(new Set());
@@ -46,6 +47,9 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
         <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("Cerca conversazioni…")} />
       </label>
       <div className="sidebar-scroll">
+        {browser.data && <NavLink to="/browser" className="bot-link" onClick={onNavigate}>
+          <AppWindow size={16} aria-hidden="true" />{t("Browser remoto")}
+        </NavLink>}
         <div className="nav-head">
           <h2 className="section-title">{t("Harness · {0}/{1} online", online, harnesses.data?.length ?? 0)}</h2>
           <a className="btn" style={{ minHeight: 30, fontSize: 12, border: 0 }} href={`${session.portal_url}/app/harnesses`} target="_blank" rel="noreferrer">{t("Collega")}</a>
