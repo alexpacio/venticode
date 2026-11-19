@@ -15,17 +15,18 @@ export type BrowserFrame = {
 type ScreenProps = {
   frame: BrowserFrame | null;
   human: boolean;
+  desktop?: boolean;
   exit: RefObject<HTMLButtonElement | null>;
   onInput: (tab: string, input: object) => void;
   onFailure: () => void;
 };
 
-export function BrowserScreen({ frame, human, exit, onInput, onFailure }: ScreenProps) {
+export function BrowserScreen({ frame, human, desktop = false, exit, onInput, onFailure }: ScreenProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const present = useRef<(next: BrowserFrame | null) => void>(ignore);
   const control = useRef<(human: boolean) => void>(ignore);
-  const current = useRef({ frame, human, onInput, onFailure });
-  useLayoutEffect(() => { current.current = { frame, human, onInput, onFailure }; });
+  const current = useRef({ frame, human, desktop, onInput, onFailure });
+  useLayoutEffect(() => { current.current = { frame, human, desktop, onInput, onFailure }; });
 
   useEffect(() => {
     const element = canvas.current!;
@@ -79,6 +80,7 @@ export function BrowserScreen({ frame, human, exit, onInput, onFailure }: Screen
         }));
         if (disposed) return;
         screen = new RemoteScreen();
+        screen.set_desktop(current.current.desktop);
         await screen.start(element, (payload: string) => {
           if (tab && current.current.human && current.current.frame?.tab === tab)
             current.current.onInput(tab, JSON.parse(payload) as object);
@@ -125,6 +127,7 @@ export function BrowserScreen({ frame, human, exit, onInput, onFailure }: Screen
     data-controlled={human}
     aria-label={t("Schermo del browser remoto")}
     tabIndex={-1}
+    data-remote-desktop={desktop ? "" : undefined}
     onKeyDownCapture={(event) => {
       if (event.key === "Tab" && event.shiftKey) {
         event.preventDefault();

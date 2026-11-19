@@ -3915,6 +3915,7 @@ dependencies = [
  "sse-stream 0.3.0",
  "subtle",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "uuid",
 ]

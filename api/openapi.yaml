@@ -170,6 +170,30 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+  /computer:
+    get:
+      operationId: getComputer
+      tags: [inventory]
+      summary: Read the current member's computer status without starting it
+      responses:
+        '200':
+          description: Computer status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Computer' }
+        '404': { $ref: '#/components/responses/Error' }
+  /computer/screen:
+    get:
+      operationId: connectComputerScreen
+      summary: Start or watch the current member's desktop over a same-origin WebSocket
+      description: |
+        Uses Motion JPEG frame packets with the same framing as /browser-agent/{thread},
+        with `tab` set to `desktop`. Client messages are `take`, `release`, `input`, and `end`.
+        The server sends `ready`, `control`, `error`, and `ended` events.
+      responses:
+        '101': { description: WebSocket upgrade }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
   /browser-agent/{thread}:
     get:
       operationId: connectBrowser
@@ -762,14 +786,16 @@ components:
         status: {type: string, enum: [pending, connected, disconnected]}
         webhook_url: {type: string, format: uri}
         project_id: {type: [string, "null"], format: uuid}
+        runtime: { $ref: '#/components/schemas/BotRuntime' }
     ConnectionSetup:
       type: object
       additionalProperties: false
-      required: [kind, destination, project_id, credentials]
+      required: [kind, destination, credentials]
       properties:
         kind: {type: string, enum: [slack, telegram, gitlab]}
         destination: {type: string, description: 'Slack channel ID, Telegram chat ID or GitLab numeric project ID'}
-        project_id: {type: string, format: uuid}
+        project_id: {type: [string, "null"], format: uuid}
+        runtime: { $ref: '#/components/schemas/BotRuntime' }
         credentials:
           type: object
           additionalProperties: false
@@ -801,6 +827,9 @@ components:
         role: { type: string, enum: [tenant_admin, reseller_admin, group_manager, member] }
         portal_url: { type: string, format: uri }
         standalone: { type: boolean, description: Session issued by a standalone Venticode instance }
+        bot_runtimes:
+          type: array
+          items: { $ref: '#/components/schemas/BotRuntime' }
     Model:
       type: object
       additionalProperties: false
@@ -810,9 +839,19 @@ components:
         name: { type: string }
         default: { type: boolean }
         tools: { type: boolean, description: Tool calling is available for this model and member }
+        vision: { type: boolean, description: Image input is available for this model and member }
+    BotRuntime:
+      type: string
+      enum: [project, kitesurf, computer]
+    Computer:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [stopped, starting, ready] }
+        harness_id: { type: string, format: uuid }
     HarnessOperation:
       type: string
-      enum: [list_files, find_files, search_files, read_file, write_file, edit_file, mkdir, rename, remove, execute, terminal_start, agent_start, mcp_list_servers, mcp_list_tools, mcp_call_tool, preview]
+      enum: [list_files, find_files, search_files, read_file, write_file, edit_file, mkdir, rename, remove, execute, terminal_start, agent_start, mcp_list_servers, mcp_list_tools, mcp_call_tool, preview, browser_tabs, browser_new_tab, browser_select_tab, browser_open, browser_snapshot, browser_follow_link, browser_open_preview, desktop_screenshot, desktop_act, project_service_start, ask_model]
     Harness:
       type: object
       additionalProperties: false
@@ -828,6 +867,8 @@ components:
         mode: { type: string, enum: [sandboxed, yolo] }
         owned: { type: boolean }
         revision: { type: integer }
+        managed: { type: boolean }
+        model_access: { type: boolean }
         host_info:
           oneOf:
             - type: 'null'
@@ -886,8 +927,9 @@ components:
         goal_id: { type: [string, "null"], format: uuid }
         question_id: { type: [string, "null"], format: uuid }
         plan_id: { type: [string, "null"], format: uuid }
-        project_id: { type: string, format: uuid }
-        harness_id: { type: string, format: uuid }
+        project_id: { type: [string, 'null'], format: uuid }
+        harness_id: { type: [string, 'null'], format: uuid }
+        runtime: { $ref: '#/components/schemas/BotRuntime' }
         title: { type: string }
         model: { type: string }
         permission_mode: { $ref: '#/components/schemas/PermissionMode' }
@@ -966,6 +1008,13 @@ components:
           type: array
           items: { $ref: '#/components/schemas/Todo' }
         run_id: { type: string, format: uuid }
+        model_call: { type: string, format: uuid, description: Identifier for a completion from the computer CLI }
+        model: { type: string }
+        model_usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
         state: { $ref: '#/components/schemas/ConversationState' }
         usage:
           type: object
@@ -1002,8 +1051,9 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         handle: { type: string, const: '@ventic', description: Mention handle used in every channel }
-        harness_id: { type: string, format: uuid }
-        root: { type: string }
+        harness_id: { type: [string, 'null'], format: uuid }
+        root: { type: [string, 'null'] }
+        runtime: { $ref: '#/components/schemas/BotRuntime' }
         enabled: { type: boolean }
         revision: { type: integer }
         channels:
@@ -1026,6 +1076,7 @@ components:
       minProperties: 2
       properties:
         revision: { type: integer }
+        runtime: { $ref: '#/components/schemas/BotRuntime' }
         enabled: { type: boolean }
         triggers: { $ref: '#/components/schemas/BotTriggers' }
         tools: { $ref: '#/components/schemas/BotTools' }

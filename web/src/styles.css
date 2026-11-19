@@ -255,3 +255,10 @@ dialog h2 { margin: 0; font-size: 16px; }
 .composer .send { background: #9be4d4; color: #0c2521; }
 @media (max-width: 600px) { .terminal-viewport {font-size: 12px;} .composer-bar .hint {display: none;} }
 .sidebar .nav-head a {color:var(--accent);}
+
+.desktop-surface {
+  position: relative;
+  flex: 1;
+  min-height: 320px;
+  overflow: hidden;
+}

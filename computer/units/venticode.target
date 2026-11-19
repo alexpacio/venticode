@@ -1,0 +1,5 @@
+[Unit]
+Description=Venticode managed computer
+Requires=basic.target dbus.socket venticode-harness.service
+After=basic.target dbus.socket venticode-harness.service
+AllowIsolate=yes

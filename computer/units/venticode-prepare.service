@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare the Venticode workspace and desktop
+Before=venticode-desktop.service venticode-harness.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/install -d -o venticode -g venticode -m 2770 /data/work
+ExecStart=/usr/bin/install -d -o venticode -g venticode -m 0700 /data/home
+ExecStart=/usr/bin/install -d -o desktop -g desktop -m 0700 /data/desktop
+ExecStart=/usr/bin/chmod 1777 /tmp /dev/shm
+ExecStart=/usr/bin/install -d -m 1777 /tmp/.X11-unix /tmp/.ICE-unix

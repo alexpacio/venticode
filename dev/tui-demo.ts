@@ -18,11 +18,21 @@ const mime: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 createServer(async (req, res) => {
+  if (req.headers.host === `localhost:${port}`) {
+    const path = new URL(req.url || "/", origin);
+    res.writeHead(307, { Location: origin + path.pathname + path.search }).end();
+    return;
+  }
   if (req.headers.host !== new URL(origin).host) {
     res.writeHead(403).end();
     return;
   }
-  const path = new URL(req.url || "/", origin).pathname;
+  const url = new URL(req.url || "/", origin);
+  const path = url.pathname;
+  if (req.method === "GET" && path === "/venticode/login") {
+    res.writeHead(303, { Location: "/__dev/login" + url.search }).end();
+    return;
+  }
   if (path.startsWith("/api/") || path === "/__dev/login") {
     await api(req, res);
     return;

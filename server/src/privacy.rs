@@ -99,6 +99,13 @@ pub(super) async fn handle(
                 .bind(s.user)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(
+                "DELETE FROM conversations WHERE browser_workspace=$1 AND browser_owner=$2",
+            )
+            .bind(s.workspace)
+            .bind(s.user)
+            .execute(&mut *tx)
+            .await?;
             let pending: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT FROM stored_objects WHERE workspace=$1 AND owner_id=$2)",
             )
@@ -107,7 +114,13 @@ pub(super) async fn handle(
             .fetch_one(&mut *tx)
             .await?;
             tx.commit().await?;
-            Ok(Json(json!({"deleted":!pending})))
+            let computer_deleted = if let Some(computers) = &app.computers {
+                computers.erase(&app, s.workspace, s.user).await?
+            } else {
+                !sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT FROM managed_computers WHERE workspace=$1 AND owner_id=$2)")
+                    .bind(s.workspace).bind(s.user).fetch_one(&app.db).await?
+            };
+            Ok(Json(json!({"deleted":!pending && computer_deleted})))
         }
         _ => Err(missing()),
     }

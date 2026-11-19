@@ -12,6 +12,7 @@ struct ScreenState {
     size: egui::Vec2,
     visible: bool,
     human: bool,
+    desktop: bool,
 }
 
 #[wasm_bindgen]
@@ -89,6 +90,10 @@ impl RemoteScreen {
         }
     }
 
+    pub fn set_desktop(&self, desktop: bool) {
+        self.state.borrow_mut().desktop = desktop;
+    }
+
     pub fn destroy(&self) {
         self.runner.destroy();
     }
@@ -113,9 +118,9 @@ impl eframe::App for Screen {
         let bounds = ui.available_rect_before_wrap();
         ui.painter()
             .rect_filled(bounds, 0.0, egui::Color32::from_rgb(15, 20, 29));
-        let (visible, human, size, pending) = {
+        let (visible, human, desktop, size, pending) = {
             let mut state = self.state.borrow_mut();
-            (state.visible, state.human, state.size, state.pending.take())
+            (state.visible, state.human, state.desktop, state.size, state.pending.take())
         };
         if !visible {
             self.texture = None;
@@ -162,12 +167,26 @@ impl eframe::App for Screen {
                 input.pointer.hover_pos(),
             )
         });
-        if let Some(position) = click.filter(|position| rect.contains(*position)) {
+        if !desktop && let Some(position) = click.filter(|position| rect.contains(*position)) {
             let position = point(position);
             self.input(json!({"kind":"click", "x":position.x, "y":position.y}));
         }
         for event in events {
             match event {
+                Event::PointerMoved(position) if desktop && rect.contains(position) => {
+                    let position = point(position);
+                    self.input(json!({"kind":"move","x":position.x,"y":position.y}));
+                }
+                Event::PointerButton {pos,button,pressed,..} if desktop && (rect.contains(pos) || !pressed) => {
+                    let position = point(rect.clamp(pos));
+                    let button = match button {
+                        egui::PointerButton::Primary => 1,
+                        egui::PointerButton::Middle => 2,
+                        egui::PointerButton::Secondary => 3,
+                        _ => continue,
+                    };
+                    self.input(json!({"kind":"pointer","x":position.x.min(size.x-1.0),"y":position.y.min(size.y-1.0),"button":button,"down":pressed}));
+                }
                 Event::MouseWheel { unit, delta, .. } if delta.y != 0.0 => {
                     if let Some(position) = hover.filter(|position| rect.contains(*position)) {
                         let position = point(position);
@@ -193,7 +212,23 @@ impl eframe::App for Screen {
                     pressed: true,
                     modifiers,
                     ..
-                } if focused && !modifiers.command && !modifiers.alt => {
+                } if desktop && focused => {
+                    if !modifiers.ctrl && !modifiers.command && !modifiers.alt && key.name().len() == 1 {
+                        continue;
+                    }
+                    let mut shortcut = String::new();
+                    if modifiers.ctrl || modifiers.command { shortcut.push_str("ctrl+"); }
+                    if modifiers.alt { shortcut.push_str("alt+"); }
+                    if modifiers.shift { shortcut.push_str("shift+"); }
+                    shortcut.push_str(match key {
+                        Key::ArrowLeft => "ArrowLeft", Key::ArrowRight => "ArrowRight",
+                        Key::ArrowUp => "ArrowUp", Key::ArrowDown => "ArrowDown",
+                        _ => key.name(),
+                    });
+                    self.input(json!({"kind":"key","key":shortcut}));
+                }
+                Event::Key { key, pressed: true, modifiers, .. }
+                    if focused && !modifiers.command && !modifiers.alt => {
                     let name = match key {
                         Key::Enter => "Enter",
                         Key::Backspace => "Backspace",

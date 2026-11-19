@@ -1,4 +1,6 @@
 mod agent;
+mod browser;
+mod computer;
 mod connections;
 mod history;
 mod inference;
@@ -33,6 +35,7 @@ struct App {
     storage: Arc<storage::Storage>,
     ventic: Option<Arc<Ventic>>,
     standalone: Option<Arc<standalone::Standalone>>,
+    computers: Option<Arc<computer::Computers>>,
 }
 
 struct Ventic {
@@ -157,7 +160,7 @@ impl Member {
             app.control_json(h, "session"),
             app.control_json(h, "harnesses")
         )?;
-        Ok(Self {
+        let mut member = Self {
             workspace: serde_json::from_value(session["workspace"]["id"].clone())
                 .map_err(|_| unavailable())?,
             user: serde_json::from_value(session["user"]["id"].clone())
@@ -166,7 +169,15 @@ impl Member {
                 .as_array()
                 .cloned()
                 .ok_or_else(unavailable)?,
-        })
+        };
+        if let Some(computers) = &app.computers
+            && let Some(item) = computers
+                .inventory(app, member.workspace, member.user)
+                .await?
+        {
+            member.harnesses.push(item);
+        }
+        Ok(member)
     }
     fn harness(&self, id: Uuid, root: &str) -> Result<&Value> {
         self.harnesses
@@ -189,6 +200,19 @@ async fn proxy(
     body: Bytes,
 ) -> Result<Response> {
     let path = uri.path().rsplit('/').next().ok_or_else(missing)?;
+    if method == Method::GET
+        && let Some(computers) = &app.computers
+        && matches!(path, "session" | "harnesses")
+    {
+        let value = if path == "session" {
+            let mut session = app.control_json(&h, path).await?;
+            session["bot_runtimes"] = json!(computers.runtimes());
+            session
+        } else {
+            json!({"items":Member::load(&app, &h, false).await?.harnesses})
+        };
+        return Ok(Json(value).into_response());
+    }
     if let Some(local) = &app.standalone {
         return match (method, path) {
             (Method::DELETE, "session") => local.sign_out(&app, &h).await,
@@ -237,6 +261,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .build()?,
         ventic,
         standalone,
+        computers: computer::Computers::from_env()?.map(Arc::new),
         storage: Arc::new(storage::Storage::new()?),
     };
     if let Some(local) = &app.standalone {
@@ -258,6 +283,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .merge(runs::routes())
         .merge(connections::routes())
         .merge(mentions::routes())
+        .merge(computer::routes())
         .fallback(|| async { missing() });
     let assets = env::var("WEB_ROOT").unwrap_or_else(|_| "web/dist".into());
     let frame_ancestor = app
@@ -277,6 +303,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Router::new().route("/internal/harness/ws", get(runner::upgrade))
     };
     let router = router
+        .route("/internal/computer/{id}/ws", get(computer::enroll))
         .route("/healthz", get(|| async { "ok" }))
         .route("/hooks/{kind}/{id}", post(mentions::hook))
         .route("/oauth/slack", get(connections::callback))
@@ -303,6 +330,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         ))
         .with_state(app.clone());
     tokio::spawn(mentions::worker(app.clone()));
+    if app.computers.is_some() {
+        tokio::spawn(computer::maintain(app.clone()));
+    }
     tokio::spawn(storage::maintain(app));
     let listener = tokio::net::TcpListener::bind(
         env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:4189".into()),

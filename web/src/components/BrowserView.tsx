@@ -20,7 +20,7 @@ type BrowserEvent =
 
 const utf8 = new TextDecoder();
 
-function decodeFrame(packet: ArrayBuffer): BrowserFrame | null {
+export function decodeFrame(packet: ArrayBuffer): BrowserFrame | null {
   const bytes = new Uint8Array(packet);
   const end = bytes.subarray(0, 1024).indexOf(0x0a);
   if (end < 0 || end + 1 === bytes.length) return null;

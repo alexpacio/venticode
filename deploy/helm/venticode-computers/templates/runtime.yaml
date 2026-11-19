@@ -1,0 +1,204 @@
+{{- $computer := .Values.computer }}
+{{- $kitesurf := .Values.kitesurf }}
+{{- $ns := .Values.workerNamespace }}
+{{- $serverNS := include "venticode-computers.serverNamespace" . }}
+{{- if or $computer.image $kitesurf.image }}
+{{- if eq $ns $serverNS }}{{ fail "workerNamespace must differ from the Venticode server namespace" }}{{ end }}
+{{- if $computer.image }}
+{{- include "venticode-computers.requireImage" $computer.image }}
+{{- $_ := required "Set computer.storageClass to an encrypted ReadWriteOncePod storage class" $computer.storageClass }}
+{{- $_ := required "Set computer.seccompProfile to a Localhost profile on the computer nodes" $computer.seccompProfile }}
+{{- end }}
+{{- if $kitesurf.image }}{{- include "venticode-computers.requireImage" $kitesurf.image }}{{- end }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: computer
+  namespace: {{ $ns }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: venticode-computers
+  namespace: {{ $ns }}
+spec:
+  hard:
+    pods: "32"
+    persistentvolumeclaims: "32"
+    requests.storage: 320Gi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: venticode-computers
+  namespace: {{ $ns }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"{{ if $computer.image }}, "persistentvolumeclaims"{{ end }}]
+    verbs: [create, get, delete, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: venticode-computers
+  namespace: {{ $ns }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: venticode-computers}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.server.serviceAccount }}
+    namespace: {{ $serverNS }}
+{{- if $computer.image }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $ns }}-token-review
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $ns }}-token-review
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $ns }}-token-review}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.server.serviceAccount }}
+    namespace: {{ $serverNS }}
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $ns }}-isolation
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  validations:
+    - expression: >-
+        has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
+        object.spec.serviceAccountName == 'computer' &&
+        object.spec.restartPolicy == 'Never' &&
+        size(object.spec.containers) == 1 &&
+        (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
+        (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
+      message: Workload pods require the isolated computer service account and one container.
+    - expression: >-
+        has(object.spec.runtimeClassName) && has(object.metadata.labels) &&
+        'app.kubernetes.io/name' in object.metadata.labels &&
+        (
+        {{- if $computer.image }}
+          (object.metadata.labels['app.kubernetes.io/name'] == 'venticode-computer' &&
+           object.spec.runtimeClassName == '{{ $computer.runtimeClass }}' &&
+           has(object.spec.hostUsers) && !object.spec.hostUsers &&
+           object.spec.containers[0].name == 'computer' &&
+           object.spec.containers[0].image == '{{ $computer.image }}' &&
+           has(object.spec.containers[0].securityContext.seccompProfile.localhostProfile) &&
+           object.spec.containers[0].securityContext.seccompProfile.localhostProfile == '{{ $computer.seccompProfile }}' &&
+           object.spec.volumes.all(v, has(v.emptyDir) ||
+             (v.name == 'data' && has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name) ||
+             (v.name == 'identity' && has(v.projected) && size(v.projected.sources) == 1 &&
+              v.projected.sources.all(s, has(s.serviceAccountToken) && s.serviceAccountToken.audience == 'venticode-computer'))))
+        {{- if $kitesurf.image }} || {{- end }}
+        {{- end }}
+        {{- if $kitesurf.image }}
+          (object.metadata.labels['app.kubernetes.io/name'] == 'venticode-kitesurf' &&
+           object.spec.runtimeClassName == 'gvisor' &&
+           object.spec.containers[0].name == 'kitesurf' &&
+           object.spec.containers[0].image == '{{ $kitesurf.image }}' &&
+           has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds <= 900 &&
+           object.spec.containers[0].securityContext.readOnlyRootFilesystem &&
+           object.spec.volumes.all(v, has(v.emptyDir)))
+        {{- end }}
+        )
+      message: Workload pods require the approved image, runtime and volumes.
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.command) || size(c.command) == 0) &&
+          (!has(c.args) || size(c.args) == 0) &&
+          (!has(c.envFrom) || size(c.envFrom) == 0) &&
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom))) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation)
+      message: Workload pod startup and environment must follow the image contract.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $ns }}-isolation
+spec:
+  policyName: {{ $ns }}-isolation
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: {{ $ns }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workload-isolation
+  namespace: {{ $ns }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    {{- with .Values.network.destinationCIDRs }}
+    - to:
+        {{- range . }}
+        {{- if not (regexMatch "^([0-9]{1,3}[.]){3}[0-9]{1,3}/32$" .) }}{{ fail "List approved destination IPv4 addresses as /32 CIDRs" }}{{ end }}
+        - ipBlock: {cidr: {{ . | quote }}}
+        {{- end }}
+      ports: [{port: 80, protocol: TCP}, {port: 443, protocol: TCP}]
+    {{- end }}
+{{- if $computer.image }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: computer-relay
+  namespace: {{ $ns }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: venticode-computer}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $serverNS }}}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: {{ .Values.server.podLabel }}}}
+      ports: [{port: 8080, protocol: TCP}]
+{{- end }}
+{{- if $kitesurf.image }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kitesurf-control
+  namespace: {{ $ns }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: venticode-kitesurf}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $serverNS }}}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: {{ .Values.server.podLabel }}}}
+      ports: [{port: 8787, protocol: TCP}]
+{{- end }}
+{{- end }}

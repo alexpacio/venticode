@@ -198,5 +198,13 @@
   "Seleziona Aggiungi progetto accanto a un harness.": "Select Add project next to a harness.",
   "Nuova conversazione": "New conversation",
   "Apri": "Open",
-  "Conversazioni": "Conversations"
+  "Conversazioni": "Conversations",
+  "Computer Ubuntu": "Ubuntu computer",
+  "Ambiente del bot": "Bot runtime",
+  "Apri il desktop": "Open desktop",
+  "Desktop remoto": "Remote desktop",
+  "Avvia il desktop": "Start desktop",
+  "Avvio del desktop…": "Starting desktop…",
+  "Desktop non disponibile.": "Desktop unavailable.",
+  "Chiudi il desktop": "Close desktop"
 }

@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle, Pencil, Trash2 } from "lucide-react";
 import { api, ApiError } from "../api/client.ts";
@@ -55,7 +55,7 @@ export function ConversationView({ menu }: { menu: ReactNode }) {
           else if(text.startsWith("/plan ")) await send(text.slice(6).trim(),"plan");
           else await send(text);
         }} onStop={stop} running={running}
-          disabled={harness && !harness.online ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
+          disabled={harness && !harness.online && !harness.managed ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
           controls={<ModeSelect conversation={c} />} />
       </main>
       <SessionPanel transcript={transcript} harness={harness} projectLabel={project ? `${project.root}/${project.path === "." ? "" : project.path}` : ""} />
@@ -84,6 +84,7 @@ function Header({ conversation, harness, projectLabel, menu, running }: { conver
         <strong>{conversation.title}</strong>
         {running && <span className="pill pill-warn"><span className="dot" aria-hidden="true" />{conversation.state === "waiting" ? t("Attende te") : t("Al lavoro")}</span>}
       </nav>
+      {conversation.runtime === "computer" && <Link className="btn" to="/computer">{t("Apri il desktop")}</Link>}
       <label className="select-inline">{t("Modello")}
         <select className="mono" value={conversation.model} onChange={(e) => void update({ model: e.target.value })}>
           {models.data?.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}

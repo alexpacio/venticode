@@ -12,6 +12,9 @@
 !harness/terminal/Cargo.toml
 !harness/terminal/src/
 !harness/terminal/src/**
+!computer/
+!computer/**
+!LICENSE
 !web/
 !web/package.json
 !web/package-lock.json
@@ -31,6 +34,8 @@
 !tui/browser/Cargo.lock
 !tui/browser/src/
 !tui/browser/src/lib.rs
+!tui/browser/screen/
+!tui/browser/screen/**
 !web/build-terminal.sh
 web/src/generated/
 !web/public/

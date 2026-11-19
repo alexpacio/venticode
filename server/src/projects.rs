@@ -33,9 +33,12 @@ pub(super) fn relative(path: &str) -> bool {
                 .all(|part| !part.is_empty() && part != "." && part != ".."))
 }
 fn visible(member: &Member, row: &sqlx::postgres::PgRow) -> bool {
-    member
-        .harness(row.get("harness_id"), row.get("root"))
-        .is_ok()
+    if let Some(id) = row.get::<Option<Uuid>, _>("harness_id") {
+        member.harness(id, row.get("root")).is_ok()
+    } else {
+        row.try_get::<&str, _>("runtime")
+            .is_ok_and(|runtime| runtime == "kitesurf")
+    }
 }
 async fn create(
     State(app): State<App>,
@@ -196,7 +199,7 @@ async fn conversations(
     Query(q): Query<Filter>,
 ) -> Result<Json<Value>> {
     let m = Member::load(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT document,harness_id,root FROM conversation_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR project_id=$3) ORDER BY updated_at DESC,id")
+    let rows=sqlx::query("SELECT document,harness_id,root,runtime FROM conversation_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR project_id=$3) ORDER BY updated_at DESC,id")
         .bind(m.workspace).bind(m.user).bind(q.project_id).fetch_all(&app.db).await?;
     Ok(Json(
         json!({"items":rows.iter().filter(|r|visible(&m,r)).take(200).map(|r|r.get::<Value,_>("document")).collect::<Vec<_>>()}),

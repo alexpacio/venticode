@@ -1,5 +1,6 @@
 [package]
 name = "venticode-harness"
+default-run = "venticode-harness"
 version = "0.3.0"
 edition = "2024"
 publish = false

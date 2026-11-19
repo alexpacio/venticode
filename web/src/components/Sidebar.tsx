@@ -47,6 +47,9 @@ export function Sidebar({ session, onNavigate }: { session: Session; onNavigate:
         <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("Cerca conversazioni…")} />
       </label>
       <div className="sidebar-scroll">
+        {session.bot_runtimes?.includes("computer") && <NavLink to="/computer" className="bot-link" onClick={onNavigate}>
+          <AppWindow size={16} aria-hidden="true" />{t("Desktop remoto")}
+        </NavLink>}
         {browser.data && <NavLink to="/browser" className="bot-link" onClick={onNavigate}>
           <AppWindow size={16} aria-hidden="true" />{t("Browser remoto")}
         </NavLink>}

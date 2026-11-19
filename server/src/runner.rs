@@ -41,6 +41,10 @@ struct Request {
 }
 
 impl Runner {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
     pub fn new(id: Uuid, secret: &str) -> Self {
         Self {
             id,
@@ -53,6 +57,32 @@ impl Runner {
         let state = self.state.lock().unwrap();
         json!({"items":[{"id":self.id,"name":"Venticode","roots":state.roots,
             "online":state.connection.is_some(),"mode":"sandboxed","owned":true,"revision":1,"host_info":state.host_info}]})
+    }
+
+    pub fn online(&self) -> bool {
+        self.state.lock().unwrap().connection.is_some()
+    }
+
+    pub fn has_request(&self, id: Uuid) -> bool {
+        self.state.lock().unwrap().requests.contains_key(&id)
+    }
+
+    pub fn forget(&self, id: Uuid) {
+        self.state.lock().unwrap().requests.remove(&id);
+    }
+
+    pub fn respond(&self, id: Uuid, frame: Value) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        if !state.requests.get(&id).is_some_and(|r| r.state == "sent") {
+            return Err(missing());
+        }
+        state
+            .connection
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .1
+            .try_send(frame)
+            .map_err(|_| unavailable())
     }
 
     pub async fn load_inventory(
@@ -87,7 +117,8 @@ impl Runner {
                 let operation = body["operation"].as_str().ok_or_else(bad)?;
                 let path = body["project_path"].as_str().ok_or_else(bad)?;
                 if !crate::projects::relative(path)
-                    || !crate::tools::is_project_operation(operation)
+                    || !(crate::tools::is_project_operation(operation)
+                        || body["managed"] == true && crate::computer::is_operation(operation))
                 {
                     return Err(bad());
                 }
@@ -296,7 +327,7 @@ pub(super) async fn upgrade(
         }))
 }
 
-async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut socket: WebSocket) {
+pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut socket: WebSocket) {
     let Ok(Some(Ok(Message::Text(text)))) =
         tokio::time::timeout(Duration::from_secs(5), socket.recv()).await
     else {

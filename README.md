@@ -90,6 +90,13 @@ origin and the webhook URL shown in the connection. The connector uses
 self-managed GitLab instance. Bot replies and tool approvals continue through
 the workspace review flow.
 
+## Kubernetes computers
+
+Bots can use an automatically enrolled Ubuntu desktop with Helium and
+`venticode-cli`, or a disposable Kitesurf browser. See the
+[computer build and installation guide](computer/README.md) for runtime,
+storage, networking, and Kubernetes verification.
+
 ## Development
 
 Requires Node.js 24 or newer and the WebAssembly build tools described under **Browser frontend**.

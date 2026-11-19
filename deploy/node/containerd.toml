@@ -1,0 +1,8 @@
+# Merge into the configuration of the dedicated Venticode worker nodes.
+# This snippet uses the containerd 2.x configuration format.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.venticode-computer]
+  runtime_type = "io.containerd.runc.v2"
+  cgroup_writable = true
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.venticode-computer.options]
+  SystemdCgroup = true

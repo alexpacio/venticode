@@ -1,0 +1,104 @@
+{{- if .Values.standalone.enabled }}
+{{- $app := .Values.standalone }}
+{{- $ns := include "venticode-computers.serverNamespace" . }}
+{{- if ne $ns .Release.Namespace }}{{ fail "Standalone server namespace must be the release namespace" }}{{ end }}
+{{- include "venticode-computers.requireImage" $app.image }}
+{{- include "venticode-computers.requireImage" $app.connectorImage }}
+{{- $host := required "Set standalone.host to the HTTPS hostname" $app.host }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.server.serviceAccount }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.server.podLabel }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app.kubernetes.io/name: {{ .Values.server.podLabel }}}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: {{ .Values.server.podLabel }}}
+    spec:
+      serviceAccountName: {{ .Values.server.serviceAccount }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: venticode
+          image: {{ $app.image | quote }}
+          ports: [{name: http, containerPort: 8080}]
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          envFrom:
+            - secretRef: {name: {{ $app.secretName }}}
+          env:
+            - {name: VENTICODE_MODE, value: standalone}
+            - {name: VENTICODE_ORIGIN, value: {{ printf "https://%s" $host | quote }}}
+            - {name: LISTEN, value: "0.0.0.0:8080"}
+            {{- if or .Values.computer.image .Values.kitesurf.image }}
+            - {name: VENTICODE_COMPUTER_NAMESPACE, value: {{ .Values.workerNamespace | quote }}}
+            - {name: VENTICODE_BROWSER_ORIGINS, value: {{ .Values.network.origins | toJson | quote }}}
+            {{- end }}
+            {{- if .Values.computer.image }}
+            - {name: VENTICODE_COMPUTER_IMAGE, value: {{ .Values.computer.image | quote }}}
+            - {name: VENTICODE_COMPUTER_ORIGIN, value: {{ printf "http://%s.%s.svc:8080" .Values.server.podLabel $ns | quote }}}
+            - {name: VENTICODE_COMPUTER_RUNTIME_CLASS, value: {{ .Values.computer.runtimeClass | quote }}}
+            - {name: VENTICODE_COMPUTER_STORAGE_CLASS, value: {{ .Values.computer.storageClass | quote }}}
+            - {name: VENTICODE_COMPUTER_SECCOMP, value: {{ .Values.computer.seccompProfile | quote }}}
+            {{- end }}
+            {{- if .Values.kitesurf.image }}
+            - {name: VENTICODE_KITESURF_IMAGE, value: {{ .Values.kitesurf.image | quote }}}
+            {{- end }}
+          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          {{- if or .Values.computer.image .Values.kitesurf.image }}
+          volumeMounts:
+            - {name: kube, mountPath: /var/run/secrets/venticode-kubernetes, readOnly: true}
+          {{- end }}
+        - name: connector
+          image: {{ $app.connectorImage | quote }}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: connector-tmp, mountPath: /tmp}
+      volumes:
+        - {name: connector-tmp, emptyDir: {sizeLimit: 64Mi}}
+        {{- if or .Values.computer.image .Values.kitesurf.image }}
+        - name: kube
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3600}
+              - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.server.podLabel }}
+spec:
+  selector: {app.kubernetes.io/name: {{ .Values.server.podLabel }}}
+  ports: [{name: http, port: 8080, targetPort: http}]
+{{- if $app.tlsSecretName }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.server.podLabel }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  {{- with $app.ingressClassName }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  tls: [{hosts: [{{ $host | quote }}], secretName: {{ $app.tlsSecretName }}}]
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: {{ .Values.server.podLabel }}, port: {name: http}}}
+{{- end }}
+{{- end }}

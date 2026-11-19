@@ -5,6 +5,8 @@ mod oauth;
 mod protocol;
 mod runtime;
 
+#[cfg(target_os = "linux")]
+mod managed;
 mod standalone;
 
 use anyhow::Result;
@@ -21,6 +23,11 @@ struct Cli {
 enum Command {
     #[command(alias = "standalone")]
     Run,
+    #[cfg(target_os = "linux")]
+    Managed,
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Worker,
     #[command(subcommand)]
     Mcp(mcp::Mcp),
 }
@@ -30,5 +37,9 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Mcp(command) => mcp::manage(&command).await,
         Command::Run => standalone::run().await,
+        #[cfg(target_os = "linux")]
+        Command::Managed => managed::run().await,
+        #[cfg(target_os = "linux")]
+        Command::Worker => managed::worker().await,
     }
 }

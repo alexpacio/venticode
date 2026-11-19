@@ -287,7 +287,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!action && method === "GET") return ok(conversation);
       if (!action && method === "PATCH") {
         const keys = Object.keys(body.json);
-        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "permission_mode"].includes(k)) ||
+        if (body.runtime !== undefined && body.runtime !== "project" || !Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "permission_mode"].includes(k)) ||
             (body.title !== undefined && (typeof body.title !== "string" || !body.title.trim() || body.title.length > 200)) ||
             (body.model !== undefined && !models.some((x) => x.id === body.model)) ||
             (body.permission_mode !== undefined && !["ask", "auto_edit", "plan"].includes(body.permission_mode)))
@@ -365,7 +365,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!m[2] && method === "GET") return ok(bot);
       if (!m[2] && method === "PATCH") {
         const keys = Object.keys(body.json), policy = (v: unknown) => ["auto", "review", "off"].includes(v as string);
-        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "enabled", "triggers", "tools", "instructions", "rate_limit_per_hour"].includes(k)) ||
+        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "enabled", "triggers", "tools", "instructions", "rate_limit_per_hour", "runtime"].includes(k)) ||
             (body.enabled !== undefined && typeof body.enabled !== "boolean") ||
             (body.triggers !== undefined && (typeof body.triggers?.mentions !== "boolean" || typeof body.triggers?.direct_messages !== "boolean" || Object.keys(body.triggers).length !== 2)) ||
             (body.tools !== undefined && (Object.keys(body.tools || {}).length !== 4 || !["read", "write", "execute", "mcp"].every((k) => policy(body.tools[k])))) ||

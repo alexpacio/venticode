@@ -1,0 +1,19 @@
+[Unit]
+Description=Venticode Xfce display and Helium bridge
+Requires=venticode-prepare.service
+After=venticode-prepare.service
+
+[Service]
+User=desktop
+Group=desktop
+UMask=0002
+WorkingDirectory=/data/work
+EnvironmentFile=/run/venticode.env
+Environment=HOME=/data/desktop
+Environment=XDG_RUNTIME_DIR=/run/venticode-desktop
+RuntimeDirectory=venticode-desktop
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/venticode/desktop.py
+Restart=on-failure
+RestartSec=2

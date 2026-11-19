@@ -1,0 +1,6 @@
+apiVersion: v2
+name: venticode-computers
+description: Opt-in Venticode computer runtime and standalone Kubernetes installation
+version: 0.1.0
+appVersion: "0.3.0"
+type: application

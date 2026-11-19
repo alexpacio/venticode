@@ -16,7 +16,8 @@ pub(super) fn routes() -> Router<App> {
 struct Setup {
     kind: String,
     destination: String,
-    project_id: Uuid,
+    project_id: Option<Uuid>,
+    runtime: Option<String>,
     credentials: Value,
 }
 pub(super) fn digest(v: &str) -> String {
@@ -157,7 +158,7 @@ fn summary(r: &PgRow, origin: &str) -> Value {
     let id: Uuid = r.get("id");
     let kind: &str = r.get("kind");
     json!({"id":id,"kind":kind,"destination":r.get::<String,_>("destination"),"identity":r.get::<String,_>("identity"),"status":r.get::<String,_>("status"),
-        "linked_user_id":r.try_get::<Option<String>,_>("linked_user_id").unwrap_or(None),"project_id":r.get::<Option<Uuid>,_>("project_id"),"webhook_url":format!("{origin}/hooks/{kind}/{id}")})
+        "linked_user_id":r.try_get::<Option<String>,_>("linked_user_id").unwrap_or(None),"project_id":r.get::<Option<Uuid>,_>("project_id"),"runtime":r.get::<String,_>("runtime"),"webhook_url":format!("{origin}/hooks/{kind}/{id}")})
 }
 async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     let (w, u) = member(&app, &h, false, false).await?;
@@ -219,28 +220,36 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
         return Err(bad());
     }
     let m = Member::load(app, h, true).await?;
-    let project = sqlx::query(
-        "SELECT harness_id,root FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3",
-    )
-    .bind(w)
-    .bind(u)
-    .bind(b.project_id)
-    .fetch_one(&app.db)
-    .await?;
-    m.harness(project.get("harness_id"), project.get("root"))?;
     let id = existing.unwrap_or_else(Uuid::new_v4);
     let mut tx = app.db.begin().await?;
     if existing.is_some() {
-        let row=sqlx::query("SELECT kind,destination,project_id FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE").bind(id).bind(w).fetch_one(&mut *tx).await?;
+        let row=sqlx::query("SELECT kind,destination,project_id,runtime FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE")
+            .bind(id).bind(w).fetch_one(&mut *tx).await?;
         if row.get::<String, _>("kind") != b.kind
             || row.get::<String, _>("destination") != b.destination
-            || row.get::<Option<Uuid>, _>("project_id") != Some(b.project_id)
+            || row.get::<Option<Uuid>, _>("project_id") != b.project_id
+            || b.runtime
+                .as_deref()
+                .is_some_and(|v| v != row.get::<&str, _>("runtime"))
         {
             return Err(conflict());
         }
     } else {
-        sqlx::query("INSERT INTO connections(id,workspace,created_by,kind,destination,project_id) VALUES($1,$2,$3,$4,$5,$6)")
-            .bind(id).bind(w).bind(u).bind(&b.kind).bind(&b.destination).bind(b.project_id).execute(&mut *tx).await?;
+        let runtime = b.runtime.as_deref().unwrap_or("project");
+        validate_runtime(app, runtime, b.project_id)?;
+        if let Some(project) = b.project_id {
+            let project = sqlx::query(
+                "SELECT harness_id,root FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3",
+            )
+            .bind(w)
+            .bind(u)
+            .bind(project)
+            .fetch_one(&mut *tx)
+            .await?;
+            m.harness(project.get("harness_id"), project.get("root"))?;
+        }
+        sqlx::query("INSERT INTO connections(id,workspace,created_by,kind,destination,project_id,runtime) VALUES($1,$2,$3,$4,$5,$6,$7)")
+            .bind(id).bind(w).bind(u).bind(&b.kind).bind(&b.destination).bind(b.project_id).bind(runtime).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     let mut tx = app.db.begin().await?;
@@ -504,9 +513,21 @@ async fn unlink(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> R
     Ok(Json(json!({"deleted":true})))
 }
 
-const BOT: &str = "SELECT c.*,p.harness_id,p.root FROM connections c JOIN projects p ON p.id=c.project_id WHERE c.workspace=$1";
+fn validate_runtime(app: &App, runtime: &str, project: Option<Uuid>) -> Result<()> {
+    let valid = match runtime {
+        "project" => project.is_some(),
+        "computer" | "kitesurf" => app
+            .computers
+            .as_ref()
+            .is_some_and(|c| c.runtimes().contains(&runtime)),
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(bad()) }
+}
+
+const BOT: &str = "SELECT c.*,p.harness_id,p.root FROM connections c LEFT JOIN projects p ON p.id=c.project_id WHERE c.workspace=$1";
 fn bot_document(r: &PgRow) -> Value {
-    json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("identity"),"handle":"@ventic","harness_id":r.get::<Uuid,_>("harness_id"),"root":r.get::<String,_>("root"),
+    json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("identity"),"handle":"@ventic","harness_id":r.get::<Option<Uuid>,_>("harness_id"),"root":r.get::<Option<String>,_>("root"),"runtime":r.get::<String,_>("runtime"),
         "enabled":r.get::<bool,_>("enabled"),"revision":r.get::<i64,_>("revision"),"channels":[{"kind":r.get::<String,_>("kind"),"name":r.get::<String,_>("destination")}],
         "triggers":r.get::<Value,_>("triggers"),"tools":r.get::<Value,_>("tools"),"instructions":r.get::<String,_>("instructions"),"rate_limit_per_hour":r.get::<i32,_>("rate_limit_per_hour")})
 }
@@ -534,6 +555,7 @@ async fn bot(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Resu
 #[serde(deny_unknown_fields)]
 struct Edit {
     revision: i64,
+    runtime: Option<String>,
     enabled: Option<bool>,
     instructions: Option<String>,
     rate_limit_per_hour: Option<i32>,
@@ -563,8 +585,18 @@ async fn edit_bot(
     {
         return Err(bad());
     }
-    let n=sqlx::query("UPDATE connections SET enabled=COALESCE($4,enabled),instructions=COALESCE($5,instructions),rate_limit_per_hour=COALESCE($6,rate_limit_per_hour),triggers=COALESCE($7,triggers),tools=COALESCE($8,tools),revision=revision+1 WHERE id=$1 AND workspace=$2 AND revision=$3 AND status='connected'")
-        .bind(id).bind(w).bind(b.revision).bind(b.enabled).bind(b.instructions).bind(b.rate_limit_per_hour).bind(b.triggers).bind(b.tools).execute(&app.db).await?;
+    if let Some(runtime) = b.runtime.as_deref() {
+        let project = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT project_id FROM connections WHERE workspace=$1 AND id=$2",
+        )
+        .bind(w)
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?;
+        validate_runtime(&app, runtime, project)?;
+    }
+    let n=sqlx::query("UPDATE connections SET enabled=COALESCE($4,enabled),instructions=COALESCE($5,instructions),rate_limit_per_hour=COALESCE($6,rate_limit_per_hour),triggers=COALESCE($7,triggers),tools=COALESCE($8,tools),runtime=COALESCE($9,runtime),revision=revision+1 WHERE id=$1 AND workspace=$2 AND revision=$3 AND status='connected'")
+        .bind(id).bind(w).bind(b.revision).bind(b.enabled).bind(b.instructions).bind(b.rate_limit_per_hour).bind(b.triggers).bind(b.tools).bind(b.runtime).execute(&app.db).await?;
     if n.rows_affected() != 1 {
         return Err(conflict());
     }

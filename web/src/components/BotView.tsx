@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Bot as BotIcon, LoaderCircle } from "lucide-react";
 import { api } from "../api/client.ts";
 import type { Bot, BotUpdate, Mention, ToolPolicy } from "../api/client.ts";
-import { useBot, useHarnesses, useMentions } from "../queries.ts";
+import { useBot, useHarnesses, useMentions, useSession } from "../queries.ts";
 import { t } from "../i18n/index.ts";
 import { relative } from "./format.ts";
 
@@ -12,6 +12,7 @@ export function BotView({ menu, admin }: { menu: ReactNode; admin: boolean }) {
   const { id = "" } = useParams();
   const bot = useBot(id);
   const mentions = useMentions(id);
+  const runtimes = useSession().data?.bot_runtimes ?? [];
   const harness = useHarnesses().data?.find((h) => h.id === bot.data?.harness_id);
   const client = useQueryClient();
   const [error, setError] = useState("");
@@ -36,9 +37,10 @@ export function BotView({ menu, admin }: { menu: ReactNode; admin: boolean }) {
         <BotIcon size={20} aria-hidden="true" style={{ color: "var(--accent)" }} />
         <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 180 }}>
           <h1 className="mono" style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>{b.handle}</h1>
-          <span className="muted" style={{ fontSize: 12 }}>{t("{0} · strumenti su {1} ({2})", b.name, harness?.name || "", b.root)}</span>
+          <span className="muted" style={{ fontSize: 12 }}>{b.runtime === "computer" ? t("Computer Ubuntu") : b.runtime === "kitesurf" ? "Kitesurf" : t("{0} · strumenti su {1} ({2})", b.name, harness?.name || "", b.root || "")}</span>
         </div>
         <span className={`pill ${b.enabled ? "pill-ok" : "pill-off"}`}><span className="dot" aria-hidden="true" />{b.enabled ? t("Attivo") : t("In pausa")}</span>
+        {b.runtime === "computer" && <Link className="btn" to="/computer">{t("Apri il desktop")}</Link>}
         {admin && <button className="btn" onClick={() => void update({ enabled: !b.enabled })}>{b.enabled ? t("Metti in pausa") : t("Riattiva")}</button>}
       </header>
       <div className="page">
@@ -53,12 +55,26 @@ export function BotView({ menu, admin }: { menu: ReactNode; admin: boolean }) {
             {mentions.data?.map((m) => <MentionCard key={m.id} bot={b} mention={m} />)}
           </section>
           {admin && <aside className="narrow" aria-label={t("Configurazione bot")}>
+            {runtimes.length > 1 && <section className="card">
+              <label className="field">{t("Ambiente del bot")}
+                <select className="select" value={b.runtime ?? "project"} onChange={e => void update({ runtime: e.currentTarget.value as BotUpdate["runtime"] })}>
+                  {runtimes.filter(mode => mode !== "project" || b.harness_id).map(mode =>
+                    <option key={mode} value={mode}>{runtimeLabel(mode)}</option>)}
+                </select>
+              </label>
+            </section>}
             <Settings bot={b} onSave={update} />
           </aside>}
         </div>
       </div>
     </main>
   );
+}
+
+export function runtimeLabel(runtime: NonNullable<BotUpdate["runtime"]>) {
+  if (runtime === "computer") return t("Computer Ubuntu");
+  if (runtime === "kitesurf") return "Kitesurf";
+  return t("Progetto");
 }
 
 function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {

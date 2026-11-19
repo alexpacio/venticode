@@ -1,0 +1,25 @@
+standalone:
+  enabled: false
+  image: ""
+  connectorImage: ""
+  secretName: venticode-standalone
+  host: ""
+  ingressClassName: ""
+  tlsSecretName: ""
+
+server:
+  namespace: ""
+  serviceAccount: venticode
+  podLabel: venticode
+
+workerNamespace: venticode-computers
+computer:
+  image: ""
+  runtimeClass: venticode-computer
+  storageClass: ""
+  seccompProfile: venticode/desktop.json
+kitesurf:
+  image: ""
+network:
+  origins: []
+  destinationCIDRs: []

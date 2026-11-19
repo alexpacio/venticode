@@ -313,7 +313,7 @@ async fn standalone_object(app: &App, w: Uuid, u: Uuid, data: &Value) -> Result<
     Ok(id)
 }
 pub(super) async fn bot_context(app: &App, id: Uuid) -> Result<Option<Value>> {
-    let r=sqlx::query("SELECT x.from_bot,c.enabled,c.status,c.tools,c.instructions FROM conversations x LEFT JOIN connections c ON c.id=x.bot_connection WHERE x.id=$1")
+    let r=sqlx::query("SELECT x.from_bot,x.runtime,c.enabled,c.status,c.tools,c.instructions FROM conversations x LEFT JOIN connections c ON c.id=x.bot_connection WHERE x.id=$1")
         .bind(id).fetch_one(&app.db).await?;
     if !r.get::<bool, _>("from_bot") {
         return Ok(None);
@@ -324,10 +324,10 @@ pub(super) async fn bot_context(app: &App, id: Uuid) -> Result<Option<Value>> {
         return Err(forbidden());
     }
     Ok(Some(
-        json!({"tools":r.get::<Value,_>("tools"),"instructions":r.get::<String,_>("instructions")}),
+        json!({"tools":r.get::<Value,_>("tools"),"instructions":r.get::<String,_>("instructions"),"runtime":r.get::<String,_>("runtime")}),
     ))
 }
-const SELECT: &str = "SELECT m.*,c.kind,c.workspace,c.destination,c.status,c.enabled,c.project_id,c.rate_limit_per_hour FROM mentions m JOIN connections c ON c.id=m.connection_id";
+const SELECT: &str = "SELECT m.*,c.kind,c.workspace,c.destination,c.status,c.enabled,c.project_id,c.runtime,c.rate_limit_per_hour FROM mentions m JOIN connections c ON c.id=m.connection_id";
 async fn document(app: &App, r: &PgRow) -> Result<Value> {
     let content = app.storage.get(r.get("body_object")).await?;
     let reply = if let Some(obj) = r.get::<Option<Uuid>, _>("reply_object") {
@@ -388,14 +388,12 @@ async fn review(
     .bind(u)
     .fetch_one(&mut *tx)
     .await?;
-    let project = sqlx::query("SELECT harness_id,root FROM projects WHERE id=$1")
-        .bind(r.get::<Option<Uuid>, _>("project_id"))
-        .fetch_one(&mut *tx)
-        .await?;
     if !owned {
         return Err(forbidden());
     }
-    actor.harness(project.get("harness_id"), project.get("root"))?;
+    if let Some(conversation) = r.get::<Option<Uuid>, _>("conversation_id") {
+        projects::owned(&app, &actor, conversation).await?;
+    }
     let c = creds(&app, &h, id).await?;
     let body = app.storage.get(r.get("reply_object")).await?;
     sqlx::query("UPDATE mentions SET state=$2,lease_until=now()+interval '2 minutes' WHERE id=$1")
@@ -507,28 +505,82 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     .bind(lease)
     .fetch_one(&mut *tx)
     .await?;
-    let project = sqlx::query("SELECT * FROM projects WHERE id=$1 AND workspace=$2")
-        .bind(r.get::<Uuid, _>("project_id"))
-        .bind(w)
-        .fetch_one(&mut *tx)
-        .await?;
-    member.harness(project.get("harness_id"), project.get("root"))?;
     let conversation = if let Some(x) = mapped {
         x
     } else {
+        let runtime: String =
+            sqlx::query_scalar("SELECT runtime FROM connections WHERE id=$1 FOR SHARE")
+                .bind(conn)
+                .fetch_one(&mut *tx)
+                .await?;
         let models = app.control_json(&h, "models").await?;
         let model = models["items"]
             .as_array()
             .and_then(|m| m.iter().find(|v| v["default"] == true).or(m.first()))
             .and_then(|m| m["id"].as_str())
             .ok_or_else(bad)?;
-        let personal:Uuid=sqlx::query_scalar("INSERT INTO projects(id,workspace,owner_id,harness_id,root,path,name) VALUES($1,$2,$3,$4,$5,$6,$7)
-            ON CONFLICT(workspace,owner_id,harness_id,root,path) DO UPDATE SET id=projects.id RETURNING id")
-            .bind(Uuid::new_v4()).bind(w).bind(u).bind(project.get::<Uuid,_>("harness_id")).bind(project.get::<String,_>("root"))
-            .bind(project.get::<String,_>("path")).bind(project.get::<String,_>("name")).fetch_one(&mut *tx).await?;
+        let personal = match runtime.as_str() {
+            "kitesurf" => {
+                if app.computers.as_ref().is_none_or(|c| c.kitesurf.is_none()) {
+                    return Err(unavailable());
+                }
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+                    .bind(format!("{w}:{u}"))
+                    .execute(&mut *tx)
+                    .await?;
+                if sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT FROM erased_subjects WHERE workspace=$1 AND owner_id=$2)",
+                )
+                .bind(w)
+                .bind(u)
+                .fetch_one(&mut *tx)
+                .await?
+                {
+                    return Err(forbidden());
+                }
+                None
+            }
+            "project" | "computer" => {
+                let (harness, root, path, name) = if runtime == "computer" {
+                    let computers = app.computers.as_ref().ok_or_else(unavailable)?;
+                    let harness: Uuid = sqlx::query_scalar("INSERT INTO managed_computers(workspace,owner_id,id) VALUES($1,$2,$3)
+                        ON CONFLICT(workspace,owner_id) DO UPDATE SET touched_at=now() RETURNING id")
+                        .bind(w).bind(u).bind(Uuid::new_v4()).fetch_one(&mut *tx).await?;
+                    if !computers.runtimes().contains(&"computer") {
+                        return Err(unavailable());
+                    }
+                    (
+                        harness,
+                        "work".to_owned(),
+                        ".".to_owned(),
+                        "Ubuntu".to_owned(),
+                    )
+                } else {
+                    let project =
+                        sqlx::query("SELECT * FROM projects WHERE id=$1 AND workspace=$2")
+                            .bind(r.get::<Option<Uuid>, _>("project_id"))
+                            .bind(w)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    member.harness(project.get("harness_id"), project.get("root"))?;
+                    (
+                        project.get("harness_id"),
+                        project.get("root"),
+                        project.get("path"),
+                        project.get("name"),
+                    )
+                };
+                Some(sqlx::query_scalar::<_,Uuid>("INSERT INTO projects(id,workspace,owner_id,harness_id,root,path,name) VALUES($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT(workspace,owner_id,harness_id,root,path) DO UPDATE SET id=projects.id RETURNING id")
+                    .bind(Uuid::new_v4()).bind(w).bind(u).bind(harness).bind(root).bind(path).bind(name).fetch_one(&mut *tx).await?)
+            }
+            _ => return Err(bad()),
+        };
         let x = Uuid::new_v4();
-        sqlx::query("INSERT INTO conversations(id,project_id,title,model,permission_mode,from_bot,bot_connection) VALUES($1,$2,'@ventic',$3,'ask',true,$4)")
-            .bind(x).bind(personal).bind(model).bind(conn).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO conversations(id,project_id,title,model,permission_mode,from_bot,bot_connection,runtime,browser_workspace,browser_owner)
+            VALUES($1,$2,'@ventic',$3,'ask',true,$4,$5,$6,$7)")
+            .bind(x).bind(personal).bind(model).bind(conn).bind(runtime)
+            .bind(personal.is_none().then_some(w)).bind(personal.is_none().then_some(u)).execute(&mut *tx).await?;
         sqlx::query("UPDATE mentions SET conversation_id=$2 WHERE id=$1")
             .bind(id)
             .bind(x)

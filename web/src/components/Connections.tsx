@@ -3,8 +3,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, list } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
-import { useProjects } from "../queries.ts";
+import { useProjects, useSession } from "../queries.ts";
 import { t } from "../i18n/index.ts";
+
+import { runtimeLabel } from "./BotView.tsx";
 
 type Connection = components["schemas"]["Connection"];
 const providers = { slack: "Slack", telegram: "Telegram", gitlab: "GitLab" };
@@ -59,7 +61,7 @@ function ConnectionCard({ connection: c, admin, refresh, edit }: { connection: C
       </form>}
       {command && <p role="status">{t("Invia questo comando dal tuo account entro cinque minuti.")} <code>{command}</code></p>}
     </>}
-    {admin && <div className="dialog-actions">{c.project_id && <button className="btn" disabled={busy} onClick={edit}>{t("Sostituisci credenziali")}</button>}
+    {admin && <div className="dialog-actions">{c.status !== "disconnected" && (c.project_id || c.runtime === "kitesurf" || c.runtime === "computer") && <button className="btn" disabled={busy} onClick={edit}>{t("Sostituisci credenziali")}</button>}
       {c.status !== "disconnected" && <button className="btn btn-danger" disabled={busy} onClick={() => {
         if (window.confirm(t("Disconnettere il bot e revocare i collegamenti degli utenti?"))) void run(async () => {
           await api(`/connections/${c.id}`, "DELETE"); await refresh();
@@ -72,6 +74,8 @@ function ConnectionCard({ connection: c, admin, refresh, edit }: { connection: C
 function SetupForm({ connection, done, cancel }: { connection: Connection | null; done: () => Promise<void>; cancel: () => void }) {
   const [kind, setKind] = useState<Connection["kind"]>(connection?.kind ?? "slack");
   const projects = useProjects();
+  const runtimes = useSession().data?.bot_runtimes ?? ["project"];
+  const [runtime, setRuntime] = useState<NonNullable<Connection["runtime"]>>(connection?.runtime ?? "project");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -82,7 +86,8 @@ function SetupForm({ connection, done, cancel }: { connection: Connection | null
     setBusy(true); setError("");
     try {
       const result = await api<{ authorize_url?: string }>(connection ? `/connections/${connection.id}` : "/connections", connection ? "PUT" : "POST", {
-        kind, destination: connection?.destination ?? data.get("destination"), project_id: connection?.project_id ?? data.get("project"), credentials,
+        kind, destination: connection?.destination ?? data.get("destination"), runtime,
+        project_id: connection ? connection.project_id : runtime === "project" ? data.get("project") : null, credentials,
       });
       form.reset();
       if (result.authorize_url) {
@@ -97,8 +102,12 @@ function SetupForm({ connection, done, cancel }: { connection: Connection | null
       {Object.entries(providers).map(([key, name]) => <option key={key} value={key}>{name}</option>)}</select></label>
     <label className="field">{kind === "slack" ? t("ID del canale Slack") : kind === "telegram" ? t("ID della chat Telegram") : t("ID numerico del progetto GitLab")}
       <input className="input" name="destination" required disabled={!!connection} defaultValue={connection?.destination} /></label>
-    <label className="field">{t("Progetto")}<select className="select" name="project" required defaultValue={connection?.project_id ?? ""} disabled={!!connection}>
-      {projects.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.root}/{p.path}</option>)}</select></label>
+    {runtimes.length > 1 && <label className="field">{t("Ambiente del bot")}
+      <select className="select" value={runtime} disabled={!!connection} onChange={e => setRuntime(e.target.value as NonNullable<Connection["runtime"]>)}>
+        {runtimes.map(mode => <option value={mode} key={mode}>{runtimeLabel(mode)}</option>)}
+      </select></label>}
+    {runtime === "project" && <label className="field">{t("Progetto")}<select className="select" name="project" required defaultValue={connection?.project_id ?? ""} disabled={!!connection}>
+      {projects.data?.map(p => <option key={p.id} value={p.id}>{p.name} · {p.root}/{p.path}</option>)}</select></label>}
     {kind === "slack" ? <>
       <p>{t("URL di reindirizzamento OAuth")} <code>{location.origin}/oauth/slack</code></p>
       <label className="field">{t("ID client")}<input className="input" name="client_id" required autoComplete="off" /></label>
@@ -107,6 +116,6 @@ function SetupForm({ connection, done, cancel }: { connection: Connection | null
     </> : <label className="field">{t("Token del bot")}<input className="input" name="token" type="password" required autoComplete="new-password" /></label>}
     {error && <p role="alert" className="error-line">{error}</p>}
     <div className="dialog-actions"><button className="btn" type="button" onClick={cancel}>{t("Annulla")}</button>
-      <button className="btn btn-primary" disabled={busy || !projects.data?.length}>{t("Collega")}</button></div>
+      <button className="btn btn-primary" disabled={busy || (!connection && runtime === "project" && !projects.data?.length)}>{t("Collega")}</button></div>
   </form>;
 }

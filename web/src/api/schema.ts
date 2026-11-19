@@ -92,6 +92,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/computer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the current member's computer status without starting it */
+        get: operations["getComputer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/computer/screen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start or watch the current member's desktop over a same-origin WebSocket
+         * @description Uses Motion JPEG frame packets with the same framing as /browser-agent/{thread},
+         *     with `tab` set to `desktop`. Client messages are `take`, `release`, `input`, and `end`.
+         *     The server sends `ready`, `control`, `error`, and `ended` events.
+         */
+        get: operations["connectComputerScreen"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/browser-agent/{thread}": {
         parameters: {
             query?: never;
@@ -517,6 +556,7 @@ export interface components {
             webhook_url: string;
             /** Format: uuid */
             project_id: string | null;
+            runtime?: components["schemas"]["BotRuntime"];
         };
         ConnectionSetup: {
             /** @enum {string} */
@@ -524,7 +564,8 @@ export interface components {
             /** @description Slack channel ID, Telegram chat ID or GitLab numeric project ID */
             destination: string;
             /** Format: uuid */
-            project_id: string;
+            project_id?: string | null;
+            runtime?: components["schemas"]["BotRuntime"];
             credentials: {
                 token?: string;
                 client_id?: string;
@@ -550,6 +591,7 @@ export interface components {
             portal_url: string;
             /** @description Session issued by a standalone Venticode instance */
             standalone?: boolean;
+            bot_runtimes?: components["schemas"]["BotRuntime"][];
         };
         Model: {
             id: string;
@@ -557,9 +599,19 @@ export interface components {
             default?: boolean;
             /** @description Tool calling is available for this model and member */
             tools?: boolean;
+            /** @description Image input is available for this model and member */
+            vision?: boolean;
         };
         /** @enum {string} */
-        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview";
+        BotRuntime: "project" | "kitesurf" | "computer";
+        Computer: {
+            /** @enum {string} */
+            state: "stopped" | "starting" | "ready";
+            /** Format: uuid */
+            harness_id?: string;
+        };
+        /** @enum {string} */
+        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
         Harness: {
             /** Format: uuid */
             id: string;
@@ -571,6 +623,8 @@ export interface components {
             mode: "sandboxed" | "yolo";
             owned: boolean;
             revision: number;
+            managed?: boolean;
+            model_access?: boolean;
             host_info?: null | {
                 os: string;
                 arch: string;
@@ -624,9 +678,10 @@ export interface components {
             /** Format: uuid */
             plan_id?: string | null;
             /** Format: uuid */
-            project_id: string;
+            project_id: string | null;
             /** Format: uuid */
-            harness_id: string;
+            harness_id: string | null;
+            runtime?: components["schemas"]["BotRuntime"];
             title: string;
             model: string;
             permission_mode: components["schemas"]["PermissionMode"];
@@ -720,6 +775,16 @@ export interface components {
             todos?: components["schemas"]["Todo"][];
             /** Format: uuid */
             run_id?: string;
+            /**
+             * Format: uuid
+             * @description Identifier for a completion from the computer CLI
+             */
+            model_call?: string;
+            model?: string;
+            model_usage?: {
+                input_tokens?: number;
+                output_tokens?: number;
+            };
             state?: components["schemas"]["ConversationState"];
             usage?: {
                 input_tokens?: number;
@@ -751,8 +816,9 @@ export interface components {
              */
             handle: "@ventic";
             /** Format: uuid */
-            harness_id: string;
-            root: string;
+            harness_id: string | null;
+            root: string | null;
+            runtime?: components["schemas"]["BotRuntime"];
             enabled: boolean;
             revision: number;
             channels: {
@@ -767,6 +833,7 @@ export interface components {
         };
         BotUpdate: {
             revision: number;
+            runtime?: components["schemas"]["BotRuntime"];
             enabled?: boolean;
             triggers?: components["schemas"]["BotTriggers"];
             tools?: components["schemas"]["BotTools"];
@@ -1052,6 +1119,47 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    getComputer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Computer status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Computer"];
+                };
+            };
+            404: components["responses"]["Error"];
+        };
+    };
+    connectComputerScreen: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
         };

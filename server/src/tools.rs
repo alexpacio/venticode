@@ -12,6 +12,13 @@ const ACTION: &[&str] = &[
     "mcp_call_tool",
     "preview",
 ];
+const COMPUTER_OPERATIONS: &[&str] = &[
+    "ask_model",
+    "desktop_act",
+    "desktop_screenshot",
+    "project_service_start",
+    "browser_open_preview",
+];
 const LOCAL_MCP: &[&str] = &["mcp_list_servers", "mcp_list_tools"];
 
 pub(super) fn is_project_operation(op: &str) -> bool {
@@ -19,13 +26,17 @@ pub(super) fn is_project_operation(op: &str) -> bool {
 }
 
 pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> Value {
+    let runtime = bot.and_then(|b| b["runtime"].as_str()).unwrap_or("project");
     let operations: Vec<_> = READ
         .iter()
         .chain(EDIT)
         .chain(ACTION)
         .chain(LOCAL_MCP.iter().filter(|_| standalone))
         .copied()
-        .filter(|op| policy(mode, false, op, bot).is_ok_and(|decision| decision != "deny"))
+        .filter(|op| {
+            runtime != "kitesurf"
+                && policy(mode, false, op, bot).is_ok_and(|decision| decision != "deny")
+        })
         .collect();
     let mut functions = Vec::new();
     if !operations.is_empty() {
@@ -43,6 +54,9 @@ pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> 
                 " execute takes command as a string and an optional working-directory path.",
             );
         }
+        if runtime == "computer" && operations.contains(&"execute") {
+            guidance.push_str(" Set arguments.model_access to true when an approved command needs to invoke venticode-cli ask. Use project_service_start for a service that must remain running through this run.");
+        }
         if operations.contains(&"mcp_list_servers") {
             guidance.push_str(" mcp_list_servers returns server ids and revisions. mcp_list_tools uses server_id and revision. mcp_call_tool also takes tool and parameters.");
         }
@@ -54,6 +68,76 @@ pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> 
     functions.push(json!({"type":"function","function":{"name":"update_tasks","description":"Replace the task list displayed in this conversation.","parameters":{"type":"object","additionalProperties":false,"required":["todos"],"properties":{"todos":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,"required":["content","status"],"properties":{"content":{"type":"string","minLength":1,"maxLength":512},"status":{"type":"string","enum":["pending","in_progress","completed"]}}}}}}}}));
     Value::Array(functions)
 }
+pub(super) fn runtime_definitions(
+    output: &mut Value,
+    mode: &str,
+    bot: Option<&Value>,
+    vision: bool,
+    model_access: bool,
+) {
+    let runtime = bot.and_then(|b| b["runtime"].as_str()).unwrap_or("project");
+    let tools = output.as_array_mut().expect("tool definitions");
+    if matches!(runtime, "kitesurf" | "computer") {
+        tools.extend(browser::definitions().filter(|d| {
+            policy(
+                mode,
+                false,
+                d["function"]["name"].as_str().unwrap_or_default(),
+                bot,
+            )
+            .is_ok_and(|p| p != "deny")
+        }));
+    }
+    if runtime != "computer" {
+        return;
+    }
+    for (name, description, properties, required, available) in [
+        (
+            "ask_model",
+            "Ask the configured model a separate text question via venticode-cli.",
+            json!({"prompt":{"type":"string","maxLength":32768}}),
+            vec!["prompt"],
+            model_access,
+        ),
+        (
+            "project_service_start",
+            "Start a project service for this run.",
+            json!({"command":{"type":"string","maxLength":32768}}),
+            vec!["command"],
+            true,
+        ),
+        (
+            "browser_open_preview",
+            "Open a service on this computer's loopback interface.",
+            json!({"port":{"type":"integer","minimum":1024,"maximum":65535},"path":{"type":"string"}}),
+            vec!["port"],
+            true,
+        ),
+        (
+            "desktop_screenshot",
+            "Observe the current Xfce desktop.",
+            json!({}),
+            vec![],
+            vision,
+        ),
+        (
+            "desktop_act",
+            "Send up to twelve desktop input events. Kinds are click, move, pointer, scroll, text and key.",
+            json!({"actions":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","required":["kind"],"properties":{
+            "kind":{"enum":["click","move","pointer","scroll","text","key"]},"x":{"type":"number"},"y":{"type":"number"},"button":{"type":"integer"},"down":{"type":"boolean"},
+            "delta":{"type":"number"},"text":{"type":"string"},"key":{"type":"string"}},"additionalProperties":false}}}),
+            vec!["actions"],
+            vision,
+        ),
+    ] {
+        if available && policy(mode, false, name, bot).is_ok_and(|decision| decision != "deny") {
+            tools.push(json!({"type":"function","function":{"name":name,"description":description,"parameters":{
+                "type":"object","properties":properties,"required":required,"additionalProperties":false
+            }}}));
+        }
+    }
+}
+
 // Flat schemas let the model generate a path or edit without a second, untyped arguments object.
 const FILE_FUNCTIONS: &[(&str, &str, &str, &[&str])] = &[
     (
@@ -128,13 +212,16 @@ fn project_arguments(name: &str, body: Value) -> Result<Value> {
     Ok(json!({"operation":op,"arguments":args}))
 }
 fn policy(mode: &str, yolo: bool, op: &str, bot: Option<&Value>) -> Result<&'static str> {
-    let category = if READ.contains(&op) || op == "mcp_list_servers" {
+    let category = if READ.contains(&op)
+        || matches!(op, "mcp_list_servers" | "desktop_screenshot")
+        || browser::is_browser_tool(op)
+    {
         "read"
     } else if EDIT.contains(&op) {
         "write"
     } else if matches!(op, "mcp_call_tool" | "mcp_list_tools") {
         "mcp"
-    } else if ACTION.contains(&op) {
+    } else if ACTION.contains(&op) || COMPUTER_OPERATIONS.contains(&op) {
         "execute"
     } else {
         return Err(bad());
@@ -211,7 +298,31 @@ pub(super) async fn decide(
     tx.commit().await?;
     Ok(Json(json!({"state":state})))
 }
-async fn relay(app: &App, h: &HeaderMap, body: Value) -> Result<Value> {
+async fn relay(app: &App, h: &HeaderMap, mut body: Value) -> Result<Value> {
+    if let Some(computers) = &app.computers {
+        let key = match body["action"].as_str() {
+            Some("execute") => body["harness_id"]
+                .as_str()
+                .and_then(|v| v.parse().ok())
+                .and_then(|id| computers.runner(id)),
+            _ => body[if body["action"] == "input" {
+                "session_id"
+            } else {
+                "request_id"
+            }]
+            .as_str()
+            .and_then(|v| v.parse().ok())
+            .and_then(|id| computers.request_runner(id)),
+        };
+        if let Some(runner) = key {
+            let cookie = h
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(forbidden)?;
+            body["managed"] = json!(true);
+            return runner.action(app.storage.fingerprint(cookie), &body);
+        }
+    }
     if let Some(local) = &app.standalone {
         let session = if body["action"] == "cancel" {
             local.session_hash(h)?
@@ -285,6 +396,7 @@ pub(super) async fn call(
     run: Uuid,
     name: &str,
     body: Value,
+    kitesurf: &mut Option<browser::Browser>,
 ) -> Result<String> {
     if name == "update_tasks" {
         let todos = body["todos"]
@@ -312,7 +424,11 @@ pub(super) async fn call(
         record(app, id, run, json!({"type":"todo","todos":todos})).await?;
         return Ok("Task list updated".into());
     }
-    let body = project_arguments(name, body)?;
+    let body = if browser::is_browser_tool(name) || COMPUTER_OPERATIONS.contains(&name) {
+        json!({"operation":name,"arguments":body})
+    } else {
+        project_arguments(name, body)?
+    };
     let op = body["operation"].as_str().ok_or_else(bad)?;
     if LOCAL_MCP.contains(&op) && app.standalone.is_none() {
         return Err(bad());
@@ -323,9 +439,26 @@ pub(super) async fn call(
     }
     let member = Member::load(app, h, true).await?;
     let c = projects::owned(app, &member, id).await?;
-    let harness = member.harness(c.get("harness_id"), c.get("root"))?;
-    let project: Uuid = c.get("project_id");
+    let runtime = c.get::<&str, _>("runtime");
     let bot = crate::mentions::bot_context(app, id).await?;
+    let browser_tool = browser::is_browser_tool(op);
+    let harness = if let Some(harness_id) = c.get::<Option<Uuid>, _>("harness_id") {
+        member.harness(harness_id, c.get("root"))?.clone()
+    } else {
+        Value::Null
+    };
+    if (runtime == "kitesurf" && !browser_tool)
+        || (browser_tool && !matches!(runtime, "kitesurf" | "computer"))
+        || (COMPUTER_OPERATIONS.contains(&op) && runtime != "computer")
+        || (harness["managed"] == true && matches!(op, "terminal_start" | "agent_start"))
+        || (args["model_access"] == true && (runtime != "computer" || op != "execute"))
+    {
+        return Err(forbidden());
+    }
+    if browser_tool {
+        browser::validate(op, args)?;
+    }
+    let project = c.get::<Option<Uuid>, _>("project_id");
     let decision = policy(
         c.get("permission_mode"),
         harness["owned"] == true && harness["mode"] == "yolo",
@@ -391,6 +524,68 @@ pub(super) async fn call(
         record(app,id,run,json!({"type":"tool_result","call_id":call,"status":"denied","summary":"Operazione negata / Operation denied"})).await?;
         return Ok("Operation denied".into());
     }
+    if runtime == "kitesurf" {
+        if kitesurf.is_none() {
+            *kitesurf = Some(browser::Browser::start(app).await?);
+        }
+        return surface_result(
+            app,
+            id,
+            run,
+            call,
+            op,
+            kitesurf.as_mut().unwrap().call(op, args).await,
+        )
+        .await;
+    }
+    let managed = if harness["managed"] == true {
+        Some(
+            app.computers
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .ready(app, member.workspace, member.user)
+                .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(runner) = &managed
+        && (browser_tool
+            || matches!(
+                op,
+                "desktop_screenshot" | "desktop_act" | "browser_open_preview"
+            ))
+    {
+        let computers = app.computers.as_ref().ok_or_else(unavailable)?;
+        let display = computers.display(runner.id());
+        let _control = display.read().await;
+        sqlx::query("SELECT id FROM conversations WHERE id=$1 AND active_run=$2")
+            .bind(id)
+            .bind(run)
+            .fetch_one(&app.db)
+            .await?;
+        let (operation, arguments) = match op {
+            "desktop_act" => (
+                "desktop_input",
+                json!({"kind":"batch","actions":args["actions"]}),
+            ),
+            "desktop_screenshot" => ("desktop_frame", args.clone()),
+            _ => (op, args.clone()),
+        };
+        return surface_result(
+            app,
+            id,
+            run,
+            call,
+            op,
+            computer::rpc(runner, operation, arguments).await,
+        )
+        .await;
+    }
+    let mut args = args.clone();
+    if op == "project_service_start" {
+        args["run_id"] = json!(run);
+    }
     // Fence the external dispatch against interruption. The row lock spans the acknowledgement.
     let mut tx = app.db.begin().await?;
     sqlx::query("SELECT id FROM conversations WHERE id=$1 AND active_run=$2 FOR UPDATE")
@@ -424,6 +619,15 @@ pub(super) async fn call(
                 continue;
             }
             let mut payload = e["result"].clone();
+            if payload["type"] == "model_request" {
+                if let Some(runner) = &managed
+                    && (op == "ask_model" || op == "execute" && args["model_access"] == true)
+                {
+                    computer::complete_model_request(app, h, id, run, call, runner, &payload)
+                        .await?;
+                }
+                continue;
+            }
             requires_upgrade |=
                 payload["type"] == "error" && payload["error"] == "Unsupported harness operation";
             failed |= payload["type"] == "error"
@@ -523,6 +727,44 @@ pub(super) async fn call(
     }
 }
 
+async fn surface_result(
+    app: &App,
+    id: Uuid,
+    run: Uuid,
+    call: Uuid,
+    op: &str,
+    value: Result<Value>,
+) -> Result<String> {
+    match value {
+        Ok(value) if op == "desktop_screenshot" => {
+            record(app,id,run,json!({"type":"tool_result","call_id":call,"status":"ok","summary":"Desktop screenshot"})).await?;
+            Ok(value.to_string())
+        }
+        Ok(value) => {
+            let text = value.to_string();
+            record(
+                app,
+                id,
+                run,
+                json!({"type":"tool_output","call_id":call,"stream":"stdout","data":text}),
+            )
+            .await?;
+            record(app,id,run,json!({"type":"tool_result","call_id":call,"status":"ok","summary":"Operation completed"})).await?;
+            Ok(text)
+        }
+        Err(error) => {
+            record(
+                app,
+                id,
+                run,
+                json!({"type":"tool_result","call_id":call,"status":"error","summary":error.1}),
+            )
+            .await?;
+            Ok(error.1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +801,42 @@ mod tests {
         );
         assert_eq!(policy("ask", false, "write_file", None).ok(), Some("ask"));
         assert!(policy("ask", true, "unknown", None).is_err());
+    }
+
+    #[test]
+    fn browser_tools_are_shared_and_machine_tools_require_their_capabilities() {
+        let bot = |runtime| json!({"runtime":runtime,"tools":{"read":"auto","execute":"review"}});
+        let runtime_names = |runtime, vision, model| {
+            let bot = bot(runtime);
+            let mut tools = definitions("ask", Some(&bot), false);
+            runtime_definitions(&mut tools, "ask", Some(&bot), vision, model);
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let kitesurf = runtime_names("kitesurf", true, true);
+        let computer = runtime_names("computer", false, false);
+        assert!(
+            !kitesurf
+                .iter()
+                .any(|name| name == "project_tool" || name == "ask_model")
+        );
+        assert!(
+            kitesurf
+                .iter()
+                .filter(|name| browser::is_browser_tool(name))
+                .all(|name| computer.contains(name))
+        );
+        assert!(
+            !computer
+                .iter()
+                .any(|name| name.starts_with("desktop_") || name == "ask_model")
+        );
+        let computer = runtime_names("computer", true, true);
+        assert!(computer.iter().any(|name| name == "desktop_screenshot"));
+        assert!(computer.iter().any(|name| name == "ask_model"));
     }
 }

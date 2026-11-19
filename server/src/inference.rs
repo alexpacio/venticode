@@ -9,6 +9,7 @@ pub(super) struct Provider {
     model: String,
     max_tokens: u32,
     tools: bool,
+    vision: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +51,8 @@ impl Provider {
         let max_tokens =
             env::var("VENTICODE_LLM_MAX_TOKENS").map_or(Ok(4096), |v| v.parse::<u32>())?;
         let tools = env::var("VENTICODE_LLM_TOOLS").map_or(Ok(true), |v| v.parse::<bool>())?;
+        let vision =
+            env::var("VENTICODE_LLM_VISION").map_or(Ok(false), |value| value.parse::<bool>())?;
         if model.trim().is_empty() || max_tokens == 0 {
             return Err("Configure a model and a positive VENTICODE_LLM_MAX_TOKENS".into());
         }
@@ -60,11 +63,12 @@ impl Provider {
             model,
             max_tokens,
             tools,
+            vision,
         })
     }
 
     pub fn models(&self) -> Value {
-        json!({"items":[{"id":self.model,"name":self.model,"default":true,"tools":self.tools}]})
+        json!({"items":[{"id":self.model,"name":self.model,"default":true,"tools":self.tools,"vision":self.vision}]})
     }
 }
 
@@ -160,6 +164,21 @@ fn anthropic_request(request: &Value, max_tokens: u32) -> Result<Value> {
             blocks.push(
                 json!({"type":"tool_result","tool_use_id":msg["tool_call_id"],"content":text}),
             );
+        } else if let Some(parts) = msg["content"].as_array() {
+            for part in parts {
+                match part["type"].as_str() {
+                    Some("text") => blocks
+                        .push(json!({"type":"text","text":part["text"].as_str().ok_or_else(bad)?})),
+                    Some("image_url") => {
+                        let data = part["image_url"]["url"]
+                            .as_str()
+                            .and_then(|url| url.strip_prefix("data:image/jpeg;base64,"))
+                            .ok_or_else(bad)?;
+                        blocks.push(json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data}}));
+                    }
+                    _ => return Err(bad()),
+                }
+            }
         } else if !text.is_empty() {
             blocks.push(json!({"type":"text","text":text}));
         }
@@ -184,6 +203,11 @@ fn anthropic_request(request: &Value, max_tokens: u32) -> Result<Value> {
             messages.push(json!({"role":role,"content":blocks}));
         }
     }
+    let max_tokens = request["max_tokens"]
+        .as_u64()
+        .map_or(u64::from(max_tokens), |limit| {
+            limit.min(u64::from(max_tokens))
+        });
     let mut body = json!({"model":request["model"],"max_tokens":max_tokens,"stream":true,"system":system.join("\n\n"),"messages":messages});
     if let Some(tools) = request["tools"]
         .as_array()

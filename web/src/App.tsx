@@ -8,6 +8,7 @@ import { Home } from "./components/Home.tsx";
 import { ProjectView } from "./components/ProjectView.tsx";
 import { ConversationView } from "./components/ConversationView.tsx";
 import { BotView } from "./components/BotView.tsx";
+import { DesktopView } from "./components/DesktopView.tsx";
 import { BrowserView } from "./components/BrowserView.tsx";
 
 import { Connections } from "./components/Connections.tsx";
@@ -41,6 +42,7 @@ export function App() {
         <Route path="/bots/:id" element={<BotView menu={menu} admin={admin} />} />
         <Route path="/connections" element={<Connections menu={menu} admin={admin} />} />
         <Route path="/browser" element={<BrowserView menu={menu} />} />
+        {session.data.bot_runtimes?.includes("computer") && <Route path="/computer" element={<DesktopView menu={menu} />} />}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </div>
@@ -80,7 +82,7 @@ function WorkspaceShortcuts() {
   const project = location.pathname.startsWith("/p/") ? id : chats.find(c=>c.id===id)?.project_id;
   useEffect(()=>{
     const listen = (event: KeyboardEvent) => {
-      if ((event.key !== "F2" && event.key !== "F3") || document.querySelector("dialog[open]")) return;
+      if ((event.key !== "F2" && event.key !== "F3") || document.querySelector("dialog[open]") || document.activeElement?.hasAttribute("data-remote-desktop")) return;
       event.preventDefault();
       setMenu(event.key === "F2" ? "chats" : "projects");
     };
