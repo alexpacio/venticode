@@ -59,7 +59,7 @@ export function ProjectView({ menu }: { menu: ReactNode }) {
       </header>
       <Terminal project={project} />
       <Composer onSend={start} placeholder={t("Descrivi il lavoro da fare in questo progetto…")}
-        disabled={harness && !harness.online ? t("{0} è offline: avvia ventiharness per continuare.", harness.name) : undefined}
+        disabled={harness && !harness.online ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
         controls={
           <label className="select-inline">{t("Modalità")}
             <select value={mode} onChange={(e) => setMode(e.target.value as PermissionMode)}>

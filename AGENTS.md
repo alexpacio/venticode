@@ -3,7 +3,7 @@
 Venticode is a standalone, multi-tenant coding and bot agent. It is integrated
 into the Ventic distribution the same way Open WebUI is: its own per-workspace
 host (`<workspace-uuid>.code.<domain>`), a one-time ticket handoff from the
-portal session, and ventiharness as the remote runtime for tools, terminals,
+portal session, and venticode-harness as the remote runtime for tools, terminals,
 sub-agents and MCP servers. It shares no code or runtime with Open WebUI.
 
 Inspect git status and preserve user edits. Do not commit, push, publish or

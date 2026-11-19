@@ -85,7 +85,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   {
     const id = seeded.id, run = randomUUID(), m1 = randomUUID(), m2 = randomUUID();
     const read = randomUUID(), edit = randomUUID(), exec = randomUUID();
-    push(id, { type: "user_message", message_id: m1, content: "Aggiungi una migrazione che limiti gli accessi harness per progetto, poi esegui i test di ventiharness." });
+    push(id, { type: "user_message", message_id: m1, content: "Aggiungi una migrazione che limiti gli accessi harness per progetto, poi esegui i test di venticode-harness." });
     push(id, { type: "run", run_id: run, state: "running" });
     push(id, { type: "todo", todos: [{ content: "Leggere il modello di accesso", status: "completed" }, { content: "Aggiungere la migrazione", status: "completed" }, { content: "Eseguire i test", status: "completed" }] });
     push(id, { type: "text", message_id: m2, delta: "Controllo come sono modellati oggi gli accessi, poi aggiungo la migrazione." });
@@ -94,7 +94,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     push(id, { type: "tool_call", call_id: edit, operation: "write_file", target: "services/control/migrations/0055_harness_project_access.sql", arguments: {} });
     push(id, { type: "tool_result", call_id: edit, status: "ok", summary: "+6", diff: { path: "services/control/migrations/0055_harness_project_access.sql", additions: 6, deletions: 0,
       patch: "@@ -0,0 +1,6 @@\n+CREATE TABLE harness_project_access (\n+  harness_id uuid NOT NULL REFERENCES harnesses(id) ON DELETE CASCADE,\n+  project_root text NOT NULL,\n+  granted_at timestamptz NOT NULL DEFAULT now(),\n+  PRIMARY KEY (harness_id, project_root)\n+);" } });
-    push(id, { type: "tool_call", call_id: exec, operation: "execute", target: "cargo test -p ventiharness --release", arguments: { command: "cargo test -p ventiharness --release" } });
+    push(id, { type: "tool_call", call_id: exec, operation: "execute", target: "cargo test -p venticode-harness --release", arguments: { command: "cargo test -p venticode-harness --release" } });
     push(id, { type: "tool_output", call_id: exec, stream: "stdout", data: "running 18 tests\ntest result: ok. 18 passed; 0 failed\n" });
     push(id, { type: "tool_result", call_id: exec, status: "ok", summary: "exit 0 · 41 s" });
     push(id, { type: "text", message_id: m2, delta: "\n\nMigrazione aggiunta e 18 test superati." });

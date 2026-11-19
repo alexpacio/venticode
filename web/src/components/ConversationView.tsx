@@ -55,7 +55,7 @@ export function ConversationView({ menu }: { menu: ReactNode }) {
           else if(text.startsWith("/plan ")) await send(text.slice(6).trim(),"plan");
           else await send(text);
         }} onStop={stop} running={running}
-          disabled={harness && !harness.online ? t("{0} è offline: avvia ventiharness per continuare.", harness.name) : undefined}
+          disabled={harness && !harness.online ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
           controls={<ModeSelect conversation={c} />} />
       </main>
       <SessionPanel transcript={transcript} harness={harness} projectLabel={project ? `${project.root}/${project.path === "." ? "" : project.path}` : ""} />
@@ -181,7 +181,7 @@ function SessionPanel({ transcript, harness, projectLabel }: { transcript: Trans
             <dt>{t("Host")}</dt><dd className="mono">{harness.name}</dd>
             <dt>{t("Cartella")}</dt><dd className="mono">{projectLabel}</dd>
             <dt>{t("Modalità")}</dt><dd>{harness.mode === "yolo" ? t("YOLO · nessuna richiesta") : t("Consenso · chiede per strumento")}</dd>
-            <dt>{t("Stato")}</dt><dd>{harness.online ? t("online") : t("offline")}{harness.host_info ? ` · ventiharness ${harness.host_info.version}` : ""}</dd>
+            <dt>{t("Stato")}</dt><dd>{harness.online ? t("online") : t("offline")}{harness.host_info ? ` · venticode-harness ${harness.host_info.version}` : ""}</dd>
           </dl>
         </section>
       )}

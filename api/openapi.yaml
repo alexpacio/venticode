@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: Venticode API
-  version: 0.2.0
+  version: 0.2.1
   description: |
     Browser API of Venticode, the coding and bot agent that runs tools on
-    connected ventiharness instances.
+    connected venticode-harness instances.
 
     Hosts and trust boundary (mirrors the Open WebUI integration in ventic):
     - `POST /api/v1/venticode/access` is served on the portal host and uses the

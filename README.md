@@ -2,7 +2,7 @@
 
 Venticode is a coding and bot agent that runs independently or as part of the
 Ventic distribution. It works
-like Claude Code in the browser: connected ventiharness machines appear in an
+like Claude Code in the browser: machines running venticode-harness appear in an
 inventory on the left, each with project folders and their conversations. The
 agent runs files, commands, terminals, sub-agents and MCP tools on the harness,
 asking for permission per tool call. The same agent can answer `@ventic`

@@ -121,7 +121,7 @@
   "{0} min": "{0} min",
   "{0} strumenti": "{0} tools",
   "{0} · strumenti su {1} ({2})": "{0} · tools on {1} ({2})",
-  "{0} è offline: avvia ventiharness per continuare.": "{0} is offline: start ventiharness to continue.",
+  "{0} è offline: avvia venticode-harness per continuare.": "{0} is offline: start venticode-harness to continue.",
   "⏎ invia · ⇧⏎ a capo · Esc interrompe": "⏎ send · ⇧⏎ newline · Esc interrupt",
   "Connessioni bot": "Bot connections",
   "Nessuna connessione configurata.": "No connections configured.",
