@@ -46,6 +46,13 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   ];
   const projects: Json[] = [];
   const conversations: Json[] = [];
+
+  // Synthetic, read-only folder tree for the /harnesses/{id}/ls browse endpoint.
+  // Keyed by `${harnessId}:${root}`; never touches a real filesystem.
+  const fileTree = new Map<string, Json>();
+  const tree = (harness: Json, root: string, spec: Record<string, Json>) => {
+    fileTree.set(`${harness.id}:${root}`, spec);
+  };
   const events = new Map<string, Event[]>();
   const listeners = new Map<string, Set<Listener>>();
   const runs = new Map<string, AbortController>();
@@ -83,6 +90,32 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   addProject(dev, "ventic-frontend");
   const common = addProject(runner, "ventic-common");
   addProject(mac, "design-tokens");
+
+  // Synthetic folders for the browse endpoint (dev-workstation).
+  tree(dev, "ventic", {
+    ".": [
+      { name: "src", directory: true, symlink: false, bytes: 0 },
+      { name: "docs", directory: true, symlink: false, bytes: 0 },
+      { name: "tests", directory: true, symlink: false, bytes: 0 },
+      { name: "Cargo.toml", directory: false, symlink: false, bytes: 1024 },
+      { name: "README.md", directory: false, symlink: false, bytes: 4096 },
+    ],
+    "src": [
+      { name: "server", directory: true, symlink: false, bytes: 0 },
+      { name: "web", directory: true, symlink: false, bytes: 0 },
+      { name: "main.rs", directory: false, symlink: false, bytes: 2048 },
+    ],
+    "src/server": [
+      { name: "browse.rs", directory: false, symlink: false, bytes: 3072 },
+      { name: "main.rs", directory: false, symlink: false, bytes: 8192 },
+    ],
+    "docs": [{ name: "guide.md", directory: false, symlink: false, bytes: 5120 }],
+    "tests": [{ name: "contracts", directory: true, symlink: false, bytes: 0 }],
+    "tests/contracts": [{ name: "openapi.yaml", directory: false, symlink: false, bytes: 6144 }],
+  });
+  tree(dev, "notes", {
+    ".": [{ name: "todo.md", directory: false, symlink: false, bytes: 512 }],
+  });
   const seeded = addConversation(ventic, "Accesso harness per progetto", 90);
   addConversation(ventic, "Revisione ordine lease WAF", 60 * 26);
   addConversation(common, "Rigenera fixture dei contratti", 60 * 5);
@@ -245,6 +278,20 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     }
     if (p === "/models" && method === "GET") return ok({ items: models });
     if (p === "/harnesses" && method === "GET") return ok({ items: harnesses });
+    if ((m = p.match(/^\/harnesses\/([^/]+)\/ls$/)) && method === "GET") {
+      const harness = harnesses.find((h) => h.id === m![1]);
+      if (!harness) return fail(404, "Harness non trovato / Harness not found");
+      const root = body.query.get("root");
+      const path = body.query.get("path") ?? ".";
+      if (!root || !harness.roots.includes(root)) return fail(400, "Radice non valida / Invalid root");
+      if (typeof path !== "string" || path.length > 1024 || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || path.split("/").includes(""))
+        return fail(400, "Cartella non valida / Invalid folder");
+      const spec = fileTree.get(`${harness.id}:${root}`);
+      if (!spec) return fail(404, "Cartella non trovata / Folder not found");
+      const items = spec[path];
+      if (!items) return fail(404, "Cartella non trovata / Folder not found");
+      return ok({ items, path });
+    }
     if (p === "/projects" && method === "GET") {
       const harnessId = body.query.get("harness_id");
       return ok({ items: projects.filter((x) => !harnessId || x.harness_id === harnessId) });

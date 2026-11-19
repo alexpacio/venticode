@@ -80,6 +80,19 @@ fn form_encode(pairs: &[(&str, &str)]) -> Vec<u8> {
     ser.finish().into_bytes()
 }
 
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn is_loopback_host(host: &str) -> bool {
     host == "localhost"
         || host.ends_with(".localhost")
@@ -297,6 +310,25 @@ impl Remote {
             .as_array()
             .cloned()
             .context("Expected list")
+    }
+
+    /// List a directory inside a granted harness root (read-only browse).
+    pub async fn list_dir(
+        &self,
+        cx: &Cx,
+        harness_id: &str,
+        root: &str,
+        path: &str,
+    ) -> Result<Vec<Value>> {
+        let mut url = format!("/harnesses/{harness_id}/ls?root={}", urlencode(root));
+        if path != "." {
+            url.push_str(&format!("&path={}", urlencode(path)));
+        }
+        let value = self.api(cx, Method::Get, &url, None).await?;
+        value["items"]
+            .as_array()
+            .cloned()
+            .context("Expected directory listing")
     }
 
     pub async fn follow(
@@ -743,7 +775,9 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{Remote, SseEvent, SseParser, is_loopback_host, jittered_backoff, origin};
+    use super::{
+        Remote, SseEvent, SseParser, is_loopback_host, jittered_backoff, origin, urlencode,
+    };
     use std::time::Duration;
 
     #[test]
@@ -895,5 +929,14 @@ mod tests {
                 id: None,
             }]
         );
+    }
+
+    #[test]
+    fn urlencode_escapes_reserved_characters() {
+        assert_eq!(urlencode("src/app"), "src%2Fapp");
+        assert_eq!(urlencode("."), ".");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("x/y"), "x%2Fy");
+        assert_eq!(urlencode("safe-_.~"), "safe-_.~");
     }
 }

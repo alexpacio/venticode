@@ -1,6 +1,7 @@
 mod client;
 mod editor;
 mod login;
+mod store;
 mod view;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -222,8 +223,50 @@ fn picker_options(app: &App, picker: Option<Picker>) -> Vec<String> {
                 .map(|c| clean(&string(c, "title"))),
         )
         .collect(),
+        Some(Picker::Browse) => browse_rows(app),
         None => Vec::new(),
     }
+}
+
+/// Row labels for the active browse: [create-here] [parent?] [dirs...] [files...].
+/// `choose_browse` relies on this exact ordering.
+fn browse_rows(app: &App) -> Vec<String> {
+    let Some(b) = app.browse.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let here = if b.at_root() {
+        app.msg("Crea progetto qui", "Create project here")
+    } else {
+        app.msg(
+            "Crea progetto in questa cartella",
+            "Create project in this folder",
+        )
+    };
+    rows.push(clean(&format!("● {here}")));
+    if !b.at_root() {
+        rows.push(clean("↑ .."));
+    }
+    for entry in &b.entries {
+        let name = string(entry, "name");
+        if entry["directory"] == true {
+            rows.push(clean(&format!("📁 {name}/")));
+        }
+    }
+    for entry in &b.entries {
+        if entry["directory"] == true {
+            continue;
+        }
+        let name = string(entry, "name");
+        let bytes = entry["bytes"].as_u64().unwrap_or(0);
+        rows.push(clean(&format!("   {name}  ({bytes} B)")));
+    }
+    if rows.len() == 1 && !b.error.is_empty() {
+        rows.push(clean(&format!("⚠ {}", b.error)));
+    } else if b.loading {
+        rows.push(clean(app.msg("Caricamento…", "Loading…")));
+    }
+    rows
 }
 
 struct FeedHandle {
@@ -238,7 +281,7 @@ impl FeedHandle {
 
 struct App {
     remote: Remote,
-    credential: keyring::Entry,
+    store: store::SessionStore,
     en: bool,
     projects: Vec<Value>,
     models: Vec<Value>,
@@ -265,13 +308,51 @@ struct App {
     opened_at: Instant,
     feed: Option<FeedHandle>,
     tx: mpsc::Sender<(String, StreamUpdate)>,
+    browse: Option<Browse>,
+    /// One-shot: run_ui opens the browse picker after a /folder command.
+    open_browse: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Picker {
     Models,
     Projects,
     Chats,
+    Browse,
+}
+
+/// State for the interactive folder browser (F3 / /folder drill-down).
+struct Browse {
+    harness: Value,
+    root: String,
+    path: String,
+    entries: Vec<Value>,
+    loading: bool,
+    error: String,
+}
+
+impl Browse {
+    /// True when `path` is the granted root itself (so there's no parent row).
+    fn at_root(&self) -> bool {
+        self.path == "." || self.path.is_empty()
+    }
+}
+
+/// `..` parent of a relative path, clamped at the root (".").
+fn parent(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => ".".to_owned(),
+        Some((parent, _)) => parent.to_owned(),
+    }
+}
+
+/// Join a directory name onto a relative path, keeping "." at the root.
+fn join(path: &str, name: &str) -> String {
+    if path == "." || path.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{path}/{name}")
+    }
 }
 
 impl Picker {
@@ -289,6 +370,10 @@ impl Picker {
             ),
             Self::Projects => app.msg("Scegli il progetto in cui lavorare", "Choose a project"),
             Self::Chats => app.msg("Scegli una conversazione", "Choose a conversation"),
+            Self::Browse => app.msg(
+                "Sfoglia le cartelle · Invio per entrare · . per creare qui",
+                "Browse folders · Enter to open · . to create here",
+            ),
         }
     }
 }
@@ -312,10 +397,110 @@ impl App {
             .collect()
     }
 
+    /// Enter the folder browser at the first available harness root.
+    async fn start_browse(&mut self, cx: &Cx) -> Result<()> {
+        let folders = self.folder_options();
+        let Some(&(h, root)) = folders.first() else {
+            self.note(self.msg(
+                "Nessun harness con cartelle disponibili.",
+                "No harness with folders available.",
+            ));
+            return Ok(());
+        };
+        self.browse = Some(Browse {
+            harness: h.clone(),
+            root: root.to_owned(),
+            path: ".".to_owned(),
+            entries: Vec::new(),
+            loading: true,
+            error: String::new(),
+        });
+        self.reload_browse(cx).await
+    }
+
+    /// Fetch the current browse directory's entries.
+    async fn reload_browse(&mut self, cx: &Cx) -> Result<()> {
+        let (harness_id, root, path) = {
+            let b = self.browse.as_ref().context("No active browse")?;
+            (string(&b.harness, "id"), b.root.clone(), b.path.clone())
+        };
+        let result = self.remote.list_dir(cx, &harness_id, &root, &path).await;
+        if let Some(b) = self.browse.as_mut() {
+            b.loading = false;
+            match result {
+                Ok(entries) => {
+                    b.entries = entries;
+                    b.error.clear();
+                }
+                Err(err) => {
+                    b.entries.clear();
+                    b.error = err.to_string();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a project at the current browse path and open it.
+    async fn create_browse_project(&mut self, cx: &Cx) -> Result<()> {
+        let (harness_id, root, path) = {
+            let b = self.browse.as_ref().context("No active browse")?;
+            (string(&b.harness, "id"), b.root.clone(), b.path.clone())
+        };
+        let body = json!({"harness_id": harness_id, "root": root, "path": path});
+        let p = self
+            .remote
+            .api(cx, Method::Post, "/projects", Some(body))
+            .await?;
+        self.browse = None;
+        self.projects.push(p.clone());
+        self.close();
+        self.project = p;
+        self.welcome();
+        Ok(())
+    }
+
+    /// Handle Enter on a highlighted browse row: create-here, parent, dir, or file.
+    async fn choose_browse(&mut self, cx: &Cx, index: usize) -> Result<()> {
+        // Row layout produced by browse_rows(): [create-here] [parent?] [dirs...] [files...]
+        let b = self.browse.as_mut().context("No active browse")?;
+        if b.loading {
+            return Ok(());
+        }
+        if index == 0 {
+            return self.create_browse_project(cx).await;
+        }
+        let mut cursor = 1;
+        if !b.at_root() {
+            if index == cursor {
+                let path = parent(&b.path);
+                b.path = path;
+                b.loading = true;
+                return self.reload_browse(cx).await;
+            }
+            cursor += 1;
+        }
+        let entry = b.entries.get(index - cursor).cloned();
+        match entry {
+            Some(e) if e["directory"] == true => {
+                let name = string(&e, "name");
+                let path = join(&b.path, &name);
+                b.path = path;
+                b.loading = true;
+                self.reload_browse(cx).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn choose(&mut self, cx: &Cx, picker: Picker, index: usize) -> Result<()> {
         match picker {
             Picker::Models => {
                 self.command(cx, &format!("/model {}", index + 1)).await?;
+            }
+            Picker::Browse => {
+                self.choose_browse(cx, index).await?;
             }
             Picker::Projects => {
                 let project = if self.projects.is_empty() {
@@ -764,7 +949,7 @@ impl App {
         match command {
             "/logout" => {
                 let _ = self.remote.api(cx, Method::Delete, "/session", None).await;
-                let _ = self.credential.delete_credential();
+                self.store.clear();
                 return Ok(true);
             }
             "/diff" => {
@@ -837,8 +1022,8 @@ impl App {
                 ));
             }
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
-                "/projects · /use N · /harnesses · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
+                "/projects · /use N · /harnesses · /folder (sfoglia) · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti/sfoglia · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
+                "/projects · /use N · /harnesses · /folder (browse) · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects/browse · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
             )),
             "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model"
                 if argument.is_empty() =>
@@ -870,6 +1055,11 @@ impl App {
                 self.close();
                 self.project = project;
                 self.note(entries(&self.project_chats()));
+            }
+            "/folder" if argument.is_empty() => {
+                self.refresh(cx).await?;
+                self.start_browse(cx).await?;
+                self.open_browse = self.browse.is_some();
             }
             "/folder" => {
                 let mut parts = argument.splitn(3, ' ');
@@ -1009,6 +1199,9 @@ async fn run_ui(
     } else if let [project] = app.projects.as_slice() {
         app.project = project.clone();
         app.welcome();
+    } else if app.projects.is_empty() && !app.folder_options().is_empty() {
+        app.start_browse(cx).await?;
+        picker = Some(Picker::Browse);
     } else {
         picker = Some(Picker::Projects);
     }
@@ -1095,6 +1288,13 @@ async fn run_ui(
         if terminated.load(Ordering::Relaxed) {
             break;
         }
+        // A /folder command requested the interactive browser: open it now.
+        if app.open_browse {
+            app.open_browse = false;
+            picker = Some(Picker::Browse);
+            selection = 0;
+            dirty = true;
+        }
         // Drain all available SSE stream updates before rendering.
         let mut got_sse = false;
         while let Ok((id, update)) = rx.try_recv() {
@@ -1106,7 +1306,7 @@ async fn run_ui(
                     StreamUpdate::Status(msg) => app.status = msg,
                     StreamUpdate::AuthExpired(msg) => {
                         app.feed.take();
-                        let _ = app.credential.delete_credential();
+                        app.store.clear();
                         app.status = msg;
                     }
                     StreamUpdate::Fatal(error) => {
@@ -1176,12 +1376,20 @@ async fn run_ui(
                         }
                         KeyCode::F(2) | KeyCode::F(3) => match app.refresh(cx).await {
                             Ok(()) => {
-                                picker =
-                                    Some(if k.code == KeyCode::F(3) || app.project.is_null() {
+                                if k.code == KeyCode::F(2) {
+                                    picker = Some(if app.project.is_null() {
                                         Picker::Projects
                                     } else {
                                         Picker::Chats
                                     });
+                                } else if app.projects.is_empty()
+                                    && !app.folder_options().is_empty()
+                                {
+                                    app.start_browse(cx).await?;
+                                    picker = Some(Picker::Browse);
+                                } else {
+                                    picker = Some(Picker::Projects);
+                                }
                                 selection = 0;
                                 app.status.clear();
                             }
@@ -1197,6 +1405,24 @@ async fn run_ui(
                                     .unwrap_or(0);
                             }
                         }
+                        KeyCode::Esc if picker == Some(Picker::Browse) => {
+                            let at_root = app.browse.as_ref().is_some_and(Browse::at_root);
+                            if at_root {
+                                picker = None;
+                                app.browse = None;
+                                selection = 0;
+                            } else {
+                                if let Some(b) = app.browse.as_mut() {
+                                    b.path = parent(&b.path);
+                                    b.loading = true;
+                                    b.entries.clear();
+                                }
+                                if let Err(error) = app.reload_browse(cx).await {
+                                    app.status = error.to_string();
+                                }
+                                selection = 0;
+                            }
+                        }
                         KeyCode::Esc if picker.is_some() => {
                             picker = None;
                             selection = 0;
@@ -1207,7 +1433,12 @@ async fn run_ui(
                             }
                             match app.choose(cx, menu, selection).await {
                                 Ok(()) => {
-                                    picker = None;
+                                    // Browse manages its own lifecycle: drill in/out
+                                    // keeps the picker open; creating a project clears
+                                    // `browse` and closes the picker.
+                                    if menu != Picker::Browse || app.browse.is_none() {
+                                        picker = None;
+                                    }
                                     selection = 0;
                                     app.status.clear();
                                 }
@@ -1565,22 +1796,22 @@ async fn run_cli(cx: Cx) -> Result<()> {
             origin(value.trim())?
         }
     };
-    let credential = keyring::Entry::new(
+    let store = store::SessionStore::open(
         if standalone.is_some() {
             "venticode-tui-standalone"
         } else {
             "venticode-tui"
         },
         &portal,
-    )?;
+    );
     let mut session = None;
-    if !stdin {
-        match credential.get_password() {
-            Ok(saved) => match Remote::restore(ca.as_deref(), &saved, standalone.is_some()) {
-                Ok(remote) => match remote.valid(&cx).await {
+    if !stdin && let Some(saved) = store.load() {
+        match Remote::restore(ca.as_deref(), &saved, standalone.is_some()) {
+            Ok(remote) => {
+                match remote.valid(&cx).await {
                     Ok(true) => session = Some(remote),
                     Ok(false) => {
-                        let _ = credential.delete_credential();
+                        store.clear();
                     }
                     Err(err) => {
                         console.print(&format!(
@@ -1592,28 +1823,19 @@ async fn run_cli(cx: Cx) -> Result<()> {
                             }
                         ));
                     }
-                },
-                Err(err) => {
-                    console.print(&format!(
-                        "[yellow]{}[/]",
-                        if en {
-                            format!("Ignoring corrupt saved session ({err}); signing in again.")
-                        } else {
-                            format!("Sessione salvata non valida ({err}); nuovo accesso.")
-                        }
-                    ));
-                    let _ = credential.delete_credential();
                 }
-            },
-            Err(keyring::Error::NoEntry) => (),
-            Err(e) => console.print(&format!(
-                "[yellow]{}[/]",
-                if en {
-                    format!("Keyring unavailable: {e}")
-                } else {
-                    format!("Portachiavi non disponibile: {e}")
-                }
-            )),
+            }
+            Err(err) => {
+                console.print(&format!(
+                    "[yellow]{}[/]",
+                    if en {
+                        format!("Ignoring corrupt saved session ({err}); signing in again.")
+                    } else {
+                        format!("Sessione salvata non valida ({err}); nuovo accesso.")
+                    }
+                ));
+                store.clear();
+            }
         }
     }
     let remote = if let Some(remote) = session {
@@ -1656,13 +1878,26 @@ async fn run_cli(cx: Cx) -> Result<()> {
         } else {
             Remote::connect(&cx, ca.as_deref(), &portal, code.trim()).await?
         };
-        if let Err(e) = credential.set_password(&remote.saved()?) {
+        if let Err(e) = store.save(&remote.saved()?) {
             console.print(&format!(
                 "[dim]{}[/]",
                 if en {
                     format!("Session available for this launch only: {e}")
                 } else {
                     format!("Sessione solo in memoria: {e}")
+                }
+            ));
+        } else if store.is_file_backend() {
+            let where_ = store
+                .file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            console.print(&format!(
+                "[dim]{}[/]",
+                if en {
+                    format!("Session saved unencrypted in {where_}")
+                } else {
+                    format!("Sessione salvata senza cifratura in {where_}")
                 }
             ));
         }
@@ -1673,7 +1908,7 @@ async fn run_cli(cx: Cx) -> Result<()> {
         &cx,
         App {
             remote,
-            credential,
+            store,
             en,
             projects: vec![],
             models: vec![],
@@ -1700,6 +1935,8 @@ async fn run_cli(cx: Cx) -> Result<()> {
             opened_at: Instant::now(),
             feed: None,
             tx,
+            browse: None,
+            open_browse: false,
         },
         rx,
         start,
@@ -1741,12 +1978,12 @@ mod tests {
         })
         .to_string();
         let remote = Remote::restore(None, &saved, false).unwrap();
-        let credential = keyring::Entry::new("venticode-tui-test", "https://workspace.example")
-            .expect("keyring entry");
+        let store =
+            crate::store::SessionStore::open("venticode-tui-test", "https://workspace.example");
         let (tx, _rx) = mpsc::channel(16);
         App {
             remote,
-            credential,
+            store,
             en: true,
             projects: vec![],
             models: vec![],
@@ -1773,6 +2010,8 @@ mod tests {
             opened_at: Instant::now(),
             feed: None,
             tx,
+            browse: None,
+            open_browse: false,
         }
     }
 

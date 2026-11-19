@@ -44,6 +44,17 @@ test("session, origin and inventory guards", async () => {
     assert.equal(created.status, 201);
     assert.equal(created.value.name, "src");
     assert.equal((await call("/api/v1/venticode/projects", "POST", { harness_id: harness.id, root: harness.roots[0], path: "src" })).status, 409);
+    // Folder browsing endpoint: lists directories, rejects bad roots and traversal.
+    const listing = await call(`/api/v1/venticode/harnesses/${harness.id}/ls?root=${encodeURIComponent(harness.roots[0])}&path=.`);
+    assert.equal(listing.status, 200);
+    assert.ok(listing.value.items.some((entry: any) => entry.name === "src" && entry.directory));
+    assert.equal(listing.value.path, ".");
+    const nested = await call(`/api/v1/venticode/harnesses/${harness.id}/ls?root=${encodeURIComponent(harness.roots[0])}&path=src`);
+    assert.equal(nested.status, 200);
+    assert.ok(nested.value.items.some((entry: any) => entry.name === "server"));
+    assert.equal((await call(`/api/v1/venticode/harnesses/${harness.id}/ls?root=${encodeURIComponent(harness.roots[0])}&path=../etc`)).status, 400);
+    assert.equal((await call(`/api/v1/venticode/harnesses/${harness.id}/ls?root=not-granted&path=.`)).status, 400);
+    assert.equal((await call(`/api/v1/venticode/harnesses/${harness.id}/ls?root=${encodeURIComponent(harness.roots[0])}&path=does-not-exist`)).status, 404);
   } finally { server.closeAllConnections(); server.close(); }
 });
 

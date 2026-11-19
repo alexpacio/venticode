@@ -198,6 +198,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/harnesses/{id}/ls": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a directory inside a granted harness root
+         * @description Read-only directory listing used to browse folders before creating a project. The harness must be online and `root` must be one of its granted roots. `path` is relative to that root; "." is the root itself.
+         */
+        get: operations["listHarnessDirectory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/projects": {
         parameters: {
             query?: never;
@@ -613,6 +635,17 @@ export interface components {
         };
         /** @enum {string} */
         HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
+        DirectoryEntry: {
+            name: string;
+            directory: boolean;
+            symlink: boolean;
+            bytes: number;
+        };
+        DirectoryListing: {
+            items: components["schemas"]["DirectoryEntry"][];
+            /** @description Normalized relative path that was listed */
+            path: string;
+        };
         Harness: {
             /** Format: uuid */
             id: string;
@@ -1231,6 +1264,37 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+        };
+    };
+    listHarnessDirectory: {
+        parameters: {
+            query: {
+                root: string;
+                path?: string;
+            };
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Directory entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryListing"];
+                };
+            };
+            400: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     listProjects: {

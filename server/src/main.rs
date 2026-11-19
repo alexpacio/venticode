@@ -1,4 +1,5 @@
 mod agent;
+mod browse;
 mod browser;
 mod computer;
 mod connections;
@@ -552,6 +553,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/session", get(proxy).delete(proxy))
         .route("/models", get(proxy))
         .route("/harnesses", get(proxy))
+        .route("/harnesses/{id}/ls", get(browse::list))
         .merge(projects::routes())
         .route("/approvals/{id}", post(tools::decide))
         .route(

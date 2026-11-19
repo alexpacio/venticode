@@ -425,7 +425,7 @@ pub(super) async fn decide(
     app.events.notify_stored(conversation);
     Ok(Json(json!({"state":state})))
 }
-async fn relay(app: &App, h: &HeaderMap, mut body: Value) -> Result<Value> {
+pub(super) async fn relay(app: &App, h: &HeaderMap, mut body: Value) -> Result<Value> {
     if let Some(computers) = &app.computers {
         let key = match body["action"].as_str() {
             Some("execute") => body["harness_id"]
