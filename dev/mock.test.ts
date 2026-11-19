@@ -103,3 +103,35 @@ test("bot mentions use @ventic and review once", async () => {
     assert.equal((await call(`/api/v1/venticode/bots/${bot.id}`, "PATCH", { revision: bot.revision, enabled: false })).value.enabled, false);
   } finally { server.closeAllConnections(); server.close(); }
 });
+
+test("a read-only plan and an unanswered goal preserve pending work", async () => {
+  const { server, call } = await start();
+  try {
+    await call("/__dev/login");
+    const base = "/api/v1/venticode/conversations";
+    const project = (await call("/api/v1/venticode/projects")).value.items[0];
+    const chat = (await call(base, "POST", { project_id: project.id })).value;
+    const path = base + "/" + chat.id;
+    const send = (content: string, intent: string, reference_id?: string) =>
+      call(path + "/messages", "POST", { id: randomUUID(), content, intent, reference_id });
+    assert.equal((await send("Inspect README", "plan")).status, 202);
+    await waitFor(async () => (await call(path)).value.state === "idle");
+    const events = (await call(path + "/events")).value.items;
+    const plan = (await call(path)).value.plan_id;
+    assert.ok(plan);
+    assert.ok(events.some((e: any) => e.type === "plan" && e.reference_id === plan));
+    const latest = events.filter((e: any) => e.type === "todo").at(-1);
+    assert.deepEqual(latest.todos.map((t: any) => t.status), ["completed", "pending", "pending"]);
+    assert.equal((await send("Proceed", "implement_plan", randomUUID())).status, 409);
+    assert.equal((await send("Ask a question", "goal")).status, 202);
+    await waitFor(async () => (await call(path)).value.state === "idle");
+    const pending = (await call(path)).value;
+    assert.ok(pending.question_id);
+    assert.ok(pending.goal_id);
+    assert.equal((await send("README", "answer", randomUUID())).status, 409);
+    assert.equal((await call(path + "/goal/" + pending.goal_id, "DELETE")).status, 204);
+    const cancelled = (await call(path)).value;
+    assert.equal(cancelled.goal_id, null);
+    assert.equal(cancelled.question_id, null);
+  } finally { server.closeAllConnections(); server.close(); }
+});

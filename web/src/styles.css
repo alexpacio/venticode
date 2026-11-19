@@ -238,3 +238,6 @@ dialog h2 { margin: 0; font-size: 16px; }
   .topbar, .thread, .composer-wrap, .page { padding-left: 16px; padding-right: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { .spin, .chev, .sidebar { animation: none; transition: none; } }
+
+.agent-controls:not(:empty) { padding: .4rem 1rem; max-height: 25vh; overflow: auto; }
+.agent-controls .btn { margin: .25rem; }

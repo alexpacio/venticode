@@ -88,6 +88,7 @@
   "Recenti": "Recent",
   "Riattiva": "Resume bot",
   "Richiesta di permesso": "Permission request",
+  "Rinomina conversazione": "Rename conversation",
   "Riprova": "Retry",
   "Risposte massime per ora": "Maximum replies per hour",
   "Risposto": "Replied",
@@ -103,6 +104,7 @@
   "Stato": "Status",
   "Strumenti": "Tools",
   "Strumenti MCP": "MCP tools",
+  "Titolo della conversazione": "Conversation title",
   "Trascrizione e output degli strumenti cifrati su S3; indice, approvazioni e consumi su PostgreSQL.": "Transcript and tool output encrypted in S3; index, approvals and usage in PostgreSQL.",
   "Venticode esegue file, comandi, terminali e server MCP sulle tue macchine tramite ventiharness. Abbina una macchina dal portale, poi avvia il demone:": "Venticode runs files, commands, terminals and MCP servers on your machines through ventiharness. Pair a machine from the portal, then start the daemon:",
   "Venticode esegue gli strumenti su {0}, dentro la cartella del progetto.": "Venticode runs tools on {0}, inside the project folder.",
@@ -165,5 +167,11 @@
   "Segreto di firma": "Signing secret",
   "Riga da inviare al terminale": "Line to send to the terminal",
   "Messaggio per l’agente": "Message for the agent",
-  "Chiudi sessione": "Close session"
+  "Chiudi sessione": "Close session",
+  "Obiettivo attivo": "Active goal",
+  "Annulla obiettivo": "Cancel goal",
+  "Implementa il piano approvato": "Implement the approved plan",
+  "Approva ed esegui il piano": "Approve and implement the plan",
+  "Rispondi alla domanda…": "Answer the question…",
+  "Scrivi un messaggio, /goal obiettivo o /plan richiesta…": "Write a message, /goal objective or /plan request…"
 }

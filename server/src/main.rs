@@ -1,4 +1,6 @@
+mod agent;
 mod connections;
+mod history;
 mod mentions;
 mod privacy;
 mod projects;

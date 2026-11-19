@@ -535,6 +535,8 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
             Path(conversation),
             Json(runs::Message {
                 id,
+                intent: Default::default(),
+                reference_id: None,
                 content: field(&content, "text")?.to_owned(),
             }),
         )

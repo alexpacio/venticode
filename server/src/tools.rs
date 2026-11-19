@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::{append_output, tool_content};
 use crate::runs::{append, record, stage};
 use std::time::Duration;
 
@@ -11,26 +12,141 @@ const ACTION: &[&str] = &[
     "mcp_call_tool",
     "preview",
 ];
-pub(super) fn definitions() -> Value {
-    let names: Vec<_> = READ.iter().chain(EDIT).chain(ACTION).collect();
-    json!([{"type":"function","function":{"name":"project_tool","description":"Work on the selected project. Paths are relative to the project. For execute supply command as a string. For a file read or write supply path, plus content for writes. Operations and their exact arguments are reviewed according to project policy.",
-        "parameters":{"type":"object","additionalProperties":false,"required":["operation","arguments"],"properties":{
-        "operation":{"type":"string","enum":names},"arguments":{"type":"object"}}}}},
-      {"type":"function","function":{"name":"update_tasks","description":"Replace the task list displayed in this conversation.","parameters":{"type":"object","additionalProperties":false,"required":["todos"],"properties":{"todos":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,"required":["content","status"],"properties":{"content":{"type":"string","minLength":1,"maxLength":512},"status":{"type":"string","enum":["pending","in_progress","completed"]}}}}}}}}])
+pub(super) fn definitions(mode: &str, bot: Option<&Value>) -> Value {
+    let operations: Vec<_> = READ
+        .iter()
+        .chain(EDIT)
+        .chain(ACTION)
+        .copied()
+        .filter(|op| policy(mode, false, op, bot).is_ok_and(|decision| decision != "deny"))
+        .collect();
+    let mut functions = Vec::new();
+    if !operations.is_empty() {
+        let mut guidance = String::from(
+            "Run one listed operation in the selected project. File paths are relative to the project folder.",
+        );
+        if operations.contains(&"list_files") {
+            guidance.push_str(" To inspect the top level, use list_files with empty arguments. search_files takes query and optional path. read_file takes path and optional start_line/end_line.");
+        }
+        if operations.contains(&"edit_file") {
+            guidance.push_str(" write_file takes path and content. To change existing text use edit_file with path and an edits array of {target, replacement} pairs.");
+        }
+        if operations.contains(&"execute") {
+            guidance.push_str(
+                " execute takes command as a string and an optional working-directory path.",
+            );
+        }
+        functions.push(json!({"type":"function","function":{"name":"project_tool",
+            "description":guidance,
+            "parameters":{"type":"object","additionalProperties":false,"required":["operation","arguments"],"properties":{
+                "operation":{"type":"string","enum":operations},"arguments":{"type":"object"}}}}}));
+    }
+    functions.push(json!({"type":"function","function":{"name":"update_tasks","description":"Replace the task list displayed in this conversation.","parameters":{"type":"object","additionalProperties":false,"required":["todos"],"properties":{"todos":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,"required":["content","status"],"properties":{"content":{"type":"string","minLength":1,"maxLength":512},"status":{"type":"string","enum":["pending","in_progress","completed"]}}}}}}}}));
+    Value::Array(functions)
 }
-fn policy(mode: &str, yolo: bool, op: &str) -> Result<&'static str> {
-    if !READ.contains(&op) && !EDIT.contains(&op) && !ACTION.contains(&op) {
+// Flat schemas let the model generate a path or edit without a second, untyped arguments object.
+const FILE_FUNCTIONS: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "read",
+        "read_file",
+        "Read a UTF-8 project file before editing it.",
+        &["path"],
+    ),
+    (
+        "write",
+        "write_file",
+        "Create a project file with the supplied contents.",
+        &["path", "content"],
+    ),
+    (
+        "edit",
+        "edit_file",
+        "Replace one unique exact piece of text. Read the original file first.",
+        &["path", "oldText", "newText"],
+    ),
+    (
+        "ls",
+        "list_files",
+        "List entries under a project-relative directory. Omit path for the project root.",
+        &[],
+    ),
+    (
+        "grep",
+        "search_files",
+        "Find occurrences of query in project files.",
+        &["query"],
+    ),
+    (
+        "bash",
+        "execute",
+        "Execute a command with the project host's native shell and return its actual output and exit status.",
+        &["command"],
+    ),
+];
+
+pub(super) fn file_functions(defs: &mut Value, mode: &str) {
+    for &(name, op, description, required) in FILE_FUNCTIONS {
+        if policy(mode, false, op, None).is_ok_and(|p| p != "deny") {
+            let mut properties = json!({});
+            for key in required {
+                properties[*key] = json!({"type":"string"});
+            }
+            if matches!(name, "ls" | "grep" | "bash") {
+                properties["path"] = json!({"type":"string"});
+            }
+            defs.as_array_mut().unwrap().push(json!({"type":"function","function":{"name":name,"description":description,
+                "parameters":{"type":"object","additionalProperties":false,"properties":properties,"required":required}}}));
+        }
+    }
+}
+fn project_arguments(name: &str, body: Value) -> Result<Value> {
+    if name == "project_tool" {
+        return Ok(body);
+    }
+    let (_, op, _, required) = FILE_FUNCTIONS
+        .iter()
+        .find(|f| f.0 == name)
+        .ok_or_else(bad)?;
+    if !body.is_object() || required.iter().any(|k| !body[*k].is_string()) {
         return Err(bad());
     }
-    Ok(if READ.contains(&op) {
-        "allow"
-    } else if mode == "plan" {
-        "deny"
-    } else if yolo || mode == "auto_edit" && EDIT.contains(&op) {
-        "allow"
+    let args = if name == "edit" {
+        json!({"path":body["path"],"edits":[{"target":body["oldText"],"replacement":body["newText"]}]})
     } else {
-        "ask"
-    })
+        body
+    };
+    Ok(json!({"operation":op,"arguments":args}))
+}
+fn policy(mode: &str, yolo: bool, op: &str, bot: Option<&Value>) -> Result<&'static str> {
+    let category = if READ.contains(&op) {
+        "read"
+    } else if EDIT.contains(&op) {
+        "write"
+    } else if op == "mcp_call_tool" {
+        "mcp"
+    } else if ACTION.contains(&op) {
+        "execute"
+    } else {
+        return Err(bad());
+    };
+    if mode == "plan" && category != "read" {
+        return Ok("deny");
+    }
+    if let Some(cfg) = bot {
+        return Ok(match (category, cfg["tools"][category].as_str()) {
+            _ if matches!(op, "terminal_start" | "agent_start") => "deny",
+            (_, Some("off") | None) => "deny",
+            ("read", Some("auto")) => "allow",
+            _ => "ask",
+        });
+    }
+    Ok(
+        if category == "read" || yolo || mode == "auto_edit" && category == "write" {
+            "allow"
+        } else {
+            "ask"
+        },
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -178,9 +294,7 @@ pub(super) async fn call(
         record(app, id, run, json!({"type":"todo","todos":todos})).await?;
         return Ok("Task list updated".into());
     }
-    if name != "project_tool" {
-        return Err(bad());
-    }
+    let body = project_arguments(name, body)?;
     let op = body["operation"].as_str().ok_or_else(bad)?;
     let args = &body["arguments"];
     if !args.is_object() {
@@ -190,31 +304,13 @@ pub(super) async fn call(
     let c = projects::owned(app, &member, id).await?;
     let harness = member.harness(c.get("harness_id"), c.get("root"))?;
     let project: Uuid = c.get("project_id");
-    let mut decision = policy(
+    let bot = crate::mentions::bot_context(app, id).await?;
+    let decision = policy(
         c.get("permission_mode"),
         harness["owned"] == true && harness["mode"] == "yolo",
         op,
+        bot.as_ref(),
     )?;
-    let bot = crate::mentions::bot_context(app, id).await?;
-    if let Some(cfg) = &bot
-        && decision != "deny"
-    {
-        let category = if READ.contains(&op) {
-            "read"
-        } else if EDIT.contains(&op) {
-            "write"
-        } else if op == "mcp_call_tool" {
-            "mcp"
-        } else {
-            "execute"
-        };
-        decision = match (category, cfg["tools"][category].as_str()) {
-            _ if matches!(op, "terminal_start" | "agent_start") => "deny",
-            (_, Some("off") | None) => "deny",
-            ("read", Some("auto")) => "allow",
-            _ => "ask",
-        };
-    }
     let call = Uuid::new_v4();
     let target = args.to_string();
     record(
@@ -291,6 +387,7 @@ pub(super) async fn call(
     let mut cursor = 0;
     let mut result = String::new();
     let mut failed = false;
+    let mut requires_upgrade = false;
     let mut diff = Value::Null;
     loop {
         let frame = relay(
@@ -306,6 +403,10 @@ pub(super) async fn call(
                 continue;
             }
             let mut payload = e["result"].clone();
+            requires_upgrade |=
+                payload["type"] == "error" && payload["error"] == "Unsupported harness operation";
+            failed |= payload["type"] == "error"
+                || (payload["type"] == "exit" && payload["code"].as_i64() != Some(0));
             if matches!(op, "edit_file" | "write_file")
                 && let Some(patch) = payload.as_object_mut().and_then(|p| p.remove("diff"))
                 && patch["path"] == args["path"]
@@ -359,42 +460,83 @@ pub(super) async fn call(
                 json!({"type":"tool_output","call_id":call,"stream":stream,"data":data}),
             )
             .await?;
-            if result.len() < 65536 {
-                result.extend(data.chars().take(65536 - result.len()));
-            }
+            append_output(&mut result, &data);
         }
         cursor = frame["after"].as_i64().ok_or_else(unavailable)?;
         if !matches!(frame["state"].as_str(), Some("pending" | "sent")) && entries.len() < 32 {
-            let status = if !failed && frame["state"] == "done" {
-                "ok"
+            let done = frame["state"] == "done";
+            let (status, summary) = if requires_upgrade {
+                (
+                    "error",
+                    "Aggiorna e riavvia ventiharness per usare gli strumenti di progetto / Update and restart ventiharness to use project tools",
+                )
+            } else if !done {
+                (
+                    "error",
+                    "Esito non confermato. Verifica il progetto prima di riprovare / Outcome unconfirmed. Verify the project before retrying",
+                )
+            } else if failed {
+                (
+                    "error",
+                    "Operazione non riuscita. Verifica il progetto prima di riprovare / Operation failed. Verify the project before retrying",
+                )
             } else {
-                "error"
+                ("ok", "Operazione completata / Operation completed")
             };
-            let mut event = json!({"type":"tool_result","call_id":call,"status":status,"summary":frame["state"]});
+            let mut event =
+                json!({"type":"tool_result","call_id":call,"status":status,"summary":summary});
             if status == "ok" && !diff.is_null() {
                 event["diff"] = diff;
             }
             record(app, id, run, event).await?;
             cancel.request = None;
-            if status != "ok" {
-                return Err(unavailable());
+            if requires_upgrade {
+                return Err(Error(StatusCode::CONFLICT, summary.into()));
             }
-            break;
+            if !done {
+                return Err(Error(StatusCode::SERVICE_UNAVAILABLE, summary.into()));
+            }
+            return Ok(tool_content(status, summary, &result));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn schemas_only_offer_available_operations() {
+        let plan = definitions("plan", None);
+        let operations = |schema: &Value| {
+            schema[0]["function"]["parameters"]["properties"]["operation"]["enum"].clone()
+        };
+        assert_eq!(operations(&plan), json!(READ));
+        let bot = json!({"tools":{"write":"review","execute":"review"}});
+        let available = operations(&definitions("ask", Some(&bot)));
+        let available = available.as_array().unwrap();
+        assert!(available.contains(&json!("write_file")));
+        for excluded in [
+            "read_file",
+            "terminal_start",
+            "agent_start",
+            "mcp_call_tool",
+        ] {
+            assert!(!available.contains(&json!(excluded)));
+        }
+        let tasks_only = definitions("plan", Some(&bot));
+        assert_eq!(tasks_only.as_array().unwrap().len(), 1);
+        assert_eq!(tasks_only[0]["function"]["name"], "update_tasks");
+    }
+    #[test]
     fn plan_is_read_only_even_on_owned_yolo() {
-        assert_eq!(policy("plan", true, "execute").ok(), Some("deny"));
-        assert_eq!(policy("plan", false, "read_file").ok(), Some("allow"));
-        assert_eq!(policy("auto_edit", false, "execute").ok(), Some("ask"));
-        assert_eq!(policy("ask", false, "write_file").ok(), Some("ask"));
-        assert!(policy("ask", true, "unknown").is_err());
+        assert_eq!(policy("plan", true, "execute", None).ok(), Some("deny"));
+        assert_eq!(policy("plan", false, "read_file", None).ok(), Some("allow"));
+        assert_eq!(
+            policy("auto_edit", false, "execute", None).ok(),
+            Some("ask")
+        );
+        assert_eq!(policy("ask", false, "write_file", None).ok(), Some("ask"));
+        assert!(policy("ask", true, "unknown", None).is_err());
     }
 }

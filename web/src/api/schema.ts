@@ -223,6 +223,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/conversations/{id}/goal/{goal_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+                goal_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Cancel the active goal while the conversation is idle */
+        delete: operations["cancelGoal"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/conversations/{id}/interrupt": {
         parameters: {
             query?: never;
@@ -525,6 +545,12 @@ export interface components {
             /** Format: uuid */
             id: string;
             /** Format: uuid */
+            goal_id?: string | null;
+            /** Format: uuid */
+            question_id?: string | null;
+            /** Format: uuid */
+            plan_id?: string | null;
+            /** Format: uuid */
             project_id: string;
             /** Format: uuid */
             harness_id: string;
@@ -571,7 +597,7 @@ export interface components {
         Event: {
             sequence: number;
             /** @enum {string} */
-            type: "user_message" | "text" | "tool_call" | "tool_output" | "tool_result" | "approval" | "todo" | "run" | "error";
+            type: "user_message" | "text" | "tool_call" | "tool_output" | "tool_result" | "approval" | "todo" | "run" | "error" | "question" | "plan" | "goal_completed" | "goal_cancelled";
             /** Format: date-time */
             created_at: string;
             /**
@@ -581,6 +607,11 @@ export interface components {
             message_id?: string;
             /** @description user_message: full text */
             content?: string;
+            /** @enum {string} */
+            intent?: "message" | "goal" | "plan" | "answer" | "implement_plan";
+            /** Format: uuid */
+            reference_id?: string;
+            options?: string[];
             /** @description text: appended to the assistant message with the same message_id */
             delta?: string;
             /**
@@ -1169,6 +1200,16 @@ export interface operations {
                     /** Format: uuid */
                     id: string;
                     content: string;
+                    /**
+                     * @default message
+                     * @enum {string}
+                     */
+                    intent?: "message" | "goal" | "plan" | "answer" | "implement_plan";
+                    /**
+                     * Format: uuid
+                     * @description Required for answer and implement_plan
+                     */
+                    reference_id?: string;
                 };
             };
         };
@@ -1190,6 +1231,31 @@ export interface operations {
             400: components["responses"]["Error"];
             409: components["responses"]["Error"];
             423: components["responses"]["Error"];
+        };
+    };
+    cancelGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+                goal_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Goal cancelled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: components["responses"]["Error"];
         };
     };
     interruptRun: {

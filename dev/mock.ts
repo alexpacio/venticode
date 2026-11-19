@@ -163,17 +163,27 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       await say(answer, `Risposta sintetica (nessun modello reale). Esploro ${project.root}/${project.path === "." ? "" : project.path} su ${harness.name}.\n\n`);
       await tool("list_files", ".", false, { status: "ok", summary: "14 voci" });
       await tool("read_file", "README.md", false, { status: "ok", summary: "120 righe" });
-      if (mode === "plan") {
-        await say(answer, "Modalità piano: propongo di aggiornare README.md e aggiungere un test. Nessuna modifica eseguita.");
+      todos[0].status = "completed";
+      if (/\b(domanda|question)\b/i.test(content)) {
+        conversation.question_id=randomUUID();
+        push(conversation.id,{type:"question",reference_id:conversation.question_id,content:"Quale file devo aggiornare?",options:["README.md","CONTRIBUTING.md"]});
+      } else if (mode === "plan") {
+        conversation.plan_id=randomUUID();
+        push(conversation.id,{type:"plan",reference_id:conversation.plan_id,content:"Aggiornare README.md e verificare con i test."});
       } else {
         progress(1);
         const edited = await tool("edit_file", "README.md", mode === "ask" && !yolo, { status: "ok", summary: "+2 −1", diff: { path: "README.md", additions: 2, deletions: 1,
           patch: `@@ -1,3 +1,4 @@\n # ${project.name}\n-Draft notes.\n+${content.slice(0, 60).replace(/\n/g, " ")}\n+See CONTRIBUTING.md before opening a merge request.\n ` } });
         progress(2);
         const ran = await tool("execute", "npm test", !yolo, { status: "ok", summary: "exit 0 · 3 s" }, ["> test", "> node --test", "✔ 12 tests passed"]);
+        todos[1].status = edited ? "completed" : "pending";
+        todos[2].status = ran ? "completed" : "pending";
+        if (edited && ran && conversation.goal_id) {
+          push(conversation.id,{type:"goal_completed",reference_id:conversation.goal_id,content:"README aggiornato e test superati."});
+          conversation.goal_id=null;
+        }
         await say(answer, edited && ran ? "Fatto: README aggiornato e test superati." : "Mi fermo qui: alcune operazioni sono state negate. Dimmi come procedere.");
       }
-      todos.forEach((t) => { t.status = "completed"; });
       push(conversation.id, { type: "todo", todos });
       setState(conversation, "idle", { run_id: runId, usage: { input_tokens: 18420, output_tokens: 640, context_ratio: 0.12 } });
     } catch {
@@ -252,6 +262,13 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       Object.assign(conversation, { created_at: now(), updated_at: now(), model: body.model || "opus-5.5", permission_mode: body.permission_mode || "ask" });
       return ok(conversation, 201);
     }
+    if ((m = p.match(/^\/conversations\/([^/]+)\/goal\/([^/]+)$/)) && method==="DELETE") {
+      const c=conversations.find(c=>c.id===m![1]);
+      if(!c)return fail(404,"Not found");
+      if(runs.has(c.id)||c.goal_id!==m[2])return fail(409,"Conflict");
+      push(c.id,{type:"goal_cancelled",reference_id:c.goal_id}); c.goal_id=null; c.question_id=null; c.plan_id=null; c.revision++;
+      return ok(null,204);
+    }
     if ((m = p.match(/^\/conversations\/([^/]+)(\/[a-z]+)?$/))) {
       const conversation = conversations.find((c) => c.id === m![1]);
       if (!conversation) return fail(404, "Conversazione non trovata / Conversation not found");
@@ -286,15 +303,24 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (action === "/stream" && method === "GET") return { stream: conversation.id };
       if (action === "/messages" && method === "POST") {
         if (!isUuid(body.id) || typeof body.content !== "string" || !body.content.trim() || body.content.length > 100000) return fail(400, "Messaggio non valido / Invalid message");
+        const intent=body.intent ?? "message";
+        if(!["message","goal","answer","plan","implement_plan"].includes(intent) || (["answer","implement_plan"].includes(intent) !== isUuid(body.reference_id)))return fail(400,"Invalid intent");
+        const fingerprint=JSON.stringify([body.content,intent,body.reference_id??null]);
         const previous = messageIds.get(body.id);
-        if (previous) return previous.conversation === conversation.id && previous.content === body.content ? ok(previous.result, 202) : fail(409, "Id messaggio già usato / Message id already used");
+        if (previous) return previous.conversation === conversation.id && previous.content === fingerprint ? ok(previous.result, 202) : fail(409, "Id messaggio già usato / Message id already used");
         const harness = harnesses.find((h) => h.id === conversation.harness_id);
         if (!harness?.online) return fail(423, "Harness offline");
         if (runs.has(conversation.id)) return fail(409, "Un'esecuzione è già in corso / A run is already active");
+        if((conversation.question_id && intent!=="answer") || (intent==="answer" && conversation.question_id!==body.reference_id) ||
+           (intent==="implement_plan" && (conversation.plan_id!==body.reference_id || conversation.permission_mode!=="plan")) || (intent==="goal" && conversation.goal_id))return fail(409,"Conflict");
+        if(intent==="goal")conversation.goal_id=body.id;
+        if(intent==="plan")conversation.permission_mode="plan";
+        if(intent==="implement_plan")conversation.permission_mode="ask";
+        conversation.plan_id=null;conversation.question_id=null;conversation.revision++;
         const result = { run_id: randomUUID(), message_id: body.id };
-        messageIds.set(body.id, { conversation: conversation.id, content: body.content, result });
+        messageIds.set(body.id, { conversation: conversation.id, content: fingerprint, result });
         if (conversation.title === "Nuova conversazione") { conversation.title = body.content.trim().split("\n")[0].slice(0, 60); conversation.revision++; }
-        push(conversation.id, { type: "user_message", message_id: body.id, content: body.content });
+        push(conversation.id, { type: "user_message", message_id: body.id, content: body.content, intent, reference_id:body.reference_id });
         const controller = new AbortController();
         runs.set(conversation.id, controller);
         void run(conversation, result.run_id, body.content, controller.signal);

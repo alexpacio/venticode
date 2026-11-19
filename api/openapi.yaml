@@ -336,6 +336,8 @@ paths:
               properties:
                 id: { type: string, format: uuid }
                 content: { type: string, minLength: 1, maxLength: 100000 }
+                intent: { type: string, enum: [message, goal, plan, answer, implement_plan], default: message }
+                reference_id: { type: string, format: uuid, description: Required for answer and implement_plan }
       responses:
         '202':
           description: Run started
@@ -351,6 +353,18 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
         '423': { $ref: '#/components/responses/Error' }
+  /conversations/{id}/goal/{goal_id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - { name: goal_id, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      operationId: cancelGoal
+      summary: Cancel the active goal while the conversation is idle
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      responses:
+        '204': { description: Goal cancelled }
+        '409': { $ref: '#/components/responses/Error' }
   /conversations/{id}/interrupt:
     parameters:
       - $ref: '#/components/parameters/Id'
@@ -768,6 +782,9 @@ components:
       required: [id, project_id, harness_id, title, model, permission_mode, state, revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
+        goal_id: { type: [string, "null"], format: uuid }
+        question_id: { type: [string, "null"], format: uuid }
+        plan_id: { type: [string, "null"], format: uuid }
         project_id: { type: string, format: uuid }
         harness_id: { type: string, format: uuid }
         title: { type: string }
@@ -824,10 +841,13 @@ components:
       required: [sequence, type, created_at]
       properties:
         sequence: { type: integer, minimum: 1 }
-        type: { type: string, enum: [user_message, text, tool_call, tool_output, tool_result, approval, todo, run, error] }
+        type: { type: string, enum: [user_message, text, tool_call, tool_output, tool_result, approval, todo, run, error, question, plan, goal_completed, goal_cancelled] }
         created_at: { type: string, format: date-time }
         message_id: { type: string, format: uuid, description: 'user_message, text' }
         content: { type: string, description: 'user_message: full text' }
+        intent: { type: string, enum: [message, goal, plan, answer, implement_plan] }
+        reference_id: { type: string, format: uuid }
+        options: { type: array, items: { type: string } }
         delta: { type: string, description: 'text: appended to the assistant message with the same message_id' }
         call_id: { type: string, format: uuid, description: 'tool_call, tool_output, tool_result, approval' }
         operation: { $ref: '#/components/schemas/HarnessOperation' }

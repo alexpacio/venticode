@@ -239,7 +239,7 @@ async fn update(
         model(&app, &h, Some(name)).await?;
     }
     let mut tx = app.db.begin().await?;
-    let result=sqlx::query("UPDATE conversations SET title=COALESCE($3,title),model=COALESCE($4,model),permission_mode=COALESCE($5,permission_mode),revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$2 AND active_run IS NULL")
+    let result=sqlx::query("UPDATE conversations SET title=COALESCE($3,title),model=COALESCE($4,model),plan_id=CASE WHEN $5 IS NOT NULL AND $5!=permission_mode THEN NULL ELSE plan_id END,permission_mode=COALESCE($5,permission_mode),revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$2 AND active_run IS NULL")
         .bind(id).bind(body.revision).bind(body.title.as_deref().map(str::trim)).bind(body.model).bind(body.permission_mode).execute(&mut *tx).await?;
     if result.rows_affected() != 1 {
         return Err(conflict());

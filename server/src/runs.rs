@@ -1,11 +1,15 @@
 use super::*;
 use axum::response::sse::{Event, Sse};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use std::{convert::Infallible, time::Duration};
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
         .route("/conversations/{id}/messages", post(send))
+        .route(
+            "/conversations/{id}/goal/{goal}",
+            delete(crate::agent::cancel_goal),
+        )
         .route("/conversations/{id}/interrupt", post(interrupt))
         .route("/conversations/{id}/events", get(events))
         .route("/conversations/{id}/stream", get(stream))
@@ -16,6 +20,19 @@ type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 pub(super) struct Message {
     pub id: Uuid,
     pub content: String,
+    #[serde(default)]
+    pub intent: Intent,
+    pub reference_id: Option<Uuid>,
+}
+#[derive(Clone, Copy, Default, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Intent {
+    #[default]
+    Message,
+    Goal,
+    Plan,
+    Answer,
+    ImplementPlan,
 }
 #[derive(Deserialize)]
 struct Cursor {
@@ -68,20 +85,22 @@ pub(super) async fn record(app: &App, id: Uuid, run: Uuid, event: Value) -> Resu
 pub(super) async fn read_events(app: &App, id: Uuid, after: i64, limit: i64) -> Result<Vec<Value>> {
     let rows=sqlx::query("SELECT sequence,object_id FROM events WHERE conversation_id=$1 AND sequence>$2 ORDER BY sequence LIMIT $3")
         .bind(id).bind(after).bind(limit).fetch_all(&app.db).await?;
-    let mut events = Vec::new();
-    for row in rows {
-        let mut event = app.storage.get(row.get("object_id")).await?;
-        // Exports read the complete encrypted object. Bound patches sent during replay.
-        if let Some(patch) = event.pointer_mut("/diff/patch")
-            && let Some(full) = patch.as_str()
-            && full.len() > 65536
-        {
-            *patch = json!(&full[..full.floor_char_boundary(65536)]);
-        }
-        event["sequence"] = json!(row.get::<i64, _>("sequence"));
-        events.push(event);
-    }
-    Ok(events)
+    futures_util::stream::iter(rows)
+        .map(|row| async move {
+            let mut event = app.storage.get(row.get("object_id")).await?;
+            // Exports read the complete encrypted object. Bound patches sent during replay.
+            if let Some(patch) = event.pointer_mut("/diff/patch")
+                && let Some(full) = patch.as_str()
+                && full.len() > 65536
+            {
+                *patch = json!(&full[..full.floor_char_boundary(65536)]);
+            }
+            event["sequence"] = json!(row.get::<i64, _>("sequence"));
+            Ok(event)
+        })
+        .buffered(8)
+        .try_collect()
+        .await
 }
 async fn events(
     State(app): State<App>,
@@ -153,7 +172,19 @@ pub(super) async fn send(
     if body.content.trim().is_empty() || body.content.chars().count() > 100000 {
         return Err(bad());
     }
-    let fingerprint = app.storage.fingerprint(&body.content);
+    if matches!(body.intent, Intent::Answer | Intent::ImplementPlan) != body.reference_id.is_some()
+    {
+        return Err(bad());
+    }
+    let fingerprint = if body.intent == Intent::Message {
+        app.storage.fingerprint(&body.content)
+    } else {
+        format!(
+            "agent-{}",
+            app.storage
+                .fingerprint(&json!([body.intent, body.reference_id, body.content]).to_string())
+        )
+    };
     let run = Uuid::new_v4();
     let existing = |row: sqlx::postgres::PgRow| {
         if row.get::<Uuid, _>("conversation_id") != id
@@ -177,16 +208,37 @@ pub(super) async fn send(
     {
         return existing(old);
     }
+    // Reject stale controls before staging encrypted content. The UPDATE repeats the
+    // checks under the row lock for concurrent senders.
+    let state = row.get::<Value, _>("document");
+    let reference = json!(body.reference_id);
+    if (state["question_id"].is_string() && body.intent != Intent::Answer)
+        || (body.intent == Intent::Answer && state["question_id"] != reference)
+        || (body.intent == Intent::ImplementPlan
+            && (state["plan_id"] != reference || state["permission_mode"] != "plan"))
+        || (body.intent == Intent::Goal && state["goal_id"].is_string())
+    {
+        return Err(conflict());
+    }
+    if body.intent == Intent::Goal {
+        let model = row.get::<&str, _>("model");
+        let catalog = app.control_json(&h, "models").await?;
+        if !catalog["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|v| v["id"] == model && v["tools"] == true))
+        {
+            return Err(Error(StatusCode::UNPROCESSABLE_ENTITY,"Scegli un modello con strumenti per avviare un obiettivo / Choose a tool-capable model to start a goal".into()));
+        }
+    }
     let harness = m.harness(row.get("harness_id"), row.get("root"))?;
     if harness["online"] != true {
         return Err(Error(StatusCode::LOCKED, "Harness offline".into()));
     }
-    let text = stage(
-        &app,
-        id,
-        json!({"type":"user_message","message_id":body.id,"content":body.content}),
-    )
-    .await?;
+    let mut message = json!({"type":"user_message","message_id":body.id,"content":body.content,"intent":body.intent});
+    if let Some(reference) = body.reference_id {
+        message["reference_id"] = json!(reference);
+    }
+    let text = stage(&app, id, message).await?;
     let started = stage(
         &app,
         id,
@@ -206,8 +258,14 @@ pub(super) async fn send(
                 .await?,
         );
     }
-    let updated=sqlx::query("UPDATE conversations SET state='running',active_run=$2,lease_until=now()+interval '90 seconds',updated_at=now()
-        WHERE id=$1 AND active_run IS NULL RETURNING model").bind(id).bind(run).fetch_optional(&mut *tx).await?.ok_or_else(conflict)?;
+    let updated=sqlx::query("UPDATE conversations SET state='running',active_run=$2,lease_until=now()+interval '90 seconds',updated_at=now(),
+        permission_mode=CASE $3 WHEN 'plan' THEN 'plan' WHEN 'implement_plan' THEN 'ask' ELSE permission_mode END,
+        question_id=NULL, plan_id=NULL, goal_id=CASE WHEN $3='goal' THEN $5 ELSE goal_id END,revision=revision+1
+        WHERE id=$1 AND active_run IS NULL AND (question_id IS NULL OR $3='answer')
+          AND ($3!='answer' OR question_id=$4) AND ($3!='implement_plan' OR (permission_mode='plan' AND plan_id=$4))
+          AND ($3!='goal' OR goal_id IS NULL) RETURNING model")
+        .bind(id).bind(run).bind(serde_json::to_value(body.intent).map_err(|_|bad())?.as_str()).bind(body.reference_id).bind(body.id)
+        .fetch_optional(&mut *tx).await?.ok_or_else(conflict)?;
     append(&mut tx, id, text).await?;
     append(&mut tx, id, started).await?;
     tx.commit().await?;
@@ -268,21 +326,23 @@ async fn interrupt(
 }
 
 async fn work(app: App, h: HeaderMap, id: Uuid, run: Uuid, model: String) {
-    let response = generate(&app, &h, id, run, model);
-    tokio::pin!(response);
-    let outcome = loop {
-        tokio::select! {
-            done=&mut response=>break done,
-            _=tokio::time::sleep(Duration::from_secs(1))=>{
-                let check=async {
-                    let m=Member::load(&app,&h,false).await?;projects::owned(&app,&m,id).await?;crate::mentions::bot_context(&app,id).await?;
-                    let n=sqlx::query("UPDATE conversations SET lease_until=now()+interval '90 seconds' WHERE id=$1 AND active_run=$2")
-                        .bind(id).bind(run).execute(&app.db).await?;
-                    if n.rows_affected()!=1{return Err(conflict())} Ok(())
-                }.await;
-                if check.is_err(){break check;}
+    // Keep polling inference even when lease renewal waits for a row held by its recorder.
+    let keep_alive = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let member = Member::load(&app, &h, false).await?;
+            projects::owned(&app, &member, id).await?;
+            crate::mentions::bot_context(&app, id).await?;
+            let renewed=sqlx::query("UPDATE conversations SET lease_until=now()+interval '90 seconds' WHERE id=$1 AND active_run=$2 AND lease_until>now()")
+                .bind(id).bind(run).execute(&app.db).await?;
+            if renewed.rows_affected() != 1 {
+                return Err(conflict());
             }
         }
+    };
+    let outcome = tokio::select! {
+        result=generate(&app,&h,id,run,model)=>result,
+        lost=keep_alive=>lost,
     };
     let reason = if outcome.is_ok() {
         Completion::Answered
@@ -295,11 +355,43 @@ async fn work(app: App, h: HeaderMap, id: Uuid, run: Uuid, model: String) {
     let _ = finish(&app, id, run, reason).await;
 }
 
-async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) -> Result<()> {
-    let mut messages: Vec<Value> = Vec::new();
-    if let Some(context) = crate::mentions::bot_context(app, id).await? {
-        messages.push(json!({"role":"system","content":context["instructions"]}));
+fn system_message(mode: &str, use_tools: bool, bot: Option<&Value>) -> Value {
+    let mut prompt = String::from(include_str!("conversation-prompt.txt").trim_end());
+    let guidance = match (use_tools, mode) {
+        (false, _) => {
+            "This model has no tools. Work from the conversation. If you need project contents or test output, ask the user for the specific missing input."
+        }
+        (true, "plan") => {
+            "Plan mode is active. Use the available evidence to propose concrete steps and verification. Leave project changes for an implementation turn."
+        }
+        (true, _) => {
+            "Use the declared tools when the request needs project work. Inspect the relevant files first, preserve existing changes, and verify the requested behavior with a focused check when available."
+        }
+    };
+    prompt.push_str("\n\n");
+    prompt.push_str(guidance);
+    if let Some(extra) = bot
+        .and_then(|b| b["instructions"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        prompt.push_str("\n\nInstructions configured for this bot connection:\n");
+        prompt.push_str(extra);
     }
+    json!({"role":"system","content":prompt})
+}
+
+async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) -> Result<()> {
+    let member = Member::load(app, h, false).await?;
+    let conversation = projects::owned(app, &member, id).await?;
+    let mode = conversation.get::<&str, _>("permission_mode");
+    let catalog = app.control_json(h, "models").await?;
+    let selected = catalog["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|v| v["id"] == model))
+        .ok_or_else(forbidden)?;
+    let use_tools = selected["tools"] == true;
+    let mut history = crate::history::History::default();
     let mut cursor = 0;
     loop {
         let batch = read_events(app, id, cursor, 128).await?;
@@ -308,34 +400,32 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         }
         for e in batch {
             cursor = e["sequence"].as_i64().ok_or_else(unavailable)?;
-            if e["type"] == "user_message" {
-                messages.push(json!({"role":"user","content":e["content"]}));
-            }
-            if e["type"] == "text" {
-                if let Some(last) = messages.last_mut().filter(|v| v["role"] == "assistant") {
-                    last["content"] = json!(format!(
-                        "{}{}",
-                        last["content"].as_str().unwrap_or(""),
-                        e["delta"].as_str().unwrap_or("")
-                    ));
-                } else {
-                    messages.push(json!({"role":"assistant","content":e["delta"]}));
-                }
-            }
+            history.push(e, use_tools);
         }
     }
-    let catalog = app.control_json(h, "models").await?;
-    let selected = catalog["items"]
-        .as_array()
-        .and_then(|items| items.iter().find(|v| v["id"] == model))
-        .ok_or_else(forbidden)?;
-    let use_tools = selected["tools"] == true;
+    let goal = conversation.get::<Value, _>("document")["goal_id"].is_string();
+    let mut messages = history.into_messages();
+    let mut repairs = 0;
+    // Reserve the first message for the current connection instructions on each model call.
+    messages.insert(0, Value::Null);
     for _ in 0..24 {
         let mut calls = std::collections::BTreeMap::<u64, (String, String, String)>::new();
         let mut answer = String::new();
+        let bot = crate::mentions::bot_context(app, id).await?;
+        messages[0] = system_message(mode, use_tools, bot.as_ref());
+        if goal && bot.is_none() && use_tools && mode != "plan" {
+            let instruction = messages[0]["content"].as_str().unwrap_or_default();
+            messages[0]["content"] = json!(format!(
+                "{instruction}\nAn explicit user goal is active. Continue until you verify its acceptance criteria, then call complete_goal. If blocked by a missing decision, call ask_question."
+            ));
+        }
         let mut request = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
         if use_tools {
-            request["tools"] = tools::definitions();
+            request["tools"] = tools::definitions(mode, bot.as_ref());
+            if bot.is_none() {
+                tools::file_functions(&mut request["tools"], mode);
+                crate::agent::actions(&mut request["tools"], mode, goal);
+            }
             request["parallel_tool_calls"] = json!(false);
         }
         let res = app
@@ -358,6 +448,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         let mut stream = sse_stream::SseByteStream::new(res.bytes_stream());
         let msg = Uuid::new_v4();
         let mut done = false;
+        let mut truncated = false;
         while let Some(event) = stream.next().await {
             let Some(data) = event.map_err(|_| unavailable())?.data else {
                 continue;
@@ -370,6 +461,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
             if v.get("error").is_some() {
                 return Err(unavailable());
             }
+            truncated |= v["choices"][0]["finish_reason"] == "length";
             if let (Some(input), Some(output)) = (
                 v["usage"]["prompt_tokens"].as_u64(),
                 v["usage"]["completion_tokens"].as_u64(),
@@ -411,11 +503,59 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         if !done {
             return Err(unavailable());
         }
-        if calls.is_empty() {
+        if calls.is_empty() && !truncated {
+            if bot.is_none() && mode == "plan" && !answer.trim().is_empty() {
+                return crate::agent::checkpoint(app, id, run, "plan", &json!({"content":answer}))
+                    .await;
+            }
+            if goal && use_tools && bot.is_none() {
+                messages.push(json!({"role":"assistant","content":answer}));
+                messages.push(json!({"role":"user","content":"Continue the active goal. Verify its result and call complete_goal, or use ask_question if user input is needed."}));
+                continue;
+            }
             return Ok(());
+        }
+        if truncated
+            || calls.values().any(|(key, name, args)| {
+                key.is_empty()
+                    || name.is_empty()
+                    || serde_json::from_str::<Value>(args).map_or(true, |v| !v.is_object())
+            })
+        {
+            if !calls.is_empty() && repairs < 2 {
+                repairs += 1;
+                messages.push(json!({"role":"user","content":"The previous function request was incomplete or invalid. No operation in that batch was executed. Send one smaller call with complete JSON arguments."}));
+                continue;
+            }
+            return Err(Error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "La risposta del modello era incompleta. Riprova con una richiesta più piccola / The model response was incomplete. Try a smaller request".into(),
+            ));
         }
         if !use_tools {
             return Err(forbidden());
+        }
+        let checkpoint = calls.values().find_map(|(_, name, args)| {
+            let kind = match name.as_str() {
+                "ask_question" => "question",
+                "propose_plan" => "plan",
+                "complete_goal" => "goal_completed",
+                _ => return None,
+            };
+            Some((kind, args))
+        });
+        if let Some((kind, args)) = checkpoint {
+            if bot.is_some() || calls.len() != 1 {
+                return Err(bad());
+            }
+            return crate::agent::checkpoint(
+                app,
+                id,
+                run,
+                kind,
+                &serde_json::from_str(args).map_err(|_| bad())?,
+            )
+            .await;
         }
         let requested:Vec<_>=calls.values().map(|(key,name,args)|json!({"id":key,"type":"function","function":{"name":name,"arguments":args}})).collect();
         messages.push(json!({"role":"assistant","content":answer,"tool_calls":requested}));

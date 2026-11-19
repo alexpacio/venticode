@@ -10,7 +10,9 @@ help:
 	  'make dev        run the synthetic mock API and the web app with HMR' \
 	  'make build      production build of the web app into web/dist' \
 	  'make test       mock, transcript and translation tests' \
-	  'make check      generate, type check, tests and build'
+	  'make check      generate, type check, tests and build' \
+	  'make check-tui  format, lint and test the Rust terminal client' \
+	  'make build-tui-windows  build the Windows x64 binary with the MSVC toolchain'
 
 setup:
 	npm --prefix web ci
@@ -52,3 +54,12 @@ check-service:
 check-connector:
 	mvn -B -f connector/pom.xml package dependency:copy-dependencies
 	python3 connector/tests/transport.py
+
+.PHONY: check-tui build-tui-windows
+check-tui:
+	cargo fmt --manifest-path tui/Cargo.toml --check
+	cargo clippy --manifest-path tui/Cargo.toml --release --locked --all-targets -- -D warnings
+	cargo test --manifest-path tui/Cargo.toml --release --locked
+
+build-tui-windows:
+	cargo build --manifest-path tui/Cargo.toml --release --locked --target x86_64-pc-windows-msvc

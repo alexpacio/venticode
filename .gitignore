@@ -7,3 +7,5 @@ data/
 /target/
 /connector/target/
 __pycache__/
+
+/tui/target/

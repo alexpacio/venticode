@@ -17,14 +17,18 @@ export const useMentions = (id: string) => useQuery({ queryKey: ["mentions", id]
 /** Live transcript: the stream replays from the start, then follows; EventSource resumes with Last-Event-ID. */
 export function useTranscript(id: string) {
   const client = useQueryClient();
-  const [events, setEvents] = useState<TranscriptEvent[]>([]);
+  const [feed, setFeed] = useState<{ id: string; events: TranscriptEvent[] }>({ id, events: [] });
   useEffect(() => {
-    setEvents([]);
+    setFeed({ id, events: [] });
     const source = new EventSource(`${base}/conversations/${id}/stream?after=0`);
     source.addEventListener("transcript", (message) => {
       const event = JSON.parse((message as MessageEvent).data) as TranscriptEvent;
-      setEvents((previous) => (event.sequence > (previous.at(-1)?.sequence ?? 0) ? [...previous, event] : previous));
-      if (event.type === "run" || event.type === "user_message") {
+      setFeed((previous) => (
+        previous.id === id && event.sequence > (previous.events.at(-1)?.sequence ?? 0)
+          ? { id, events: [...previous.events, event] }
+          : previous
+      ));
+      if ((event.type === "run" && (event.state !== "running" || !event.usage)) || ["user_message","goal_cancelled","plan","question","goal_completed"].includes(event.type)) {
         void client.invalidateQueries({ queryKey: ["conversations"] });
         void client.invalidateQueries({ queryKey: ["conversation", id] });
       }
@@ -35,7 +39,7 @@ export function useTranscript(id: string) {
     });
     return () => source.close();
   }, [id, client]);
-  return events;
+  return feed.id === id ? feed.events : [];
 }
 
 export const isUnauthorized = (error: unknown) => error instanceof ApiError && error.status === 401;

@@ -1,13 +1,14 @@
-import { useMemo } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { LoaderCircle, Trash2 } from "lucide-react";
+import { LoaderCircle, Pencil, Trash2 } from "lucide-react";
 import { api, ApiError } from "../api/client.ts";
 import type { Conversation, Harness, PermissionMode } from "../api/client.ts";
 import { useConversation, useHarnesses, useModels, useProjects, useTranscript } from "../queries.ts";
 import { fold, type Transcript } from "../transcript.ts";
 import { t } from "../i18n/index.ts";
 import { TranscriptView } from "./TranscriptView.tsx";
+import { AgentControls } from "./AgentControls.tsx";
 import { Composer } from "./Composer.tsx";
 import type { ReactNode } from "react";
 
@@ -17,6 +18,7 @@ export function ConversationView({ menu }: { menu: ReactNode }) {
   const { id = "" } = useParams();
   const conversation = useConversation(id);
   const events = useTranscript(id);
+  const pending = useRef<{ key: string; id: string } | null>(null);
   const transcript = useMemo(() => fold(events), [events]);
   const harness = useHarnesses().data?.find((h) => h.id === conversation.data?.harness_id);
   const project = useProjects().data?.find((p) => p.id === conversation.data?.project_id);
@@ -27,17 +29,32 @@ export function ConversationView({ menu }: { menu: ReactNode }) {
     return <main className="main"><div className="empty" role="status"><LoaderCircle className="spin" aria-hidden="true" /></div></main>;
   const c = conversation.data;
   const running = transcript.running || c.state === "running" || c.state === "waiting";
-  const send = (content: string) => api(`/conversations/${c.id}/messages`, "POST", { id: crypto.randomUUID(), content });
+  const send = async (content: string, intent = "message", reference?: string) => {
+    const key = JSON.stringify([id, content, intent, reference]);
+    const request = pending.current?.key === key ? pending.current : { key, id: crypto.randomUUID() };
+    pending.current = request;
+    const result = await api(`/conversations/${id}/messages`, "POST", {
+      id: request.id, content, ...(intent === "message" ? {} : { intent }), reference_id: reference,
+    });
+    if (pending.current === request) pending.current = null;
+    return result;
+  };
   const stop = () => void api(`/conversations/${c.id}/interrupt`, "POST");
 
   return (
     <>
       <main className="main">
-        <Header conversation={c} harness={harness} projectLabel={project ? (project.path === "." ? project.root : `${project.root}/${project.path}`) : ""} menu={menu} running={running} />
+        <Header key={c.id} conversation={c} harness={harness} projectLabel={project ? (project.path === "." ? project.root : `${project.root}/${project.path}`) : ""} menu={menu} running={running} />
         {transcript.blocks.length === 0
           ? <div className="empty"><h1>{t("Cosa facciamo in {0}?", project?.name || "")}</h1><p>{t("Venticode esegue gli strumenti su {0}, dentro la cartella del progetto.", harness?.name || "")}</p></div>
           : <TranscriptView blocks={transcript.blocks} harness={harness?.name || ""} />}
-        <Composer onSend={async (text) => { await send(text); }} onStop={stop} running={running}
+        <AgentControls key={c.id} c={c} events={events} running={running} send={send} />
+        <Composer key={c.id} placeholder={c.question_id ? t("Rispondi alla domanda…") : t("Scrivi un messaggio, /goal obiettivo o /plan richiesta…")} onSend={async (text) => {
+          if(c.question_id) await send(text,"answer",c.question_id);
+          else if(text.startsWith("/goal ")) await send(text.slice(6).trim(),"goal");
+          else if(text.startsWith("/plan ")) await send(text.slice(6).trim(),"plan");
+          else await send(text);
+        }} onStop={stop} running={running}
           disabled={harness && !harness.online ? t("{0} è offline: avvia ventiharness per continuare.", harness.name) : undefined}
           controls={<ModeSelect conversation={c} />} />
       </main>
@@ -51,6 +68,7 @@ function Header({ conversation, harness, projectLabel, menu, running }: { conver
   const client = useQueryClient();
   const navigate = useNavigate();
   const update = useUpdate(conversation);
+  const [renaming, setRenaming] = useState(false);
   const remove = async () => {
     if (!confirm(t("Eliminare la conversazione “{0}”? Trascrizione e output verranno cancellati.", conversation.title))) return;
     await api(`/conversations/${conversation.id}`, "DELETE");
@@ -71,8 +89,38 @@ function Header({ conversation, harness, projectLabel, menu, running }: { conver
           {models.data?.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
         </select>
       </label>
+      <button className="icon-btn" aria-label={t("Rinomina conversazione")} disabled={running} onClick={() => setRenaming(true)}><Pencil size={16} aria-hidden="true" /></button>
       <button className="icon-btn" aria-label={t("Elimina conversazione")} disabled={running} onClick={() => void remove()}><Trash2 size={16} aria-hidden="true" /></button>
+      {renaming && <RenameDialog title={conversation.title} onClose={() => setRenaming(false)} onSave={(title) => update({ title })} />}
     </header>
+  );
+}
+
+function RenameDialog({ title, onClose, onSave }: { title: string; onClose: () => void; onSave: (title: string) => Promise<boolean> }) {
+  const [saving, setSaving] = useState(false);
+  const save = async (value: string) => {
+    const next = value.trim();
+    if (!next) return;
+    setSaving(true);
+    if (await onSave(next)) onClose();
+    else setSaving(false);
+  };
+  return (
+    <dialog ref={(node) => { if (node && !node.open) node.showModal(); }} onClose={onClose} aria-labelledby="rename-conversation">
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        void save(String(new FormData(event.currentTarget).get("title")));
+      }}>
+        <h2 id="rename-conversation">{t("Rinomina conversazione")}</h2>
+        <label className="field"><span>{t("Titolo della conversazione")}</span>
+          <input className="input" name="title" defaultValue={title} maxLength={200} required />
+        </label>
+        <div className="dialog-actions">
+          <button className="btn" type="button" onClick={onClose}>{t("Annulla")}</button>
+          <button className="btn btn-primary" disabled={saving}>{t("Salva")}</button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -90,14 +138,17 @@ function ModeSelect({ conversation }: { conversation: Conversation }) {
 function useUpdate(conversation: Conversation) {
   const client = useQueryClient();
   return async (change: Partial<Pick<Conversation, "model" | "permission_mode" | "title">>) => {
+    let saved = false;
     try {
       const next = await api<Conversation>(`/conversations/${conversation.id}`, "PATCH", { revision: conversation.revision, ...change });
       client.setQueryData(["conversation", conversation.id], next);
+      saved = true;
     } catch (failure) {
       if (!(failure instanceof ApiError && failure.status === 409)) alert((failure as Error).message);
     }
     void client.invalidateQueries({ queryKey: ["conversation", conversation.id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
+    return saved;
   };
 }
 

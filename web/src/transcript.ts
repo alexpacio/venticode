@@ -79,6 +79,12 @@ export function fold(events: TranscriptEvent[]): Transcript {
         else if (block.status === "waiting") block.status = block.approval.state === "denied" ? "denied" : block.approval.state === "expired" ? "cancelled" : "running";
         break;
       }
+      case "question":
+      case "plan":
+      case "goal_completed":
+        if (event.content && !(blocks.at(-1)?.kind === "text" && (blocks.at(-1) as {content?:string})?.content === event.content))
+          blocks.push({kind:"text",id:String(event.sequence),content:event.content});
+        break;
       case "todo":
         todos = event.todos || [];
         break;
