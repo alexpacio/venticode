@@ -82,13 +82,16 @@ pub(super) async fn handle(
                 .map(|(conversation_id, sequence, object_id)| {
                     let storage = app.storage.clone();
                     async move {
-                        let mut event = storage.get(object_id).await?;
+                        let Some(mut event) = storage.get_optional(object_id).await? else {
+                            return Ok::<_, Error>(None);
+                        };
                         event["conversation_id"] = json!(conversation_id);
                         event["sequence"] = json!(sequence);
-                        Ok::<_, Error>(event)
+                        Ok(Some(event))
                     }
                 })
                 .buffered(8)
+                .try_filter_map(|item| async move { Ok(item) })
                 .try_collect()
                 .await?;
             let mentions: Vec<Value> = futures_util::stream::iter(mention_rows)
@@ -96,23 +99,28 @@ pub(super) async fn handle(
                     |(id, connection_id, state, body_object, reply_object, address)| {
                         let storage = app.storage.clone();
                         async move {
-                            let content = storage.get(body_object).await?;
+                            let Some(content) = storage.get_optional(body_object).await? else {
+                                return Ok::<_, Error>(None);
+                            };
                             let reply = match reply_object {
-                                Some(reply_id) => storage.get(reply_id).await?,
+                                Some(reply_id) => {
+                                    storage.get_optional(reply_id).await?.unwrap_or(Value::Null)
+                                }
                                 None => Value::Null,
                             };
-                            Ok::<_, Error>(json!({
+                            Ok(Some(json!({
                                 "id": id,
                                 "connection_id": connection_id,
                                 "state": state,
                                 "content": content,
                                 "reply": reply,
                                 "address": address
-                            }))
+                            })))
                         }
                     },
                 )
                 .buffered(8)
+                .try_filter_map(|item| async move { Ok(item) })
                 .try_collect()
                 .await?;
             Ok(Json(
@@ -154,7 +162,7 @@ pub(super) async fn handle(
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "UPDATE object_cleanup SET due_at=now() WHERE object_id IN (SELECT object_id FROM stored_objects WHERE workspace=$1 AND owner_id=$2)",
+                "INSERT INTO object_cleanup(object_id,due_at) SELECT object_id,now() FROM stored_objects WHERE workspace=$1 AND owner_id=$2 ON CONFLICT(object_id) DO UPDATE SET due_at=now()",
             )
             .bind(s.workspace)
             .bind(s.user)

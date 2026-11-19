@@ -37,19 +37,22 @@ export function BotView({ menu, admin }: { menu: ReactNode; admin: boolean }) {
   }
   if (!bot.data) return <main className="main"><div className="topbar">{menu}</div><div className="empty" role="status"><LoaderCircle className="spin" aria-hidden="true" /></div></main>;
   const b = bot.data;
-  const update = async (change: Omit<BotUpdate, "revision">) => {
-    if (saving) return;
+  const update = async (change: Omit<BotUpdate, "revision">): Promise<boolean> => {
+    if (saving) return false;
     setSaving(true);
     setError("");
     setSavedNotice(false);
     try {
+      await client.cancelQueries({ queryKey: ["bot", b.id] });
       const next = await api<Bot>(`/bots/${b.id}`, "PATCH", { revision: b.revision, ...change });
       client.setQueryData(["bot", b.id], next);
       void client.invalidateQueries({ queryKey: ["bots"] });
       setSavedNotice(true);
+      return true;
     } catch (failure) {
       setError((failure as Error).message);
       void client.invalidateQueries({ queryKey: ["bot", b.id] });
+      return false;
     } finally {
       setSaving(false);
     }
@@ -114,9 +117,15 @@ export function runtimeLabel(runtime: NonNullable<BotUpdate["runtime"]>) {
 function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {
   const client = useQueryClient();
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const review = async (decision: "approve" | "discard") => {
     setBusy(true);
-    try { await api(`/bots/${bot.id}/mentions/${mention.id}/review`, "POST", { decision }); } catch (failure) { alert((failure as Error).message); }
+    setError("");
+    try {
+      await api(`/bots/${bot.id}/mentions/${mention.id}/review`, "POST", { decision });
+    } catch (failure) {
+      setError((failure as Error).message);
+    }
     await client.invalidateQueries({ queryKey: ["mentions", bot.id] });
     setBusy(false);
   };
@@ -149,12 +158,13 @@ function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {
       )}
       {mention.reply && (
         <div style={{ display: "flex", gap: 10 }}>
-          <span className="brand-mark" aria-hidden="true" style={{ width: 24, height: 24, fontSize: 10, borderRadius: 6 }}>&gt;_</span>
+          <span className="brand-mark" aria-hidden="true" style={{ width: 24, height: 24, fontSize: 10 }}>&gt;_</span>
           <p style={{ margin: 0, color: mention.state === "review" ? "var(--text-2)" : undefined }}>
             {mention.state === "review" && <span className="muted">{t("Bozza: ")}</span>}{mention.reply}
           </p>
         </div>
       )}
+      {error && <p className="error-line" role="alert" style={{ margin: 0 }}>{error}</p>}
       {mention.state === "review" && (
         <div className="approval-actions">
           <button className="btn btn-primary btn-lg" disabled={busy} onClick={() => void review("approve")}>{t("Approva e pubblica")}</button>
@@ -165,13 +175,24 @@ function MentionCard({ bot, mention }: { bot: Bot; mention: Mention }) {
   );
 }
 
-function Settings({ bot, saving, onSave }: { bot: Bot; saving: boolean; onSave: (change: Omit<BotUpdate, "revision">) => Promise<void> }) {
+function Settings({ bot, saving, onSave }: { bot: Bot; saving: boolean; onSave: (change: Omit<BotUpdate, "revision">) => Promise<boolean> }) {
   const [instructions, setInstructions] = useState(bot.instructions);
-  const [rate, setRate] = useState(bot.rate_limit_per_hour);
+  const [rateText, setRateText] = useState(String(bot.rate_limit_per_hour));
+  const [instructionsDirty, setInstructionsDirty] = useState(false);
+  const [rateDirty, setRateDirty] = useState(false);
+
   useEffect(() => {
-    setInstructions(bot.instructions);
-    setRate(bot.rate_limit_per_hour);
-  }, [bot.revision, bot.instructions, bot.rate_limit_per_hour]);
+    if (!instructionsDirty) setInstructions(bot.instructions);
+  }, [bot.instructions, instructionsDirty]);
+
+  useEffect(() => {
+    if (!rateDirty) setRateText(String(bot.rate_limit_per_hour));
+  }, [bot.rate_limit_per_hour, rateDirty]);
+
+  const parsedRate = rateText.trim() === "" ? Number.NaN : Number(rateText);
+  const validRate = Number.isInteger(parsedRate) && parsedRate >= 1 && parsedRate <= 1000;
+  const unchanged = instructions === bot.instructions && validRate && parsedRate === bot.rate_limit_per_hour;
+
   const policies: Array<[keyof Bot["tools"], string]> = [["read", t("Lettura file")], ["write", t("Scrittura file")], ["execute", t("Comandi")], ["mcp", t("Strumenti MCP")]];
   return (
     <>
@@ -202,14 +223,31 @@ function Settings({ bot, saving, onSave }: { bot: Bot; saving: boolean; onSave: 
         ))}
         <span className="muted" style={{ fontSize: 11 }}>{t("Il limite massimo resta quello concesso dall'harness.")}</span>
       </section>
-      <form className="card" onSubmit={(e) => { e.preventDefault(); void onSave({ instructions, rate_limit_per_hour: rate }); }}>
+      <form className="card" onSubmit={(e) => {
+        e.preventDefault();
+        if (!validRate) return;
+        void onSave({ instructions, rate_limit_per_hour: parsedRate }).then((ok) => {
+          if (ok) {
+            setInstructionsDirty(false);
+            setRateDirty(false);
+          }
+        });
+      }}>
         <label className="field"><span>{t("Istruzioni")}</span>
-          <textarea className="textarea" rows={5} maxLength={8000} value={instructions} onChange={(e) => setInstructions(e.target.value)} />
+          <textarea className="textarea" rows={5} maxLength={8000} value={instructions} onChange={(e) => {
+            const next = e.target.value;
+            setInstructions(next);
+            setInstructionsDirty(next !== bot.instructions);
+          }} />
         </label>
         <label className="field"><span>{t("Risposte massime per ora")}</span>
-          <input className="input" type="number" min={1} max={1000} required value={rate} onChange={(e) => setRate(Number(e.target.value))} />
+          <input className="input" type="number" min={1} max={1000} required value={rateText} onChange={(e) => {
+            const next = e.target.value;
+            setRateText(next);
+            setRateDirty(next !== String(bot.rate_limit_per_hour));
+          }} />
         </label>
-        <button className="btn btn-light" disabled={saving || (instructions === bot.instructions && rate === bot.rate_limit_per_hour)}>{t("Salva")}</button>
+        <button className="btn btn-light" disabled={saving || !validRate || unchanged}>{t("Salva")}</button>
       </form>
     </>
   );

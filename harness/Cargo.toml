@@ -12,6 +12,7 @@ ventic-relay = []
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
+cap-std = "=4.0.3"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 hex = "0.4"

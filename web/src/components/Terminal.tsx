@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import init, { render } from "../generated/terminal/venticode_tui_browser.js";
 import type { Conversation, Project } from "../api/client.ts";
 import { t, useLanguage } from "../i18n/index.ts";
@@ -7,6 +7,25 @@ import type { Block } from "../transcript.ts";
 type Cells = [string, string, string][][];
 const empty: Block[] = [];
 let moduleReady: ReturnType<typeof init> | undefined;
+
+function estimateWrappedRows(items: { role: string; text: string }[], width: number, expanded: boolean): number {
+  if (!items.length) return 0;
+  let total = items.length - 1;
+  for (const item of items) {
+    const w = Math.max(1, item.role === "Assistant" ? width : width - 2);
+    const compact = item.role === "Output" && !expanded;
+    let itemRows = 0;
+    for (const raw of item.text.split("\n")) {
+      itemRows += Math.max(1, Math.ceil(raw.length / w));
+      if (compact && itemRows >= 4) {
+        itemRows = 4;
+        break;
+      }
+    }
+    total += itemRows;
+  }
+  return total;
+}
 
 export function Terminal({
   project,
@@ -25,46 +44,58 @@ export function Terminal({
   const [size, setSize] = useState({ width: 80, height: 24 });
   const [ready, setReady] = useState(false);
   const [failure, setFailure] = useState("");
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [offset, setOffset] = useState(0);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const touch = useRef(0);
+  const copyTimer = useRef<number | undefined>(undefined);
+
   useEffect(() => {
     let active = true;
+    setFailure("");
     (moduleReady ??= init())
       .then(() => {
         if (active) setReady(true);
       })
       .catch((e: Error) => {
         moduleReady = undefined;
-        if (active) setFailure(e.message);
+        if (active) setFailure(e.message || String(e));
       });
+    return () => {
+      active = false;
+    };
+  }, [loadAttempt]);
+
+  useEffect(() => {
+    let active = true;
     const resize = () => {
       const el = area.current,
         ruler = measure.current;
       if (!el || !ruler) return;
       const cell = ruler.getBoundingClientRect();
-      if (cell.width && cell.height)
-        setSize({
-          width: Math.max(
-            1,
-            Math.min(240, Math.floor(el.clientWidth / cell.width)),
-          ),
-          height: Math.max(
-            1,
-            Math.min(98, Math.floor(el.clientHeight / cell.height)),
-          ),
-        });
+      if (cell.width && cell.height) {
+        const w = Math.max(1, Math.min(240, Math.floor(el.clientWidth / cell.width)));
+        const h = Math.max(1, Math.min(98, Math.floor(el.clientHeight / cell.height)));
+        setSize((prev) => (prev.width === w && prev.height === h ? prev : { width: w, height: h }));
+      }
     };
     const observer = new ResizeObserver(resize);
-    observer.observe(area.current!);
-    observer.observe(measure.current!);
-    void document.fonts?.ready?.then(() => { if (active) resize(); });
+    if (area.current) observer.observe(area.current);
+    if (measure.current) observer.observe(measure.current);
+    void document.fonts?.ready?.then(() => {
+      if (active) resize();
+    });
     return () => {
       active = false;
       observer.disconnect();
     };
   }, []);
+
+  useEffect(() => () => {
+    if (copyTimer.current !== undefined) window.clearTimeout(copyTimer.current);
+  }, []);
+
   const lines = useMemo(() => {
     const items: { role: string; text: string }[] = [];
     for (const block of blocks) {
@@ -98,6 +129,9 @@ export function Terminal({
           },
         ];
   }, [blocks, notice, language]);
+
+  const hasTools = useMemo(() => blocks.some((b) => b.kind === "tool"), [blocks]);
+
   const lastReply = useMemo(() => {
     for (let i = blocks.length - 1; i >= 0; i--) {
       const b = blocks[i];
@@ -105,15 +139,53 @@ export function Terminal({
     }
     return "";
   }, [blocks]);
+
+  const projectName = project?.name;
+  const chatTitle = chat?.title;
+  const chatState = chat?.state;
+  const chatMode = chat?.permission_mode;
+  const chatModel = chat?.model;
+  const headerPayload = useMemo(
+    () => ({
+      project: projectName ? { name: projectName } : undefined,
+      chat:
+        chatTitle || chatState || chatMode
+          ? { title: chatTitle, state: chatState, permission_mode: chatMode }
+          : undefined,
+      model: chatModel,
+    }),
+    [projectName, chatTitle, chatState, chatMode, chatModel],
+  );
+
+  const estimatedRows = useMemo(
+    () => estimateWrappedRows(lines, size.width, expanded),
+    [lines, size.width, expanded],
+  );
+  const prevMetrics = useRef({ rows: estimatedRows, width: size.width, expanded });
+  const lastRenderedScroll = useRef(0);
+
+  useLayoutEffect(() => {
+    const prev = prevMetrics.current;
+    prevMetrics.current = { rows: estimatedRows, width: size.width, expanded };
+    if (prev.width === size.width && prev.expanded === expanded) {
+      const delta = estimatedRows - prev.rows;
+      if (delta > 0) {
+        setOffset((current) => {
+          if (current <= 0) return 0;
+          const baseScroll = lastRenderedScroll.current > 0 ? lastRenderedScroll.current : current;
+          return Math.min(65535, baseScroll + delta);
+        });
+      }
+    }
+  }, [estimatedRows, size.width, expanded]);
+
   const { frame, renderError } = useMemo(() => {
     if (!ready) return { frame: undefined, renderError: "" };
     try {
       const parsed = JSON.parse(
         render(
           JSON.stringify({
-            project,
-            chat,
-            model: chat?.model,
+            ...headerPayload,
             lines,
             en: language === "en",
             compact_tools: !expanded,
@@ -127,17 +199,43 @@ export function Terminal({
     } catch (err) {
       return { frame: undefined, renderError: (err as Error).message };
     }
-  }, [ready, project, chat, lines, language, expanded, offset, size]);
+  }, [ready, headerPayload, lines, language, expanded, offset, size]);
+
+  useLayoutEffect(() => {
+    if (frame) lastRenderedScroll.current = frame.scroll;
+  }, [frame]);
+
   const move = (n: number) =>
     setOffset(Math.max(0, Math.min(65535, (frame?.scroll ?? 0) + n)));
+  const moveRef = useRef(move);
+  moveRef.current = move;
+
+  useEffect(() => {
+    const el = area.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const linesDelta = e.deltaMode === 1 ? e.deltaY : e.deltaY / 24;
+      const step = Math.sign(linesDelta) * Math.max(1, Math.min(8, Math.round(Math.abs(linesDelta))));
+      moveRef.current(-step);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   const copyLast = async () => {
     if (!lastReply) return;
     try {
       await navigator.clipboard.writeText(lastReply);
+      if (copyTimer.current !== undefined) window.clearTimeout(copyTimer.current);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1800);
+      copyTimer.current = window.setTimeout(() => {
+        copyTimer.current = undefined;
+        setCopied(false);
+      }, 1800);
     } catch { /* clipboard unavailable */ }
   };
+
   const errMsg = failure || renderError;
   return (
     <section className="terminal" aria-label={t("Terminale")}>
@@ -147,12 +245,6 @@ export function Terminal({
         aria-live="off"
         tabIndex={0}
         ref={area}
-        onWheel={(e) => {
-          e.preventDefault();
-          const linesDelta = e.deltaMode === 1 ? e.deltaY : e.deltaY / 24;
-          const step = Math.sign(linesDelta) * Math.max(1, Math.min(8, Math.round(Math.abs(linesDelta))));
-          move(-step);
-        }}
         onTouchStart={(e) => {
           touch.current = e.touches[0].clientY;
         }}
@@ -186,7 +278,14 @@ export function Terminal({
           M
         </span>
         {errMsg ? (
-          <p role="alert">{errMsg}</p>
+          <div role="alert" style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 8 }}>
+            <p style={{ margin: 0 }}>{errMsg}</p>
+            {failure && (
+              <button type="button" className="btn" onClick={() => setLoadAttempt((n) => n + 1)}>
+                {t("Riprova")}
+              </button>
+            )}
+          </div>
         ) : !frame ? (
           t("Caricamento…")
         ) : (
@@ -207,9 +306,9 @@ export function Terminal({
           ))
         )}
       </div>
-      {(blocks.some((b) => b.kind === "tool") || !!frame?.scroll || !!lastReply) && (
+      {(hasTools || !!frame?.scroll || !!lastReply) && (
         <div className="terminal-keys">
-          {blocks.some((b) => b.kind === "tool") && (
+          {hasTools && (
             <button
               type="button"
               aria-pressed={expanded}

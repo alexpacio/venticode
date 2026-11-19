@@ -5,6 +5,7 @@ use sha2::Sha256;
 use sqlx::postgres::PgRow;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
@@ -127,7 +128,8 @@ fn inbound(kind: &str, v: &Value, r: &PgRow) -> Result<Option<Inbound>> {
                 return Ok(None);
             }
             let text = field(m, "text")?.to_owned();
-            let mentioned = text.split_whitespace().any(|v| {
+            let mentioned = text.split_whitespace().any(|raw| {
+                let v = raw.trim_end_matches([',', ':', '.', ';', '?', '!']);
                 v.eq_ignore_ascii_case(&format!("@{identity}"))
                     || v.eq_ignore_ascii_case("@ventic")
                     || v.eq_ignore_ascii_case(&format!("/ventic@{identity}"))
@@ -159,7 +161,7 @@ fn inbound(kind: &str, v: &Value, r: &PgRow) -> Result<Option<Inbound>> {
             let text = field(a, "note")?.to_owned();
             let mentioned = text
                 .split_whitespace()
-                .any(|s| s.trim_end_matches([',', ':']) == "@ventic");
+                .any(|s| s.trim_end_matches([',', ':', '.', ';', '?', '!']) == "@ventic");
             Some(Inbound {
                 delivery: a["id"].as_i64().ok_or_else(bad)?.to_string(),
                 sender: v["user"]["id"].as_i64().ok_or_else(bad)?.to_string(),
@@ -172,12 +174,22 @@ fn inbound(kind: &str, v: &Value, r: &PgRow) -> Result<Option<Inbound>> {
         _ => return Err(missing()),
     })
 }
-async fn reply(app: &App, r: &PgRow, c: &Value, address: &Value, text: &str) -> Result<Value> {
+async fn reply(
+    app: &App,
+    kind: &str,
+    c: &Value,
+    address: &Value,
+    text: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Value> {
     let mut req = address.clone();
-    req["kind"] = json!(r.get::<String, _>("kind"));
+    req["kind"] = json!(kind);
     req["operation"] = json!("reply");
     req["credentials"] = c.clone();
     req["text"] = json!(text);
+    if let Some(key) = idempotency_key {
+        req["idempotency_key"] = json!(key);
+    }
     provider(app, req).await
 }
 pub(super) async fn hook(
@@ -195,7 +207,7 @@ pub(super) async fn hook(
     .await?;
     let w: Uuid = r.get("workspace");
     let trusted = workspace_headers(&app, w)?;
-    if host(&h)? != host(&trusted)? {
+    if !host(&h)?.eq_ignore_ascii_case(host(&trusted)?) {
         return Err(forbidden());
     }
     let c = creds(&app, &trusted, id).await?;
@@ -210,8 +222,11 @@ pub(super) async fn hook(
     let Some(ev) = inbound(&kind, &v, &r)? else {
         return Ok(Json(json!({"ok":true})));
     };
+    let enabled = r.get::<bool, _>("enabled");
     let words: Vec<_> = ev.text.split_whitespace().collect();
-    if let [.., "link", code] = words.as_slice()
+    if enabled
+        && (ev.mentioned || ev.dm)
+        && let [.., "link", code] = words.as_slice()
         && code.len() == 64
     {
         let mut tx = app.db.begin().await?;
@@ -231,13 +246,23 @@ pub(super) async fn hook(
         } else {
             "Codice non valido o scaduto. Genera un nuovo codice in Venticode / Invalid or expired code. Generate a new code in Venticode."
         };
-        if let Err(err) = reply(&app, &r, &c, &ev.address, feedback).await {
-            tracing::warn!(connection_id = %id, status = err.0.as_u16(), "failed to send link feedback reply");
-        }
+        // Send webhook feedback asynchronously so Slack's 3s webhook timeout is never breached.
+        let app_bg = app.clone();
+        let kind_bg = kind.clone();
+        let creds_bg = c;
+        let addr_bg = ev.address;
+        let idem = format!("link-{id}-{}", ev.delivery);
+        app.tasks.spawn(async move {
+            if let Err(err) =
+                reply(&app_bg, &kind_bg, &creds_bg, &addr_bg, feedback, Some(&idem)).await
+            {
+                tracing::warn!(connection_id = %id, status = err.0.as_u16(), "failed to send link feedback reply");
+            }
+        });
         return Ok(Json(json!({"ok":true})));
     }
     let triggers: Value = r.get("triggers");
-    if !r.get::<bool, _>("enabled")
+    if !enabled
         || !(ev.mentioned && triggers["mentions"] == true
             || ev.dm && triggers["direct_messages"] == true)
     {
@@ -251,20 +276,30 @@ pub(super) async fn hook(
     .fetch_optional(&app.db)
     .await?;
     if owner.is_none() {
-        let claim=sqlx::query("INSERT INTO link_notices(connection_id,delivery_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
-            .bind(id).bind(&ev.delivery).execute(&app.db).await?;
+        let claim = sqlx::query(
+            "INSERT INTO link_notices(connection_id,delivery_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(&ev.delivery)
+        .execute(&app.db)
+        .await?;
         if claim.rows_affected() == 1 {
-            reply(
-                &app,
-                &r,
-                &c,
-                &ev.address,
-                &format!(
-                    "Collega il tuo account / Link your account: {}/connections",
-                    origin(&app, &trusted)?
-                ),
-            )
-            .await?;
+            let notice = format!(
+                "Collega il tuo account / Link your account: {}/connections",
+                origin(&app, &trusted)?
+            );
+            let app_bg = app.clone();
+            let kind_bg = kind.clone();
+            let creds_bg = c;
+            let addr_bg = ev.address;
+            let idem = format!("notice-{id}-{}", ev.delivery);
+            app.tasks.spawn(async move {
+                if let Err(err) =
+                    reply(&app_bg, &kind_bg, &creds_bg, &addr_bg, &notice, Some(&idem)).await
+                {
+                    tracing::warn!(connection_id = %id, status = err.0.as_u16(), "failed to send unlinked notice reply");
+                }
+            });
         }
         return Ok(Json(json!({"ok":true})));
     }
@@ -287,7 +322,12 @@ pub(super) async fn hook(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
-    let count:i64=sqlx::query_scalar("SELECT count(*) FROM mentions WHERE connection_id=$1 AND created_at>now()-interval '1 hour'").bind(id).fetch_one(&mut *tx).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mentions WHERE connection_id=$1 AND created_at>now()-interval '1 hour'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     let existing: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT FROM mentions WHERE connection_id=$1 AND delivery_id=$2)",
     )
@@ -389,9 +429,17 @@ async fn review(
         "discard" => "discarded",
         _ => return Err(bad()),
     };
+    // Short transaction: validate ownership and transition state without external HTTP/S3 I/O.
     let mut tx = app.db.begin().await?;
-    let r=sqlx::query(&format!("{SELECT} WHERE m.id=$1 AND connection_id=$2 AND c.workspace=$3 AND owner_id=$4 FOR UPDATE OF m,c"))
-        .bind(mention).bind(id).bind(w).bind(u).fetch_one(&mut *tx).await?;
+    let r = sqlx::query(&format!(
+        "{SELECT} WHERE m.id=$1 AND connection_id=$2 AND c.workspace=$3 AND owner_id=$4 FOR UPDATE OF m,c"
+    ))
+    .bind(mention)
+    .bind(id)
+    .bind(w)
+    .bind(u)
+    .fetch_one(&mut *tx)
+    .await?;
     if r.get::<String, _>("state") != "review"
         || !r.get::<bool, _>("enabled")
         || r.get::<String, _>("status") != "connected"
@@ -408,32 +456,30 @@ async fn review(
     if !owned {
         return Err(forbidden());
     }
-    if let Some(conversation) = r.get::<Option<Uuid>, _>("conversation_id") {
+    let conversation_id: Option<Uuid> = r.get("conversation_id");
+    let kind: String = r.get("kind");
+    let address: Value = r.get("address");
+    let reply_object: Option<Uuid> = r.get("reply_object");
+    if let Some(conversation) = conversation_id {
         projects::owned(&app, &actor, conversation).await?;
     }
-    let payload = if state == "sending" {
-        let c = creds(&app, &h, id).await?;
-        let body = app.storage.get(r.get("reply_object")).await?;
-        Some((c, body))
-    } else {
-        None
-    };
     sqlx::query("UPDATE mentions SET state=$2,lease_until=CASE WHEN $2='sending' THEN now()+interval '2 minutes' ELSE NULL END WHERE id=$1")
         .bind(mention)
         .bind(state)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    if let Some((c, body)) = payload {
-        let result = reply(
-            &app,
-            &r,
-            &c,
-            &r.get("address"),
-            body.as_str().ok_or_else(bad)?,
-        )
+    if state == "sending" {
+        let send_res = async {
+            let c = creds(&app, &h, id).await?;
+            let obj = reply_object.ok_or_else(bad)?;
+            let body = app.storage.get(obj).await?;
+            let text = body.as_str().ok_or_else(bad)?;
+            let idem = format!("mention-{mention}");
+            reply(&app, &kind, &c, &address, text, Some(&idem)).await
+        }
         .await;
-        let (next, remote) = match &result {
+        let (next, remote) = match &send_res {
             Ok(v) => (
                 "replied",
                 v["ts"].as_str().map(str::to_owned).unwrap_or_else(|| {
@@ -449,8 +495,9 @@ async fn review(
                 ("uncertain", String::new())
             }
         };
-        sqlx::query("UPDATE mentions SET state=$2,remote_id=$3,lease_until=NULL,replied_at=CASE WHEN $2='replied' THEN now() END WHERE id=$1 AND state IN ('sending','uncertain')").bind(mention).bind(next).bind(remote).execute(&app.db).await?;
-        result?;
+        sqlx::query("UPDATE mentions SET state=$2,remote_id=$3,lease_until=NULL,replied_at=CASE WHEN $2='replied' THEN now() END WHERE id=$1 AND state IN ('sending','uncertain')")
+            .bind(mention).bind(next).bind(remote).execute(&app.db).await?;
+        send_res?;
     }
     let row = sqlx::query(&format!(
         "SELECT v.*,to_jsonb(v.created_at)#>>'{{}}' AS created FROM ({SELECT}) v WHERE id=$1"
@@ -463,48 +510,75 @@ async fn review(
 
 pub(super) async fn worker(app: App) {
     let mut shutdown = app.shutdown.clone();
-    let mut retries = std::collections::HashMap::<Uuid, u32>::new();
+    let permits = Arc::new(Semaphore::new(8));
     loop {
         if *shutdown.borrow() {
             break;
         }
+        let permit = match tokio::select! {
+            p = permits.clone().acquire_owned() => p,
+            _ = shutdown.changed() => break,
+        } {
+            Ok(p) => p,
+            Err(_) => break,
+        };
         let lease = Uuid::new_v4();
-        let claimed=sqlx::query_scalar::<_,Uuid>("UPDATE mentions SET lease_id=$1, lease_until=now()+interval '2 minutes' WHERE id=(
-            SELECT id FROM mentions WHERE state IN ('pending','answering') AND (lease_until IS NULL OR lease_until<now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id").bind(lease).fetch_optional(&app.db).await;
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE mentions SET lease_id=$1, lease_until=now()+interval '2 minutes' WHERE id=(
+                SELECT m.id FROM mentions m
+                JOIN connections c ON c.id=m.connection_id
+                WHERE m.state IN ('pending','answering')
+                  AND c.enabled AND c.status='connected'
+                  AND (m.lease_until IS NULL OR m.lease_until<now())
+                ORDER BY m.created_at LIMIT 1 FOR UPDATE OF m SKIP LOCKED
+            ) RETURNING id",
+        )
+        .bind(lease)
+        .fetch_optional(&app.db)
+        .await;
         match claimed {
             Ok(Some(id)) => {
-                match process(&app, id, lease).await {
-                    Ok(()) => {
-                        retries.remove(&id);
-                    }
-                    Err(err) => {
+                let app_task = app.clone();
+                app.tasks.spawn(async move {
+                    let _permit = permit;
+                    if let Err(err) = process(&app_task, id, lease).await {
                         let transient = err.0.is_server_error()
                             || matches!(err.0, StatusCode::LOCKED | StatusCode::TOO_MANY_REQUESTS);
-                        let count = retries.entry(id).or_insert(0);
-                        if transient && *count < 3 {
-                            *count += 1;
-                            let delay = 5i64 * (1i64 << (*count - 1));
-                            tracing::warn!(mention_id = %id, status = err.0.as_u16(), attempt = *count, delay_secs = delay, "transient mention error, scheduling retry");
-                            let _ = sqlx::query("UPDATE mentions SET lease_until=now()+make_interval(secs => $3) WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')")
-                                .bind(id).bind(lease).bind(delay as f64).execute(&app.db).await;
-                        } else {
-                            retries.remove(&id);
-                            tracing::error!(mention_id = %id, status = err.0.as_u16(), message = %err.1, "mention processing failed");
-                            let _ = sqlx::query("UPDATE mentions SET state='failed',lease_until=NULL WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')").bind(id).bind(lease).execute(&app.db).await;
+                        if transient {
+                            let retries: Option<i32> = sqlx::query_scalar(
+                                "UPDATE mentions SET retry_count=retry_count+1 WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering') RETURNING retry_count",
+                            )
+                            .bind(id)
+                            .bind(lease)
+                            .fetch_optional(&app_task.db)
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(count) = retries
+                                && count <= 3
+                            {
+                                let delay = 5i64 * (1i64 << (count - 1).min(4));
+                                tracing::warn!(mention_id = %id, status = err.0.as_u16(), attempt = count, delay_secs = delay, "transient mention error, scheduling retry");
+                                let _ = sqlx::query("UPDATE mentions SET lease_until=now()+make_interval(secs => $3) WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')")
+                                    .bind(id).bind(lease).bind(delay as f64).execute(&app_task.db).await;
+                                return;
+                            }
                         }
+                        tracing::error!(mention_id = %id, status = err.0.as_u16(), message = %err.1, "mention processing failed");
+                        let _ = sqlx::query("UPDATE mentions SET state='failed',lease_until=NULL WHERE id=$1 AND lease_id=$2 AND state IN ('pending','answering')")
+                            .bind(id).bind(lease).execute(&app_task.db).await;
                     }
-                }
-                if retries.len() > 512 {
-                    retries.clear();
-                }
+                });
             }
             Ok(None) => {
+                drop(permit);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     _ = shutdown.changed() => break,
                 }
             }
             Err(error) => {
+                drop(permit);
                 tracing::warn!(error = %error, "mention worker poll failed");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -514,6 +588,29 @@ pub(super) async fn worker(app: App) {
         }
     }
 }
+
+/// Revokes a delegated standalone session token when mention processing finishes.
+struct DelegatedSessionCleanup {
+    db: PgPool,
+    token_hash: Option<String>,
+}
+
+impl Drop for DelegatedSessionCleanup {
+    fn drop(&mut self) {
+        if let Some(hash) = self.token_hash.take() {
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "DELETE FROM standalone_sessions WHERE token_hash=$1 AND bot_grant IS NOT NULL",
+                )
+                .bind(hash)
+                .execute(&db)
+                .await;
+            });
+        }
+    }
+}
+
 async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     let r = sqlx::query(&format!(
         "{SELECT} WHERE m.id=$1 AND m.lease_id=$2 AND c.status='connected' AND c.enabled"
@@ -543,8 +640,14 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     }
     let mut h = workspace_headers(app, w)?;
     let content = app.storage.get(r.get("body_object")).await?;
-    let grant:Uuid=sqlx::query_scalar("SELECT control_grant FROM external_links WHERE connection_id=$1 AND external_id=$2 AND user_id=$3")
-        .bind(conn).bind(field(&content,"author")?).bind(u).fetch_one(&app.db).await?;
+    let grant: Uuid = sqlx::query_scalar(
+        "SELECT control_grant FROM external_links WHERE connection_id=$1 AND external_id=$2 AND user_id=$3",
+    )
+    .bind(conn)
+    .bind(field(&content, "author")?)
+    .bind(u)
+    .fetch_one(&app.db)
+    .await?;
     let v = private(
         app,
         &h,
@@ -554,13 +657,31 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     if v["user_id"] != u.to_string() {
         return Err(forbidden());
     }
+    let delegated_token = field(&v, "token")?;
+    let mut session_cleanup = DelegatedSessionCleanup {
+        db: app.db.clone(),
+        token_hash: app.standalone.is_some().then(|| digest(delegated_token)),
+    };
     h.insert(
         header::COOKIE,
-        format!("venticode_session={}", field(&v, "token")?)
+        format!("venticode_session={delegated_token}")
             .parse()
             .map_err(|_| bad())?,
     );
     let member = Member::load(app, &h, true).await?;
+    // Pre-fetch default model outside any Postgres transaction if conversation isn't mapped yet.
+    let preloaded_model = if r.get::<Option<Uuid>, _>("conversation_id").is_none() {
+        let models = app.control_json(&h, "models").await?;
+        let model = models["items"]
+            .as_array()
+            .and_then(|m| m.iter().find(|v| v["default"] == true).or(m.first()))
+            .and_then(|m| m["id"].as_str())
+            .ok_or_else(bad)?
+            .to_owned();
+        Some(model)
+    } else {
+        None
+    };
     let mut tx = app.db.begin().await?;
     let mapped: Option<Uuid> = sqlx::query_scalar(
         "SELECT conversation_id FROM mentions WHERE id=$1 AND lease_id=$2 FOR UPDATE",
@@ -577,12 +698,7 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
                 .bind(conn)
                 .fetch_one(&mut *tx)
                 .await?;
-        let models = app.control_json(&h, "models").await?;
-        let model = models["items"]
-            .as_array()
-            .and_then(|m| m.iter().find(|v| v["default"] == true).or(m.first()))
-            .and_then(|m| m["id"].as_str())
-            .ok_or_else(bad)?;
+        let model = preloaded_model.ok_or_else(bad)?;
         let personal = match runtime.as_str() {
             "kitesurf" => {
                 if app.computers.as_ref().is_none_or(|c| c.kitesurf.is_none()) {
@@ -654,6 +770,8 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     };
     tx.commit().await?;
     if r.get::<Option<Uuid>, _>("run_id").is_none() {
+        // Keep the delegated session alive while the background run executes.
+        session_cleanup.token_hash = None;
         let (_, Json(started)) = runs::send(
             State(app.clone()),
             h,
@@ -679,7 +797,10 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
             .fetch_one(&app.db)
             .await?;
     if outcome != "completed" {
-        return Err(unavailable());
+        return Err(Error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Esecuzione bot non completata / Bot run did not complete".into(),
+        ));
     }
     let mut after = 0;
     let mut text = String::new();
@@ -700,7 +821,8 @@ async fn process(app: &App, id: Uuid, lease: Uuid) -> Result<()> {
     }
     let obj = standalone_object(app, w, u, &json!(text)).await?;
     let mut tx = app.db.begin().await?;
-    let n=sqlx::query("UPDATE mentions SET state='review',reply_object=$2,lease_until=NULL WHERE id=$1 AND state='answering' AND lease_id=$3").bind(id).bind(obj).bind(lease).execute(&mut *tx).await?;
+    let n = sqlx::query("UPDATE mentions SET state='review',reply_object=$2,lease_until=NULL WHERE id=$1 AND state='answering' AND lease_id=$3")
+        .bind(id).bind(obj).bind(lease).execute(&mut *tx).await?;
     if n.rows_affected() == 1 {
         sqlx::query("DELETE FROM object_cleanup WHERE object_id=$1")
             .bind(obj)

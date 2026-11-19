@@ -1,14 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Trash2 } from "lucide-react";
+import { LoaderCircle, Trash2 } from "lucide-react";
 import { api } from "../api/client.ts";
 import type { Conversation, PermissionMode } from "../api/client.ts";
 import { useHarnesses, useModels, useProjects } from "../queries.ts";
 import { t } from "../i18n/index.ts";
 import { Composer } from "./Composer.tsx";
 import { modes } from "./ConversationView.tsx";
-import { Terminal } from "./Terminal.tsx";
 
 export function ProjectView({ menu }: { menu: ReactNode }) {
   const { id = "" } = useParams();
@@ -21,14 +20,34 @@ export function ProjectView({ menu }: { menu: ReactNode }) {
   const navigate = useNavigate();
   const [mode, setMode] = useState<PermissionMode>("ask");
   const [model, setModel] = useState("");
-  const firstTurn = useRef<{ project: string; chat: string; key: string; messageId: string } | null>(null);
+  const [error, setError] = useState("");
+  const firstTurn = useRef<{
+    project: string;
+    chat: string;
+    revision: number;
+    model: string;
+    permissionMode: PermissionMode;
+    key: string;
+    messageId: string;
+  } | null>(null);
 
   useEffect(() => {
     setMode("ask");
+    setError("");
     firstTurn.current = null;
   }, [id]);
 
-  if (projects.isPending) return <main className="main"><div className="topbar">{menu}</div><Terminal notice={t("Caricamento…")} /></main>;
+  if (projects.isPending) {
+    return (
+      <main className="main">
+        <div className="topbar">{menu}</div>
+        <div className="empty" role="status">
+          <LoaderCircle className="spin" aria-hidden="true" />
+          {t("Caricamento…")}
+        </div>
+      </main>
+    );
+  }
   if (projects.isError) return <main className="main"><div className="topbar">{menu}</div><div className="empty" role="alert">
     <h1>{t("Impossibile caricare il progetto")}</h1>
     <p>{projects.error.message}</p>
@@ -37,20 +56,47 @@ export function ProjectView({ menu }: { menu: ReactNode }) {
   if (!project) return <main className="main"><div className="topbar">{menu}</div><div className="empty"><h1>{t("Progetto non trovato")}</h1></div></main>;
 
   const start = async (raw: string) => {
+    setError("");
     let content = raw;
     let intent: "message" | "goal" | "plan" = "message";
     if (raw.startsWith("/goal ")) { content = raw.slice(6).trim(); intent = "goal"; }
     else if (raw.startsWith("/plan ")) { content = raw.slice(6).trim(); intent = "plan"; }
     const turnKey = JSON.stringify([content, intent]);
+    const desiredMode: PermissionMode = intent === "plan" ? "plan" : mode;
+    const desiredModel = model || "";
     if (firstTurn.current?.project !== project.id) {
       const chat = await api<Conversation>("/conversations", "POST", {
         project_id: project.id,
-        permission_mode: intent === "plan" ? "plan" : mode,
-        ...(model ? { model } : {}),
+        permission_mode: desiredMode,
+        ...(desiredModel ? { model: desiredModel } : {}),
       });
-      firstTurn.current = { project: project.id, chat: chat.id, key: turnKey, messageId: crypto.randomUUID() };
+      firstTurn.current = {
+        project: project.id,
+        chat: chat.id,
+        revision: chat.revision,
+        model: chat.model,
+        permissionMode: chat.permission_mode,
+        key: turnKey,
+        messageId: crypto.randomUUID(),
+      };
       client.setQueryData(["conversation", chat.id], chat);
       void client.invalidateQueries({ queryKey: ["conversations"] });
+    } else {
+      const turn = firstTurn.current;
+      const patch: Partial<Pick<Conversation, "model" | "permission_mode">> = {};
+      if (desiredMode !== turn.permissionMode) patch.permission_mode = desiredMode;
+      if (desiredModel && desiredModel !== turn.model) patch.model = desiredModel;
+      if (Object.keys(patch).length > 0) {
+        const updated = await api<Conversation>(`/conversations/${turn.chat}`, "PATCH", {
+          revision: turn.revision,
+          ...patch,
+        });
+        turn.revision = updated.revision;
+        turn.model = updated.model;
+        turn.permissionMode = updated.permission_mode;
+        client.setQueryData(["conversation", updated.id], updated);
+        void client.invalidateQueries({ queryKey: ["conversations"] });
+      }
     }
     const turn = firstTurn.current;
     if (turn.key !== turnKey) {
@@ -67,11 +113,14 @@ export function ProjectView({ menu }: { menu: ReactNode }) {
   };
   const remove = async () => {
     if (!confirm(t("Eliminare il progetto “{0}” e tutte le sue conversazioni? I file sull'harness non vengono toccati.", project.name))) return;
+    setError("");
     try {
       await api(`/projects/${project.id}`, "DELETE");
       await Promise.all([client.invalidateQueries({ queryKey: ["projects"] }), client.invalidateQueries({ queryKey: ["conversations"] })]);
       navigate("/");
-    } catch (failure) { alert((failure as Error).message); }
+    } catch (failure) {
+      setError((failure as Error).message);
+    }
   };
   const folder = project.path === "." ? project.root : `${project.root}/${project.path}`;
   const defaultModel = models.data?.find((m) => m.default)?.id || models.data?.[0]?.id || "";
@@ -92,7 +141,12 @@ export function ProjectView({ menu }: { menu: ReactNode }) {
         )}
         <button className="icon-btn" title={t("Elimina progetto")} aria-label={t("Elimina progetto")} onClick={() => void remove()}><Trash2 size={16} aria-hidden="true" /></button>
       </header>
-      <Terminal project={project} />
+      {error && <div className="agent-controls" role="alert"><span className="error-line">{error}</span></div>}
+      <section className="terminal" aria-label={t("Terminale")}>
+        <div className="terminal-viewport" role="status">
+          <p className="terminal-notice">· {t("Scrivi il primo messaggio e premi Invio")}</p>
+        </div>
+      </section>
       <Composer key={project.id} onSend={start} placeholder={t("Descrivi il lavoro da fare in questo progetto…")}
         disabled={harness && !harness.online && !harness.managed ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
         controls={

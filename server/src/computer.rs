@@ -1,11 +1,17 @@
 use super::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 const AUDIENCE: &str = "venticode-computer";
 const API_IDENTITY: &str = "/var/run/secrets/venticode-kubernetes";
 const DESKTOP: &str = "desktop";
+const TOUCH_DEBOUNCE: Duration = Duration::from_secs(60);
+
 pub(super) struct Computers {
     kube: reqwest::Client,
     namespace: String,
@@ -14,6 +20,9 @@ pub(super) struct Computers {
     pub origins: Vec<String>,
     runners: Mutex<HashMap<Uuid, Arc<runner::Runner>>>,
     displays: Mutex<HashMap<Uuid, Arc<tokio::sync::RwLock<()>>>>,
+    provisioning: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    last_touched: Mutex<HashMap<Uuid, Instant>>,
+    enroll_attempts: Mutex<VecDeque<Instant>>,
 }
 
 struct MachineConfig {
@@ -115,6 +124,9 @@ impl Computers {
             origins,
             runners: Mutex::default(),
             displays: Mutex::default(),
+            provisioning: Mutex::default(),
+            last_touched: Mutex::default(),
+            enroll_attempts: Mutex::default(),
         }))
     }
 
@@ -127,6 +139,22 @@ impl Computers {
             modes.push("computer");
         }
         modes
+    }
+
+    fn enroll_allowed(&self) -> bool {
+        let mut attempts = self
+            .enroll_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        while attempts.front().is_some_and(|t| *t < cutoff) {
+            attempts.pop_front();
+        }
+        if attempts.len() >= 120 {
+            return false;
+        }
+        attempts.push_back(Instant::now());
+        true
     }
 
     pub fn runner(&self, id: Uuid) -> Option<Arc<runner::Runner>> {
@@ -148,6 +176,15 @@ impl Computers {
 
     pub fn display(&self, id: Uuid) -> Arc<tokio::sync::RwLock<()>> {
         self.displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_default()
+            .clone()
+    }
+
+    fn provision_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.provisioning
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(id)
@@ -261,6 +298,7 @@ impl Computers {
         }
     }
 
+    /// Ensure the computer record and Kubernetes pod exist without holding DB locks across K8s I/O.
     pub async fn ensure(&self, app: &App, workspace: Uuid, owner: Uuid) -> Result<Uuid> {
         let machine = self.machine.as_ref().ok_or_else(missing)?;
         let id: Uuid = sqlx::query_scalar(
@@ -272,11 +310,9 @@ impl Computers {
         .bind(Uuid::new_v4())
         .fetch_one(&app.db)
         .await?;
-        let mut tx = app.db.begin().await?;
-        sqlx::query("SELECT id FROM managed_computers WHERE id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+        self.record_touch(id);
+        let lock = self.provision_lock(id);
+        let _guard = lock.lock().await;
         let name = name(id);
         if let Some(pod) = self.pod(&name).await? {
             if pod["metadata"]["deletionTimestamp"].is_null()
@@ -289,15 +325,18 @@ impl Computers {
                 self.delete(&format!("pods/{name}"), Some(uid)).await?;
             }
         } else {
-            self.create("persistentvolumeclaims", json!({
-                "apiVersion":"v1","kind":"PersistentVolumeClaim",
-                "metadata":{"name":name,"labels":{"app.kubernetes.io/name":"venticode-computer"}},
-                "spec":{"accessModes":["ReadWriteOncePod"],"storageClassName":machine.storage_class,
-                    "resources":{"requests":{"storage":"10Gi"}}}
-            })).await?;
+            self.create(
+                "persistentvolumeclaims",
+                json!({
+                    "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                    "metadata":{"name":name,"labels":{"app.kubernetes.io/name":"venticode-computer"}},
+                    "spec":{"accessModes":["ReadWriteOncePod"],"storageClassName":machine.storage_class,
+                        "resources":{"requests":{"storage":"10Gi"}}}
+                }),
+            )
+            .await?;
             self.create("pods", self.manifest(id, machine)).await?;
         }
-        tx.commit().await?;
         Ok(id)
     }
 
@@ -342,17 +381,44 @@ impl Computers {
         })
     }
 
+    fn record_touch(&self, id: Uuid) {
+        let mut map = self.last_touched.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 2048 {
+            let cutoff = Instant::now() - Duration::from_secs(600);
+            map.retain(|_, ts| *ts >= cutoff);
+        }
+        map.insert(id, Instant::now());
+    }
+
+    fn should_touch(&self, id: Uuid) -> bool {
+        self.last_touched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .is_none_or(|ts| ts.elapsed() >= TOUCH_DEBOUNCE)
+    }
+
     async fn touch(&self, app: &App, id: Uuid) -> Result<()> {
-        if sqlx::query("UPDATE managed_computers SET touched_at=now() WHERE id=$1 AND NOT EXISTS(
-                SELECT FROM erased_subjects WHERE workspace=managed_computers.workspace AND owner_id=managed_computers.owner_id)")
-            .bind(id).execute(&app.db).await?.rows_affected() == 1 {
+        if sqlx::query(
+            "UPDATE managed_computers SET touched_at=now() WHERE id=$1 AND NOT EXISTS(
+                SELECT FROM erased_subjects WHERE workspace=managed_computers.workspace AND owner_id=managed_computers.owner_id)",
+        )
+        .bind(id)
+        .execute(&app.db)
+        .await?
+        .rows_affected()
+            == 1
+        {
+            self.record_touch(id);
             return Ok(());
         }
         Err(missing())
     }
 
     pub async fn touch_if_present(&self, app: &App, id: Uuid) {
-        let _ = self.touch(app, id).await;
+        if self.should_touch(id) {
+            let _ = self.touch(app, id).await;
+        }
     }
 
     pub async fn ready(
@@ -361,6 +427,13 @@ impl Computers {
         workspace: Uuid,
         owner: Uuid,
     ) -> Result<Arc<runner::Runner>> {
+        // Fast path: if the computer's runner is already online, skip DB writes and K8s GETs.
+        if let Some(id) = self.id(app, workspace, owner).await?
+            && let Some(runner) = self.runner(id).filter(|runner| runner.online())
+        {
+            self.touch_if_present(app, id).await;
+            return Ok(runner);
+        }
         let id = self.ensure(app, workspace, owner).await?;
         let pod_name = name(id);
         for step in 0..75 {
@@ -440,6 +513,14 @@ impl Computers {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
+        self.provisioning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.last_touched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         Ok(true)
     }
 }
@@ -455,6 +536,12 @@ pub(super) async fn enroll(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response> {
     let computers = app.computers.as_ref().ok_or_else(missing)?;
+    if !computers.enroll_allowed() {
+        return Err(Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Troppi tentativi di connessione / Too many enrollment attempts".into(),
+        ));
+    }
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -468,9 +555,18 @@ pub(super) async fn enroll(
     .bind(id)
     .fetch_one(&app.db)
     .await?;
-    let review: Value = computers.request(Method::POST, "/apis/authentication.k8s.io/v1/tokenreviews").await?
+    let review: Value = computers
+        .request(Method::POST, "/apis/authentication.k8s.io/v1/tokenreviews")
+        .await?
         .json(&json!({"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":token,"audiences":[AUDIENCE]}}))
-        .send().await.map_err(|_| unavailable())?.error_for_status().map_err(|_| unavailable())?.json().await.map_err(|_| unavailable())?;
+        .send()
+        .await
+        .map_err(|_| unavailable())?
+        .error_for_status()
+        .map_err(|_| unavailable())?
+        .json()
+        .await
+        .map_err(|_| unavailable())?;
     let pod = computers.pod(&name(id)).await?.ok_or_else(forbidden)?;
     let uid = pod["metadata"]["uid"].as_str().ok_or_else(forbidden)?;
     let identity = &review["status"];
@@ -546,7 +642,7 @@ async fn reap(app: &App, computers: &Computers) -> Result<()> {
             .strip_prefix("computer-")
             .and_then(|raw| raw.parse::<Uuid>().ok())
         {
-            machines.insert(id, uid);
+            machines.insert(id, uid.to_owned());
         } else if name.starts_with("kitesurf-")
             && (matches!(
                 pod["status"]["phase"].as_str(),
@@ -560,34 +656,51 @@ async fn reap(app: &App, computers: &Computers) -> Result<()> {
         }
     }
     let live: Vec<_> = machines.keys().copied().collect();
-    let mut tx = app.db.begin().await?;
+    if live.is_empty() {
+        return Ok(());
+    }
+    // Select idle computers in a short read query; perform K8s DELETEs outside any DB lock.
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "SELECT m.id FROM managed_computers m
         WHERE m.id=ANY($1) AND m.touched_at < now()-interval '10 minutes' AND NOT EXISTS (
             SELECT FROM conversations c JOIN projects p ON p.id=c.project_id
             WHERE p.harness_id=m.id AND c.active_run IS NOT NULL AND c.lease_until > now())
-        ORDER BY m.touched_at LIMIT 8 FOR UPDATE OF m SKIP LOCKED",
+        ORDER BY m.touched_at LIMIT 8",
     )
     .bind(live)
-    .fetch_all(&mut *tx)
+    .fetch_all(&app.db)
     .await?;
-    for id in &ids {
-        computers
-            .delete(&format!("pods/{}", name(*id)), Some(machines[id]))
-            .await?;
-    }
-    tx.commit().await?;
     for id in ids {
+        let lock = computers.provision_lock(id);
+        let Ok(_guard) = lock.try_lock() else {
+            continue;
+        };
+        // Re-check DB freshness before deleting to avoid racing a concurrent start.
+        let still_idle: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT FROM managed_computers m
+            WHERE m.id=$1 AND m.touched_at < now()-interval '10 minutes' AND NOT EXISTS (
+                SELECT FROM conversations c JOIN projects p ON p.id=c.project_id
+                WHERE p.harness_id=m.id AND c.active_run IS NOT NULL AND c.lease_until > now()))",
+        )
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?;
+        if !still_idle {
+            continue;
+        }
         computers
-            .runners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
-        computers
-            .displays
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
+            .delete(&format!("pods/{}", name(id)), Some(&machines[&id]))
+            .await?;
+        // Never evict a runner that has already re-enrolled and is online.
+        let mut runners = computers.runners.lock().unwrap_or_else(|e| e.into_inner());
+        if runners.get(&id).is_some_and(|r| !r.online()) {
+            runners.remove(&id);
+            computers
+                .displays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
     }
     Ok(())
 }
@@ -635,12 +748,16 @@ pub(super) fn is_operation(op: &str) -> bool {
 pub(super) async fn rpc(runner: &runner::Runner, op: &str, args: Value) -> Result<Value> {
     let id = Uuid::new_v4();
     let session = id.to_string();
-    runner.action(session.clone(), &json!({"action":"execute","request_id":id,"project_id":id,
-        "harness_id":runner.id(),"root":"work","project_path":".","operation":op,"arguments":args,"managed":true}))?;
+    runner.action(
+        session.clone(),
+        &json!({"action":"execute","request_id":id,"project_id":id,
+        "harness_id":runner.id(),"root":"work","project_path":".","operation":op,"arguments":args,"managed":true}),
+    )?;
     let result = tokio::time::timeout(Duration::from_secs(12), async {
         let mut after = 0;
         let mut result = None;
         loop {
+            let version = runner.version();
             let poll = runner.action(
                 session.clone(),
                 &json!({"action":"poll","request_id":id,"after":after}),
@@ -663,7 +780,7 @@ pub(super) async fn rpc(runner: &runner::Runner, op: &str, args: Value) -> Resul
             match poll["state"].as_str() {
                 Some("done") => return result.ok_or_else(unavailable),
                 Some("failed" | "cancelled") => return Err(unavailable()),
-                _ => runner.wait(Duration::from_millis(35)).await,
+                _ => runner.wait_since(version, Duration::from_millis(35)).await,
             }
         }
     })
@@ -673,6 +790,53 @@ pub(super) async fn rpc(runner: &runner::Runner, op: &str, args: Value) -> Resul
     }
     runner.forget(id);
     result.map_err(|_| unavailable())?
+}
+
+fn validate_desktop_input(input: &Value) -> Result<()> {
+    let obj = input.as_object().ok_or_else(bad)?;
+    let kind = obj.get("kind").and_then(Value::as_str).ok_or_else(bad)?;
+    let finite = |key: &str| {
+        obj.get(key)
+            .and_then(Value::as_f64)
+            .is_some_and(|v| v.is_finite() && (-100_000.0..=100_000.0).contains(&v))
+    };
+    match kind {
+        "click" | "move" => {
+            if !finite("x") || !finite("y") {
+                return Err(bad());
+            }
+        }
+        "pointer" => {
+            if !finite("x") || !finite("y") || !obj.get("down").is_some_and(Value::is_boolean) {
+                return Err(bad());
+            }
+        }
+        "scroll" => {
+            if !finite("delta") {
+                return Err(bad());
+            }
+        }
+        "text" => {
+            if !obj
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() <= 4096)
+            {
+                return Err(bad());
+            }
+        }
+        "key" => {
+            if !obj
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s.len() <= 64)
+            {
+                return Err(bad());
+            }
+        }
+        _ => return Err(bad()),
+    }
+    Ok(())
 }
 
 async fn screen(
@@ -694,8 +858,8 @@ async fn screen(
                     &mut ws,
                     Message::Text(
                         json!({"type":"ended","reason":if error.0 == StatusCode::CONFLICT {
-                "busy"
-            } else { "unavailable" }})
+                            "busy"
+                        } else { "unavailable" }})
                         .to_string()
                         .into(),
                     ),
@@ -726,6 +890,10 @@ async fn view(
     let mut frames = tokio::time::interval(Duration::from_millis(280));
     frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut lease = tokio::time::interval(Duration::from_secs(15));
+    lease.reset();
+    let mut shutdown = app.shutdown.clone();
+    // Run frame capture off the select loop so slow desktop_frame RPCs never starve user input.
+    let mut in_flight_frame: Option<tokio::task::JoinHandle<Result<Value>>> = None;
     send(
         ws,
         Message::Text(json!({"type":"ready"}).to_string().into()),
@@ -734,6 +902,7 @@ async fn view(
     let result = async {
         loop {
             tokio::select! {
+                _ = shutdown.changed() => break,
                 packet = ws.recv() => {
                     let Some(Ok(packet)) = packet else { break };
                     match packet {
@@ -750,7 +919,11 @@ async fn view(
                                     human = None;
                                     send(ws, Message::Text(json!({"type":"control","human":false}).to_string().into())).await?;
                                 }
-                                Some("input") if human.is_some() && value["tab"] == DESKTOP => {
+                                Some("input")
+                                    if human.is_some()
+                                        && value["tab"] == DESKTOP
+                                        && validate_desktop_input(&value["input"]).is_ok() =>
+                                {
                                     rpc(&runner, "desktop_input", value["input"].clone()).await?;
                                 }
                                 _ => {}
@@ -763,8 +936,15 @@ async fn view(
                         _ => {}
                     }
                 }
-                _ = frames.tick() => {
-                    let frame = rpc(&runner, "desktop_frame", json!({})).await?;
+                _ = frames.tick(), if in_flight_frame.is_none() => {
+                    let r = runner.clone();
+                    in_flight_frame = Some(tokio::spawn(async move {
+                        rpc(&r, "desktop_frame", json!({})).await
+                    }));
+                }
+                frame_res = async { in_flight_frame.as_mut().unwrap().await }, if in_flight_frame.is_some() => {
+                    in_flight_frame = None;
+                    let frame = frame_res.map_err(|_| unavailable())??;
                     let bytes = STANDARD.decode(frame["jpeg"].as_str().ok_or_else(unavailable)?).map_err(|_| unavailable())?;
                     let mut packet = json!({"type":"frame","tab":DESKTOP,"width":frame["width"],"height":frame["height"]})
                         .to_string().into_bytes();
@@ -773,14 +953,20 @@ async fn view(
                     send(ws, Message::Binary(packet.into())).await?;
                 }
                 _ = lease.tick() => {
-                    let current = Member::load(app,headers,true).await?;
-                    if current.workspace != member.workspace || current.user != member.user { return Err(forbidden()); }
+                    let current = Member::load(app, headers, true).await?;
+                    if current.workspace != member.workspace || current.user != member.user {
+                        return Err(forbidden());
+                    }
                     computers.touch(app, id).await?;
                 }
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
+    if let Some(handle) = in_flight_frame {
+        handle.abort();
+    }
     if human.is_some() {
         let _ = rpc(&runner, "desktop_release", json!({})).await;
     }
@@ -802,6 +988,28 @@ impl Drop for PreviewCleanup {
     }
 }
 
+/// Ensures `computer_model_calls.finished` is marked true even if `subcompletion()` is cancelled.
+struct ModelCallGuard {
+    db: PgPool,
+    query: Uuid,
+    finished: bool,
+}
+
+impl Drop for ModelCallGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let db = self.db.clone();
+            let query = self.query;
+            tokio::spawn(async move {
+                let _ = sqlx::query("UPDATE computer_model_calls SET finished=true WHERE id=$1")
+                    .bind(query)
+                    .execute(&db)
+                    .await;
+            });
+        }
+    }
+}
+
 pub(super) async fn complete_model_request(
     app: &App,
     h: &HeaderMap,
@@ -812,7 +1020,9 @@ pub(super) async fn complete_model_request(
     payload: &Value,
 ) -> Result<()> {
     let query: Uuid = serde_json::from_value(payload["query"].clone()).map_err(|_| bad())?;
-    let result = subcompletion(app, h, conversation, run, query, payload).await;
+    runner.touch_request(call);
+    let result = subcompletion(app, h, conversation, run, call, query, runner, payload).await;
+    runner.touch_request(call);
     let mut response = match result {
         Ok(result) => result,
         Err(error) => json!({"error":error.1}),
@@ -823,12 +1033,15 @@ pub(super) async fn complete_model_request(
     runner.respond(call, response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn subcompletion(
     app: &App,
     h: &HeaderMap,
     conversation: Uuid,
     run: Uuid,
+    call: Uuid,
     query: Uuid,
+    runner: &runner::Runner,
     payload: &Value,
 ) -> Result<Value> {
     use futures_util::StreamExt;
@@ -867,6 +1080,11 @@ async fn subcompletion(
         ));
     }
     tx.commit().await?;
+    let mut guard = ModelCallGuard {
+        db: app.db.clone(),
+        query,
+        finished: false,
+    };
     let request = json!({"model":model,"messages":[{"role":"user","content":prompt}],
         "stream":true,"stream_options":{"include_usage":true},"max_tokens":2048});
     let result = tokio::time::timeout(Duration::from_secs(45), async {
@@ -875,6 +1093,7 @@ async fn subcompletion(
         let mut usage = Value::Null;
         let mut finish_seen = false;
         while let Some(event) = events.next().await {
+            runner.touch_request(call);
             let event = event?;
             if event == "[DONE]" {
                 return Ok(json!({"model":model,"text":result,"usage":usage}));
@@ -907,6 +1126,7 @@ async fn subcompletion(
         .bind(query)
         .execute(&app.db)
         .await?;
+    guard.finished = true;
     let mut event = json!({"type":"run","run_id":run,"state":"running",
         "model_call":query,"model":model,"status":if result.is_ok() {"ok"} else {"error"}});
     if let Ok(value) = &result {

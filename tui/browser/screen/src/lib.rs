@@ -62,37 +62,53 @@ impl RemoteScreen {
         {
             return;
         }
-        let mut state = self.state.borrow_mut();
-        state.pending = Some(egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            pixels,
-        ));
-        state.size = egui::vec2(remote_w, remote_h);
-        state.visible = true;
-        if let Some(context) = &state.context {
+        let context = {
+            let mut state = self.state.borrow_mut();
+            state.pending = Some(egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                pixels,
+            ));
+            state.size = egui::vec2(remote_w, remote_h);
+            state.visible = true;
+            state.context.clone()
+        };
+        if let Some(context) = context {
             context.request_repaint();
         }
     }
 
     pub fn clear(&self) {
-        let mut state = self.state.borrow_mut();
-        state.pending = None;
-        state.visible = false;
-        if let Some(context) = &state.context {
+        let context = {
+            let mut state = self.state.borrow_mut();
+            state.pending = None;
+            state.visible = false;
+            state.context.clone()
+        };
+        if let Some(context) = context {
             context.request_repaint();
         }
     }
 
     pub fn set_control(&self, human: bool) {
-        let mut state = self.state.borrow_mut();
-        state.human = human;
-        if let Some(context) = &state.context {
+        let context = {
+            let mut state = self.state.borrow_mut();
+            state.human = human;
+            state.context.clone()
+        };
+        if let Some(context) = context {
             context.request_repaint();
         }
     }
 
     pub fn set_desktop(&self, desktop: bool) {
-        self.state.borrow_mut().desktop = desktop;
+        let context = {
+            let mut state = self.state.borrow_mut();
+            state.desktop = desktop;
+            state.context.clone()
+        };
+        if let Some(context) = context {
+            context.request_repaint();
+        }
     }
 
     pub fn destroy(&self) {
@@ -122,7 +138,13 @@ impl eframe::App for Screen {
             .rect_filled(bounds, 0.0, egui::Color32::from_rgb(15, 20, 29));
         let (visible, human, desktop, size, pending) = {
             let mut state = self.state.borrow_mut();
-            (state.visible, state.human, state.desktop, state.size, state.pending.take())
+            (
+                state.visible,
+                state.human,
+                state.desktop,
+                state.size,
+                state.pending.take(),
+            )
         };
         if !visible {
             self.texture = None;
@@ -180,7 +202,12 @@ impl eframe::App for Screen {
                 Event::PointerMoved(position) if desktop && rect.contains(position) => {
                     moved_pos = Some(position);
                 }
-                Event::PointerButton {pos,button,pressed,..} if desktop && (rect.contains(pos) || !pressed) => {
+                Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } if desktop && (rect.contains(pos) || !pressed) => {
                     let position = point(rect.clamp(pos));
                     let button = match button {
                         egui::PointerButton::Primary => 1,
@@ -188,7 +215,7 @@ impl eframe::App for Screen {
                         egui::PointerButton::Secondary => 3,
                         _ => continue,
                     };
-                    self.input(json!({"kind":"pointer","x":position.x.min(size.x-1.0),"y":position.y.min(size.y-1.0),"button":button,"down":pressed}));
+                    self.input(json!({"kind":"pointer","x":position.x.clamp(0.0, (size.x-1.0).max(0.0)),"y":position.y.clamp(0.0, (size.y-1.0).max(0.0)),"button":button,"down":pressed}));
                 }
                 Event::MouseWheel { unit, delta, .. } if delta.y != 0.0 => {
                     if let Some(position) = hover.filter(|position| rect.contains(*position)) {
@@ -243,18 +270,30 @@ impl eframe::App for Screen {
                         continue;
                     }
                     let mut shortcut = String::new();
-                    if modifiers.ctrl || modifiers.command { shortcut.push_str("ctrl+"); }
-                    if modifiers.alt { shortcut.push_str("alt+"); }
-                    if modifiers.shift { shortcut.push_str("shift+"); }
+                    if modifiers.ctrl || modifiers.command {
+                        shortcut.push_str("ctrl+");
+                    }
+                    if modifiers.alt {
+                        shortcut.push_str("alt+");
+                    }
+                    if modifiers.shift {
+                        shortcut.push_str("shift+");
+                    }
                     shortcut.push_str(match key {
-                        Key::ArrowLeft => "ArrowLeft", Key::ArrowRight => "ArrowRight",
-                        Key::ArrowUp => "ArrowUp", Key::ArrowDown => "ArrowDown",
+                        Key::ArrowLeft => "ArrowLeft",
+                        Key::ArrowRight => "ArrowRight",
+                        Key::ArrowUp => "ArrowUp",
+                        Key::ArrowDown => "ArrowDown",
                         _ => key.name(),
                     });
                     self.input(json!({"kind":"key","key":shortcut}));
                 }
-                Event::Key { key, pressed: true, modifiers, .. }
-                    if focused && !modifiers.command && !modifiers.alt => {
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if focused && !modifiers.command && !modifiers.alt => {
                     let name = match key {
                         Key::Enter => "Enter",
                         Key::Backspace => "Backspace",

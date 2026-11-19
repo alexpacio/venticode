@@ -73,7 +73,7 @@ pub(super) fn validate(op: &str, args: &Value) -> Result<()> {
 struct Pod {
     computers: Arc<computer::Computers>,
     name: String,
-    uid: String,
+    uid: Option<String>,
 }
 
 impl Drop for Pod {
@@ -81,7 +81,9 @@ impl Drop for Pod {
         let computers = self.computers.clone();
         let (name, uid) = (self.name.clone(), self.uid.clone());
         tokio::spawn(async move {
-            let _ = computers.delete(&format!("pods/{name}"), Some(&uid)).await;
+            let _ = computers
+                .delete(&format!("pods/{name}"), uid.as_deref())
+                .await;
         });
     }
 }
@@ -99,6 +101,12 @@ impl Browser {
         let computers = app.computers.clone().ok_or_else(unavailable)?;
         let image = computers.kitesurf.as_ref().ok_or_else(unavailable)?;
         let name = format!("kitesurf-{}", Uuid::new_v4().simple());
+        // Construct cleanup guard before creating the pod so cancellation mid-start cannot leak it.
+        let mut pod = Pod {
+            computers: computers.clone(),
+            name: name.clone(),
+            uid: None,
+        };
         let created = computers.create("pods", json!({
             "apiVersion":"v1","kind":"Pod","metadata":{"name":name,"labels":{"app.kubernetes.io/name":"venticode-kitesurf"}},
             "spec":{"runtimeClassName":"gvisor","serviceAccountName":"computer","automountServiceAccountToken":false,
@@ -119,13 +127,9 @@ impl Browser {
             .as_str()
             .ok_or_else(unavailable)?
             .to_owned();
-        let pod = Pod {
-            computers,
-            name,
-            uid,
-        };
+        pod.uid = Some(uid.clone());
         for _ in 0..60 {
-            if observed["metadata"]["uid"] != pod.uid
+            if observed["metadata"]["uid"] != uid
                 || matches!(
                     observed["status"]["phase"].as_str(),
                     Some("Failed" | "Succeeded")

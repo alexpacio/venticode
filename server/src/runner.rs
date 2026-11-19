@@ -4,20 +4,25 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::{Notify, mpsc};
 
 const FRAME_LIMIT: usize = 8 * 1024 * 1024;
-const LEASE: Duration = Duration::from_secs(30);
+const LEASE: Duration = Duration::from_secs(60);
+const MAX_BUFFERED_FRAMES: usize = 1024;
 
 pub(super) struct Runner {
     id: Uuid,
     token: [u8; 32],
     state: Mutex<StateData>,
     notify: Notify,
+    version: AtomicU64,
 }
 
 #[derive(Default)]
@@ -52,6 +57,7 @@ impl Runner {
             token: Sha256::digest(secret.as_bytes()).into(),
             state: Mutex::default(),
             notify: Notify::new(),
+            version: AtomicU64::new(0),
         }
     }
 
@@ -59,8 +65,24 @@ impl Runner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub async fn wait(&self, timeout: Duration) {
-        let _ = tokio::time::timeout(timeout, self.notify.notified()).await;
+    fn signal(&self) {
+        self.version.fetch_add(1, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Race-free wait: registers the waiter before checking `version`, eliminating lost wakeups.
+    pub async fn wait_since(&self, seen: u64, timeout: Duration) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.version.load(Ordering::Acquire) != seen {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, notified).await;
     }
 
     pub fn inventory(&self) -> Value {
@@ -81,11 +103,20 @@ impl Runner {
         self.lock().requests.remove(&id);
     }
 
-    pub fn respond(&self, id: Uuid, frame: Value) -> Result<()> {
-        let state = self.lock();
-        if !state.requests.get(&id).is_some_and(|r| r.state == "sent") {
-            return Err(missing());
+    /// Renew an active request's poll lease while the server performs slow work (e.g. subcompletion).
+    pub fn touch_request(&self, id: Uuid) {
+        let mut state = self.lock();
+        if let Some(req) = state.requests.get_mut(&id) {
+            req.last_poll = Instant::now();
         }
+    }
+
+    pub fn respond(&self, id: Uuid, frame: Value) -> Result<()> {
+        let mut state = self.lock();
+        let Some(req) = state.requests.get_mut(&id).filter(|r| r.state == "sent") else {
+            return Err(missing());
+        };
+        req.last_poll = Instant::now();
         state
             .connection
             .as_ref()
@@ -102,7 +133,11 @@ impl Runner {
     ) -> std::result::Result<(), sqlx::Error> {
         let row: Option<(sqlx::types::Json<Vec<String>>, Value)> = sqlx::query_as(
             "SELECT roots,host_info FROM standalone_runner_inventory WHERE workspace=$1 AND runner_id=$2",
-        ).bind(workspace).bind(self.id).fetch_optional(db).await?;
+        )
+        .bind(workspace)
+        .bind(self.id)
+        .fetch_optional(db)
+        .await?;
         if let Some((roots, host_info)) = row {
             let mut state = self.lock();
             state.roots = roots.0;
@@ -149,10 +184,12 @@ impl Runner {
                     return Err(unavailable());
                 }
                 let project = uuid(body, "project_id")?;
-                sender.try_send(json!({"type":"execute","id":id,"payload":{
-                    "consent_id":id,"root":root,"mode":"sandboxed","operation":"project_tool","mcp_grants":{},
-                    "arguments":{"project_path":path,"operation":operation,"arguments":body["arguments"],"include_diff":body["include_diff"] == true}
-                }})).map_err(|_| unavailable())?;
+                sender
+                    .try_send(json!({"type":"execute","id":id,"payload":{
+                        "consent_id":id,"root":root,"mode":"sandboxed","operation":"project_tool","mcp_grants":{},
+                        "arguments":{"project_path":path,"operation":operation,"arguments":body["arguments"],"include_diff":body["include_diff"] == true}
+                    }}))
+                    .map_err(|_| unavailable())?;
                 state.requests.insert(
                     id,
                     Request {
@@ -184,6 +221,8 @@ impl Runner {
                                 .map_err(|_| unavailable())?;
                         }
                         request.state = "cancelled";
+                        request.frames.clear();
+                        request.bytes = 0;
                     }
                     return Ok(json!({"state":request.state}));
                 }
@@ -248,7 +287,9 @@ impl Runner {
                     ("agent_start", Some("stop")) => ("agent_stop", json!({"session_id":parent})),
                     _ => return Err(bad()),
                 };
-                sender.try_send(json!({"type":"input","id":id,"payload":{"consent_id":parent,"root":request.root,"mode":"sandboxed","operation":operation,"arguments":args,"mcp_grants":{}}})).map_err(|_| unavailable())?;
+                sender
+                    .try_send(json!({"type":"input","id":id,"payload":{"consent_id":parent,"root":request.root,"mode":"sandboxed","operation":operation,"arguments":args,"mcp_grants":{}}}))
+                    .map_err(|_| unavailable())?;
                 request.input_ids.insert(id);
                 Ok(json!({"accepted":true}))
             }
@@ -294,15 +335,24 @@ impl Runner {
             Some("output") => {}
             _ => return None,
         }
-        if r.frames.len() >= 256 || r.bytes + size > 16 * 1024 * 1024 {
+        if r.frames.len() >= MAX_BUFFERED_FRAMES || r.bytes + size > 16 * 1024 * 1024 {
+            tracing::warn!(
+                runner_id = %self.id,
+                request_id = %id,
+                buffered_frames = r.frames.len(),
+                buffered_bytes = r.bytes,
+                "runner request exceeded buffer limit, cancelling"
+            );
             r.state = "failed";
-            self.notify.notify_waiters();
+            r.frames.clear();
+            r.bytes = 0;
+            self.signal();
             return Some(id);
         }
         r.sequence += 1;
         r.bytes += size;
         r.frames.push_back((r.sequence, size, frame));
-        self.notify.notify_waiters();
+        self.signal();
         None
     }
 }
@@ -343,10 +393,16 @@ pub(super) async fn upgrade(
 }
 
 pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut socket: WebSocket) {
-    let Ok(Some(Ok(Message::Text(text)))) =
-        tokio::time::timeout(Duration::from_secs(5), socket.recv()).await
-    else {
-        return;
+    let text = match tokio::time::timeout(Duration::from_secs(5), socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(other) => {
+            tracing::warn!(runner_id = %runner.id, frame = ?other.map(|r| r.is_ok()), "runner handshake failed before inventory");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(runner_id = %runner.id, "runner handshake timed out waiting for inventory");
+            return;
+        }
     };
     #[derive(Deserialize)]
     struct Inventory {
@@ -356,6 +412,7 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
         host_info: Value,
     }
     let Ok(inventory) = serde_json::from_str::<Inventory>(&text) else {
+        tracing::warn!(runner_id = %runner.id, "runner sent malformed inventory JSON");
         return;
     };
     if inventory.kind != "inventory"
@@ -369,52 +426,89 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
         })
     {
+        tracing::warn!(runner_id = %runner.id, "runner inventory rejected due to invalid roots");
         return;
     }
-    if ["os", "arch", "version"].iter().any(|k| !inventory.host_info[*k].as_str().is_some_and(|v| !v.is_empty() && v.len() <= 80)) ||
-        sqlx::query("INSERT INTO standalone_runner_inventory(workspace,runner_id,roots,host_info) VALUES($1,$2,$3,$4)
-            ON CONFLICT(workspace,runner_id) DO UPDATE SET roots=excluded.roots,host_info=excluded.host_info")
-            .bind(workspace).bind(runner.id).bind(json!(inventory.roots)).bind(&inventory.host_info).execute(db).await.is_err() {
+    if ["os", "arch", "version"].iter().any(|k| {
+        !inventory.host_info[*k]
+            .as_str()
+            .is_some_and(|v| !v.is_empty() && v.len() <= 80)
+    }) {
+        tracing::warn!(runner_id = %runner.id, "runner inventory rejected due to invalid host_info");
         return;
     }
-    let (tx, mut rx) = mpsc::channel::<Value>(64);
+    if let Err(err) = sqlx::query(
+        "INSERT INTO standalone_runner_inventory(workspace,runner_id,roots,host_info) VALUES($1,$2,$3,$4)
+        ON CONFLICT(workspace,runner_id) DO UPDATE SET roots=excluded.roots,host_info=excluded.host_info",
+    )
+    .bind(workspace)
+    .bind(runner.id)
+    .bind(json!(inventory.roots))
+    .bind(&inventory.host_info)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(runner_id = %runner.id, error = %err, "failed to persist runner inventory");
+        return;
+    }
+    let (tx, mut rx) = mpsc::channel::<Value>(128);
     let connection = Uuid::new_v4();
     let root_count = inventory.roots.len();
     {
         let mut state = runner.lock();
         for request in state.requests.values_mut().filter(|r| r.state == "sent") {
             request.state = "failed";
+            request.frames.clear();
+            request.bytes = 0;
         }
-        state.connection = Some((connection, tx));
+        state.connection = Some((connection, tx.clone()));
         state.roots = inventory.roots;
         state.host_info = inventory.host_info;
     }
-    runner.notify.notify_waiters();
+    runner.signal();
     tracing::info!(runner_id = %runner.id, roots = root_count, "runner connected");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut heard = Instant::now();
-    'outer: loop {
+    let reason;
+    loop {
         tokio::select! {
             frame = rx.recv() => {
-                let Some(frame) = frame else { break; };
-                if send(&mut socket, Message::Text(frame.to_string().into())).await.is_err() { break; }
+                let Some(frame) = frame else { reason = "channel_closed"; break; };
+                if send(&mut socket, Message::Text(frame.to_string().into())).await.is_err() {
+                    reason = "send_failed";
+                    break;
+                }
             }
             frame = socket.recv() => {
                 heard = Instant::now();
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        let Ok(frame) = serde_json::from_str(&text) else { break; };
-                        if let Some(id) = runner.receive(connection, text.len(), frame)
-                            && send(&mut socket, Message::Text(json!({"type":"cancel","id":id}).to_string().into())).await.is_err() { break; }
+                        let Ok(frame) = serde_json::from_str(&text) else {
+                            reason = "malformed_frame";
+                            break;
+                        };
+                        if let Some(id) = runner.receive(connection, text.len(), frame) {
+                            let _ = tx.try_send(json!({"type":"cancel","id":id}));
+                        }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
-                    _ => break,
+                    Some(Ok(Message::Close(_))) => { reason = "peer_close"; break; }
+                    Some(Err(_)) => { reason = "recv_error"; break; }
+                    None => { reason = "eof"; break; }
+                    _ => {}
                 }
             }
             _ = heartbeat.tick() => {
-                if heard.elapsed() >= Duration::from_secs(20) || send(&mut socket, Message::Ping(Default::default())).await.is_err() { break; }
+                if heard.elapsed() >= Duration::from_secs(20) {
+                    reason = "heartbeat_timeout";
+                    break;
+                }
+                if send(&mut socket, Message::Ping(Default::default())).await.is_err() {
+                    reason = "ping_failed";
+                    break;
+                }
                 for id in runner.expire(connection) {
-                    if send(&mut socket, Message::Text(json!({"type":"cancel","id":id}).to_string().into())).await.is_err() { break 'outer; }
+                    let _ = tx.try_send(json!({"type":"cancel","id":id}));
                 }
             }
         }
@@ -428,9 +522,11 @@ pub(super) async fn serve(runner: &Runner, db: &PgPool, workspace: Uuid, mut soc
         state.connection = None;
         for request in state.requests.values_mut().filter(|r| r.state == "sent") {
             request.state = "failed";
+            request.frames.clear();
+            request.bytes = 0;
         }
-        runner.notify.notify_waiters();
-        tracing::info!(runner_id = %runner.id, "runner disconnected");
+        runner.signal();
+        tracing::info!(runner_id = %runner.id, reason, "runner disconnected");
     }
 }
 
@@ -507,5 +603,15 @@ mod tests {
             "cancelled"
         );
         assert_eq!(rx.try_recv().unwrap(), json!({"type":"cancel","id":id}));
+    }
+
+    #[tokio::test]
+    async fn wait_since_does_not_lose_wakeup() {
+        let runner = Runner::new(Uuid::new_v4(), "fixture");
+        let v0 = runner.version();
+        runner.signal();
+        let start = Instant::now();
+        runner.wait_since(v0, Duration::from_secs(5)).await;
+        assert!(start.elapsed() < Duration::from_millis(200));
     }
 }

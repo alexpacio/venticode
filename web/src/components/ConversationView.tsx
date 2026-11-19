@@ -1,12 +1,13 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle, Pencil, Trash2 } from "lucide-react";
 import { api, ApiError } from "../api/client.ts";
 import type { Conversation, Harness, PermissionMode } from "../api/client.ts";
 import { useConversation, useHarnesses, useModels, useProjects, useTranscript } from "../queries.ts";
-import { fold, type Transcript } from "../transcript.ts";
+import type { Transcript } from "../transcript.ts";
 import { t } from "../i18n/index.ts";
+import { ErrorBoundary } from "./ErrorBoundary.tsx";
 import { Terminal } from "./Terminal.tsx";
 import { ToolActions } from "./TranscriptView.tsx";
 import { AgentControls } from "./AgentControls.tsx";
@@ -15,15 +16,26 @@ import type { ReactNode } from "react";
 
 export const modes = (): Array<[PermissionMode, string]> => [["ask", t("Chiedi prima di modificare")], ["auto_edit", t("Accetta modifiche")], ["plan", t("Solo piano")]];
 
+type UpdateResult = { ok: boolean; error?: string };
+type UpdateFn = (
+  change: Partial<Pick<Conversation, "model" | "permission_mode" | "title">>,
+  options?: { reportError?: boolean },
+) => Promise<UpdateResult>;
+
 export function ConversationView({ menu, panelToggle }: { menu: ReactNode; panelToggle?: ReactNode }) {
   const { id = "" } = useParams();
   const conversation = useConversation(id);
-  const { events, disconnected } = useTranscript(id, Boolean(conversation.data));
+  const { transcript, disconnected } = useTranscript(id, Boolean(conversation.data));
   const pending = useRef<{ key: string; id: string } | null>(null);
-  const transcript = useMemo(() => fold(events), [events]);
   const harness = useHarnesses().data?.find((h) => h.id === conversation.data?.harness_id);
   const project = useProjects().data?.find((p) => p.id === conversation.data?.project_id);
   const [actionError, setActionError] = useState("");
+  const update = useUpdate(id, setActionError);
+
+  useEffect(() => {
+    setActionError("");
+    pending.current = null;
+  }, [id]);
 
   if (conversation.isError) {
     const notFound = conversation.error instanceof ApiError && conversation.error.status === 404;
@@ -36,8 +48,7 @@ export function ConversationView({ menu, panelToggle }: { menu: ReactNode; panel
   if (!conversation.data)
     return <main className="main"><div className="topbar">{menu}</div><div className="empty" role="status"><LoaderCircle className="spin" aria-hidden="true" /></div></main>;
   const c = conversation.data;
-  const lastRunEvent = [...events].reverse().find((e) => e.type === "run");
-  const running = lastRunEvent ? transcript.running : (c.state === "running" || c.state === "waiting");
+  const running = transcript.hasRunEvent ? transcript.running : (c.state === "running" || c.state === "waiting");
   const send = async (content: string, intent = "message", reference?: string) => {
     setActionError("");
     const key = JSON.stringify([id, content, intent, reference]);
@@ -62,33 +73,34 @@ export function ConversationView({ menu, panelToggle }: { menu: ReactNode; panel
   return (
     <>
       <main className="main">
-        <Header key={c.id} conversation={c} harness={harness} projectLabel={projectLabel} menu={menu} panelToggle={panelToggle} running={running} onError={setActionError} />
+        <Header key={`header-${c.id}`} conversation={c} harness={harness} projectLabel={projectLabel} menu={menu} panelToggle={panelToggle} running={running} update={update} onError={setActionError} />
         {disconnected && <div className="agent-controls" role="status"><span className="muted" style={{ fontSize: 12 }}>{t("Connessione persa, riconnessione in corso…")}</span></div>}
         {actionError && <div className="agent-controls" role="alert"><span className="error-line">{actionError}</span></div>}
-        <Terminal key={id} project={project} chat={c} blocks={transcript.blocks} />
-        {transcript.blocks.map(block => block.kind === "tool" && <ToolActions key={block.id} block={block} harness={harness?.name || ""} />)}
-        <AgentControls key={c.id} c={c} events={events} running={running} send={send} />
-        <Composer key={c.id} placeholder={c.question_id ? t("Rispondi alla domanda…") : t("Scrivi un messaggio, /goal obiettivo o /plan richiesta…")} onSend={async (text) => {
+        <ErrorBoundary resetKey={id} inline>
+          <Terminal key={`terminal-${id}`} project={project} chat={c} blocks={transcript.blocks} />
+        </ErrorBoundary>
+        {transcript.blocks.map(block => block.kind === "tool" && <ToolActions key={block.id} block={block} harness={harness?.name || ""} disconnected={disconnected} />)}
+        <AgentControls key={`controls-${c.id}`} c={c} transcript={transcript} running={running} send={send} />
+        <Composer key={`composer-${c.id}`} placeholder={c.question_id ? t("Rispondi alla domanda…") : t("Scrivi un messaggio, /goal obiettivo o /plan richiesta…")} onSend={async (text) => {
           if (c.question_id) await send(text, "answer", c.question_id);
           else if (text.startsWith("/goal ")) await send(text.slice(6).trim(), "goal");
           else if (text.startsWith("/plan ")) await send(text.slice(6).trim(), "plan");
           else await send(text);
         }} onStop={() => void stop()} running={running}
           disabled={harness && !harness.online && !harness.managed ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
-          controls={<ModeSelect conversation={c} onError={setActionError} />} />
+          controls={<ModeSelect conversation={c} update={update} />} />
       </main>
       <SessionPanel transcript={transcript} harness={harness} projectLabel={projectLabel} />
     </>
   );
 }
 
-function Header({ conversation, harness, projectLabel, menu, panelToggle, running, onError }: {
-  conversation: Conversation; harness?: Harness; projectLabel: string; menu: ReactNode; panelToggle?: ReactNode; running: boolean; onError: (msg: string) => void;
+function Header({ conversation, harness, projectLabel, menu, panelToggle, running, update, onError }: {
+  conversation: Conversation; harness?: Harness; projectLabel: string; menu: ReactNode; panelToggle?: ReactNode; running: boolean; update: UpdateFn; onError: (msg: string) => void;
 }) {
   const models = useModels();
   const client = useQueryClient();
   const navigate = useNavigate();
-  const update = useUpdate(conversation, onError);
   const [renaming, setRenaming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const remove = async () => {
@@ -125,21 +137,27 @@ function Header({ conversation, harness, projectLabel, menu, panelToggle, runnin
       <button className="icon-btn" title={t("Rinomina conversazione")} aria-label={t("Rinomina conversazione")} disabled={running} onClick={() => setRenaming(true)}><Pencil size={16} aria-hidden="true" /></button>
       <button className="icon-btn" title={t("Elimina conversazione")} aria-label={t("Elimina conversazione")} disabled={running || deleting} onClick={() => void remove()}><Trash2 size={16} aria-hidden="true" /></button>
       {panelToggle}
-      {renaming && <RenameDialog title={conversation.title} onClose={() => setRenaming(false)} onSave={(title) => update({ title })} />}
+      {renaming && <RenameDialog title={conversation.title} onClose={() => setRenaming(false)} onSave={(title) => update({ title }, { reportError: false })} />}
     </header>
   );
 }
 
-function RenameDialog({ title, onClose, onSave }: { title: string; onClose: () => void; onSave: (title: string) => Promise<boolean> }) {
+function RenameDialog({ title, onClose, onSave }: { title: string; onClose: () => void; onSave: (title: string) => Promise<UpdateResult> }) {
   const ref = useRef<HTMLDialogElement>(null);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const save = async (value: string) => {
     const next = value.trim();
     if (!next) return;
     if (next === title.trim()) { onClose(); return; }
     setSaving(true);
-    if (await onSave(next)) onClose();
-    else setSaving(false);
+    setError("");
+    const result = await onSave(next);
+    if (result.ok) onClose();
+    else {
+      setError(result.error || t("Si è verificato un errore imprevisto"));
+      setSaving(false);
+    }
   };
   return (
     <dialog ref={(node) => { ref.current = node; if (node && !node.open) node.showModal(); }} onClose={onClose} onClick={(e) => { if (e.target === ref.current) ref.current.close(); }} aria-labelledby="rename-conversation">
@@ -151,6 +169,7 @@ function RenameDialog({ title, onClose, onSave }: { title: string; onClose: () =
         <label className="field"><span>{t("Titolo della conversazione")}</span>
           <input autoFocus className="input" name="title" defaultValue={title} maxLength={200} required />
         </label>
+        {error && <p className="error-line" role="alert" style={{ margin: 0 }}>{error}</p>}
         <div className="dialog-actions">
           <button className="btn" type="button" onClick={() => ref.current?.close()}>{t("Annulla")}</button>
           <button className="btn btn-primary" disabled={saving}>{t("Salva")}</button>
@@ -160,8 +179,7 @@ function RenameDialog({ title, onClose, onSave }: { title: string; onClose: () =
   );
 }
 
-function ModeSelect({ conversation, onError }: { conversation: Conversation; onError: (msg: string) => void }) {
-  const update = useUpdate(conversation, onError);
+function ModeSelect({ conversation, update }: { conversation: Conversation; update: UpdateFn }) {
   return (
     <label className="select-inline">{t("Modalità")}
       <select value={conversation.permission_mode} onChange={(e) => void update({ permission_mode: e.target.value as PermissionMode })}>
@@ -171,21 +189,44 @@ function ModeSelect({ conversation, onError }: { conversation: Conversation; onE
   );
 }
 
-function useUpdate(conversation: Conversation, onError: (msg: string) => void) {
+function useUpdate(conversationId: string, onError: (msg: string) => void): UpdateFn {
   const client = useQueryClient();
-  return async (change: Partial<Pick<Conversation, "model" | "permission_mode" | "title">>) => {
-    let saved = false;
-    onError("");
-    try {
-      const next = await api<Conversation>(`/conversations/${conversation.id}`, "PATCH", { revision: conversation.revision, ...change });
-      client.setQueryData(["conversation", conversation.id], next);
-      saved = true;
-    } catch (failure) {
-      onError((failure as Error).message);
-    }
-    void client.invalidateQueries({ queryKey: ["conversation", conversation.id] });
-    void client.invalidateQueries({ queryKey: ["conversations"] });
-    return saved;
+  const queueRef = useRef<Promise<unknown>>(Promise.resolve());
+  useEffect(() => {
+    queueRef.current = Promise.resolve();
+  }, [conversationId]);
+  return (change, options) => {
+    const reportError = options?.reportError ?? true;
+    const task = queueRef.current
+      .catch(() => {})
+      .then(async (): Promise<UpdateResult> => {
+        if (reportError) onError("");
+        await client.cancelQueries({ queryKey: ["conversation", conversationId] });
+        const current = client.getQueryData<Conversation>(["conversation", conversationId]);
+        if (!current) {
+          const msg = t("Impossibile caricare la conversazione");
+          if (reportError) onError(msg);
+          return { ok: false, error: msg };
+        }
+        try {
+          const next = await api<Conversation>(`/conversations/${conversationId}`, "PATCH", {
+            revision: current.revision,
+            ...change,
+          });
+          await client.cancelQueries({ queryKey: ["conversation", conversationId] });
+          client.setQueryData(["conversation", conversationId], next);
+          void client.invalidateQueries({ queryKey: ["conversations"] });
+          return { ok: true };
+        } catch (failure) {
+          const msg = (failure as Error).message;
+          if (reportError) onError(msg);
+          void client.invalidateQueries({ queryKey: ["conversation", conversationId] });
+          void client.invalidateQueries({ queryKey: ["conversations"] });
+          return { ok: false, error: msg };
+        }
+      });
+    queueRef.current = task;
+    return task;
   };
 }
 

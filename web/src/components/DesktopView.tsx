@@ -5,10 +5,12 @@ import { useComputerStatus } from "../queries.ts";
 import { t } from "../i18n/index.ts";
 import { BrowserScreen, type BrowserFrame } from "./BrowserScreen.tsx";
 import { decodeFrame } from "./BrowserView.tsx";
+import { ErrorBoundary } from "./ErrorBoundary.tsx";
 
 export function DesktopView({ menu }: { menu: ReactNode }) {
   const status = useComputerStatus(true);
   const socket = useRef<WebSocket | null>(null);
+  const startTimeout = useRef<number | undefined>(undefined);
   const lastMove = useRef(0);
   const control = useRef<HTMLButtonElement>(null);
   const [connected, setConnected] = useState(false);
@@ -17,13 +19,22 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
   const [changingControl, setChangingControl] = useState(false);
   const [error, setError] = useState("");
 
+  const clearStartTimeout = () => {
+    if (startTimeout.current !== undefined) {
+      window.clearTimeout(startTimeout.current);
+      startTimeout.current = undefined;
+    }
+  };
+
   useEffect(() => () => {
+    clearStartTimeout();
     const ws = socket.current;
     socket.current = null;
     ws?.close();
   }, []);
 
   function close(failed = false, message = "") {
+    clearStartTimeout();
     const ws = socket.current;
     socket.current = null;
     if (ws?.readyState === WebSocket.OPEN && !failed) {
@@ -38,6 +49,7 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
   }
 
   function start() {
+    if (socket.current) return;
     setError("");
     setConnected(true);
     const url = new URL(`${base}/computer/screen`, location.origin);
@@ -46,11 +58,12 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
     socket.current = ws;
     ws.binaryType = "arraybuffer";
     let ready = false;
-    const timeout = window.setTimeout(() => {
+    clearStartTimeout();
+    startTimeout.current = window.setTimeout(() => {
+      startTimeout.current = undefined;
       if (socket.current === ws && !ready) close(true);
     }, 90_000);
     ws.onerror = ws.onclose = () => {
-      window.clearTimeout(timeout);
       if (socket.current === ws) close(true);
     };
     ws.onmessage = event => {
@@ -60,12 +73,12 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
           const next = decodeFrame(event.data);
           if (next?.tab === "desktop") {
             ready = true;
-            window.clearTimeout(timeout);
+            clearStartTimeout();
             setFrame(next);
           }
         } else {
           const packet = JSON.parse(event.data);
-          if (packet.type === "ready") { ready = true; window.clearTimeout(timeout); }
+          if (packet.type === "ready") { ready = true; clearStartTimeout(); }
           if (packet.type === "control") { setHuman(packet.human === true); setChangingControl(false); }
           if (packet.type === "error") { setChangingControl(false); setError(t("Impossibile completare l’azione.")); }
           if (packet.type === "ended") {
@@ -111,15 +124,17 @@ export function DesktopView({ menu }: { menu: ReactNode }) {
     </header>
     {connected ? <>
       <div className="desktop-surface">
-        <BrowserScreen frame={frame} human={human} desktop exit={control}
-          onFailure={() => close(true)} onInput={(tab, input) => {
-            if ("kind" in input && input.kind === "move") {
-              const now = performance.now();
-              if (now - lastMove.current < 30) return;
-              lastMove.current = now;
-            }
-            send({ type: "input", tab, input });
-          }} />
+        <ErrorBoundary inline>
+          <BrowserScreen frame={frame} human={human} desktop exit={control}
+            onFailure={() => close(true)} onInput={(tab, input) => {
+              if ("kind" in input && input.kind === "move") {
+                const now = performance.now();
+                if (now - lastMove.current < 30) return;
+                lastMove.current = now;
+              }
+              send({ type: "input", tab, input });
+            }} />
+        </ErrorBoundary>
         {!frame && <div className="browser-placeholder" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }} role="status">
           <LoaderCircle className="spin" aria-hidden="true" />{t("Avvio del desktop…")}
         </div>}

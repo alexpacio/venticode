@@ -16,13 +16,28 @@ use uuid::Uuid;
 // Replace the fragment before posting it back to this random, loopback-only path.
 const RETURN_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>Venticode</title>
 <p id="status">Collegamento… / Connecting…</p><script>
+const status = document.getElementById('status');
 const code = location.hash.slice(1);
 history.replaceState(null, '', location.pathname);
-fetch(location.pathname, {method:'POST',body:decodeURIComponent(code)}).then(r=>{
-document.getElementById('status').textContent = r.ok ? 'Torna al terminale / Return to the terminal' : 'Collegamento fallito / Connection failed';
-}).catch(()=>{
-document.getElementById('status').textContent = 'Collegamento fallito / Connection failed';
-});</script>"#;
+let decoded;
+try {
+  decoded = decodeURIComponent(code);
+} catch {
+  status.textContent = 'Collegamento fallito / Connection failed';
+}
+if (decoded !== undefined) {
+  fetch(location.pathname, {method:'POST',body:decoded}).then(r=>{
+    status.textContent = r.ok ? 'Torna al terminale / Return to the terminal' : 'Collegamento fallito / Connection failed';
+  }).catch(()=>{
+    status.textContent = 'Collegamento fallito / Connection failed';
+  });
+}</script>"#;
+
+fn callback_response(status: u16, reason: &str, body: Vec<u8>) -> Response {
+    Response::new(status, reason, body)
+        .with_header("Cache-Control", "no-store")
+        .with_header("Referrer-Policy", "no-referrer")
+}
 
 fn sign_in_url(portal: &str, port: &str, state: &str) -> Result<Url> {
     let mut url = Url::parse(&format!("{portal}/app/venticode"))?;
@@ -66,10 +81,10 @@ pub async fn browser(cx: &Cx, portal: &str, en: bool) -> Result<String> {
             let sender = sender_for_handler.clone();
             async move {
                 if req.uri != expected_path {
-                    return Response::new(404, "Not Found", Vec::new());
+                    return callback_response(404, "Not Found", Vec::new());
                 }
                 match req.method {
-                    Method::Get => Response::new(200, "OK", RETURN_PAGE.as_bytes().to_vec())
+                    Method::Get => callback_response(200, "OK", RETURN_PAGE.as_bytes().to_vec())
                         .with_header("Content-Type", "text/html; charset=utf-8"),
                     Method::Post => {
                         let host_ok = req
@@ -79,25 +94,28 @@ pub async fn browser(cx: &Cx, portal: &str, en: bool) -> Result<String> {
                             .header_value("origin")
                             .is_some_and(|v| v.eq_ignore_ascii_case(&expected_origin));
                         if !host_ok || !origin_ok {
-                            return Response::new(403, "Forbidden", Vec::new());
+                            return callback_response(403, "Forbidden", Vec::new());
                         }
                         let Ok(body) = String::from_utf8(req.body) else {
-                            return Response::new(400, "Bad Request", Vec::new());
+                            return callback_response(400, "Bad Request", Vec::new());
                         };
                         if body.is_empty() {
-                            return Response::new(400, "Bad Request", Vec::new());
+                            return callback_response(400, "Bad Request", Vec::new());
                         }
                         let taken = sender.lock().unwrap_or_else(|e| e.into_inner()).take();
                         if let Some(tx) = taken {
-                            if let Some(req_cx) = Cx::current() {
-                                let _ = tx.send(&req_cx, body);
+                            let sent =
+                                Cx::current().is_some_and(|req_cx| tx.send(&req_cx, body).is_ok());
+                            if sent {
+                                callback_response(200, "OK", Vec::new())
+                            } else {
+                                callback_response(500, "Internal Server Error", Vec::new())
                             }
-                            Response::new(200, "OK", Vec::new())
                         } else {
-                            Response::new(410, "Gone", Vec::new())
+                            callback_response(410, "Gone", Vec::new())
                         }
                     }
-                    _ => Response::new(405, "Method Not Allowed", Vec::new()),
+                    _ => callback_response(405, "Method Not Allowed", Vec::new()),
                 }
             }
         },
@@ -160,5 +178,27 @@ mod tests {
             url.query().unwrap(),
             format!("terminal=1&port=49152&state={state}")
         );
+    }
+
+    #[test]
+    fn callback_responses_set_security_headers() {
+        let res = callback_response(200, "OK", Vec::new());
+        assert!(
+            res.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("cache-control") && v == "no-store")
+        );
+        assert!(
+            res.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("referrer-policy") && v == "no-referrer")
+        );
+    }
+
+    #[test]
+    fn return_page_guards_decode_uri_component() {
+        assert!(RETURN_PAGE.contains("try {"));
+        assert!(RETURN_PAGE.contains("decodeURIComponent(code)"));
+        assert!(RETURN_PAGE.contains("} catch {"));
     }
 }

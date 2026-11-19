@@ -3,7 +3,7 @@ import { Navigate, useNavigate } from "react-router-dom";
 import type { Session } from "../api/client.ts";
 import { useHarnesses, useProjects } from "../queries.ts";
 import { t } from "../i18n/index.ts";
-import { Terminal } from "./Terminal.tsx";
+
 export function Home({ session, menu }: { session: Session; menu: ReactNode }) {
   const projects = useProjects();
   const harnesses = useHarnesses();
@@ -47,7 +47,11 @@ export function Home({ session, menu }: { session: Session; menu: ReactNode }) {
           </a>
         )}
       </header>
-      <Terminal notice={notice} />
+      <section className="terminal" aria-label={t("Terminale")}>
+        <div className="terminal-viewport" role={projects.isError ? "alert" : "status"}>
+          <p className="terminal-notice">{notice}</p>
+        </div>
+      </section>
     </main>
   );
 }

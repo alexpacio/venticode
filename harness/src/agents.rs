@@ -2,12 +2,24 @@
 use crate::protocol::Agent;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::VecDeque, path::Path};
+
+const MAX_PENDING_PROMPTS: usize = 8;
+
+fn format_error(err: &Value) -> String {
+    if let Some(msg) = err["message"].as_str() {
+        msg.to_owned()
+    } else if let Some(msg) = err.as_str() {
+        msg.to_owned()
+    } else {
+        err.to_string()
+    }
+}
 
 pub struct Session {
     agent: Agent,
     cwd: String,
-    prompt: Option<String>,
+    prompts: VecDeque<String>,
     stage: u8,
     thread_id: Option<String>,
     session_id: Option<String>,
@@ -19,16 +31,25 @@ impl Session {
             prompt.is_none_or(|v| !v.is_empty() && v.len() <= 32768),
             "Invalid agent prompt"
         );
+        let mut prompts = VecDeque::new();
+        if let Some(prompt) = prompt {
+            prompts.push_back(prompt.to_owned());
+        }
         Ok(Self {
             agent,
             cwd: cwd.to_str().context("Invalid working directory")?.into(),
-            prompt: prompt.map(str::to_owned),
+            prompts,
             stage: 0,
             thread_id: None,
             session_id: None,
             turn_seq: 0,
         })
     }
+
+    pub fn is_ready(&self) -> bool {
+        self.stage >= 3
+    }
+
     fn format_prompt(&mut self, text: &str) -> Result<Value> {
         self.turn_seq += 1;
         let id = if self.turn_seq == 1 {
@@ -51,15 +72,20 @@ impl Session {
             }
         })
     }
+
+    fn drain_pending_prompts(&mut self) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(self.prompts.len());
+        while let Some(prompt) = self.prompts.pop_front() {
+            out.push(self.format_prompt(&prompt)?);
+        }
+        Ok(out)
+    }
+
     pub fn start(&mut self) -> Vec<Value> {
         match self.agent {
             Agent::ClaudeCode | Agent::Pi => {
                 self.stage = 3;
-                if let Some(prompt) = self.prompt.take() {
-                    self.format_prompt(&prompt).into_iter().collect()
-                } else {
-                    vec![]
-                }
+                self.drain_pending_prompts().unwrap_or_default()
             }
             Agent::Codex => {
                 self.stage = 1;
@@ -75,21 +101,31 @@ impl Session {
             }
         }
     }
+
     pub fn prompt(&mut self, prompt: &str) -> Result<Vec<Value>> {
         ensure!(
             !prompt.is_empty() && prompt.len() <= 32768,
             "Invalid agent prompt"
         );
         if self.stage < 3 {
-            self.prompt = Some(prompt.to_owned());
+            ensure!(
+                self.prompts.len() < MAX_PENDING_PROMPTS,
+                "Too many prompts queued before agent handshake"
+            );
+            self.prompts.push_back(prompt.to_owned());
             return Ok(vec![]);
         }
         Ok(vec![self.format_prompt(prompt)?])
     }
+
     pub fn receive(&mut self, event: &Value) -> Result<Vec<Value>> {
         let id = event["id"].as_str().unwrap_or("");
         if id == "ventiharness:init" && self.stage == 1 {
-            ensure!(event["error"].is_null(), "Agent initialization failed");
+            ensure!(
+                event["error"].is_null(),
+                "Agent initialization failed: {}",
+                format_error(&event["error"])
+            );
             self.stage = 2;
             return Ok(if self.agent == Agent::Codex {
                 vec![
@@ -107,32 +143,29 @@ impl Session {
             });
         }
         if id == "ventiharness:session" && self.stage == 2 {
-            ensure!(event["error"].is_null(), "Agent session creation failed");
+            ensure!(
+                event["error"].is_null(),
+                "Agent session creation failed: {}",
+                format_error(&event["error"])
+            );
             self.stage = 3;
             if self.agent == Agent::Codex {
                 let thread = event["result"]["thread"]["id"]
                     .as_str()
                     .context("Missing Codex thread")?;
                 self.thread_id = Some(thread.to_owned());
-                return if let Some(prompt) = self.prompt.take() {
-                    Ok(vec![self.format_prompt(&prompt)?])
-                } else {
-                    Ok(vec![])
-                };
+                return self.drain_pending_prompts();
             }
             let session = event["result"]["sessionId"]
                 .as_str()
                 .context("Missing ACP session")?;
             self.session_id = Some(session.to_owned());
-            return if let Some(prompt) = self.prompt.take() {
-                Ok(vec![self.format_prompt(&prompt)?])
-            } else {
-                Ok(vec![])
-            };
+            return self.drain_pending_prompts();
         }
         Ok(vec![])
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +173,7 @@ mod tests {
     fn codex_initializes_once_before_starting_a_turn_and_supports_followup() {
         let mut session =
             Session::new(Agent::Codex, Path::new("/project"), Some("fix test")).unwrap();
+        assert!(!session.is_ready());
         assert_eq!(session.start()[0]["method"], "initialize");
         let ready = json!({"id":"ventiharness:init","result":{}});
         assert_eq!(
@@ -152,12 +186,46 @@ mod tests {
             session.receive(&event).unwrap()[0]["params"]["threadId"],
             "native-thread"
         );
+        assert!(session.is_ready());
         assert!(session.receive(&event).unwrap().is_empty());
         let follow = session.prompt("now add tests").unwrap();
         assert_eq!(follow[0]["method"], "turn/start");
         assert_eq!(follow[0]["params"]["threadId"], "native-thread");
         assert_eq!(follow[0]["params"]["input"][0]["text"], "now add tests");
     }
+
+    #[test]
+    fn queues_multiple_pre_handshake_prompts_with_cap_and_surfaces_errors() {
+        let mut session = Session::new(Agent::Codex, Path::new("/project"), Some("first")).unwrap();
+        session.start();
+        for i in 2..=MAX_PENDING_PROMPTS {
+            assert!(session.prompt(&format!("prompt-{i}")).unwrap().is_empty());
+        }
+        assert!(session.prompt("overflow").is_err());
+
+        // Surface init error details
+        let mut failing = Session::new(Agent::Codex, Path::new("/project"), None).unwrap();
+        failing.start();
+        let err = failing
+            .receive(
+                &json!({"id":"ventiharness:init","error":{"code":-32000,"message":"auth expired"}}),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("auth expired"));
+
+        // Drain all queued prompts in FIFO order once session starts
+        session
+            .receive(&json!({"id":"ventiharness:init","result":{}}))
+            .unwrap();
+        let emitted = session
+            .receive(&json!({"id":"ventiharness:session","result":{"thread":{"id":"t-fifo"}}}))
+            .unwrap();
+        assert_eq!(emitted.len(), MAX_PENDING_PROMPTS);
+        assert_eq!(emitted[0]["params"]["input"][0]["text"], "first");
+        assert_eq!(emitted[1]["params"]["input"][0]["text"], "prompt-2");
+        assert_eq!(emitted[7]["params"]["input"][0]["text"], "prompt-8");
+    }
+
     #[test]
     fn incompatible_acp_does_not_start_a_session() {
         let mut session =
@@ -169,6 +237,7 @@ mod tests {
                 .is_err()
         );
     }
+
     #[test]
     fn promptless_codex_and_acp_sessions_still_complete_handshake_and_followup() {
         let mut codex = Session::new(Agent::Codex, Path::new("/project"), None).unwrap();

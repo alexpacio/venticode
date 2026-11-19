@@ -10,6 +10,7 @@ mod privacy;
 mod projects;
 mod runner;
 mod runs;
+mod secrets;
 mod standalone;
 mod storage;
 mod tools;
@@ -24,21 +25,136 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use std::{env, sync::Arc, time::Duration};
+use sqlx::{Executor, PgPool, Row, postgres::PgPoolOptions};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::{broadcast, watch};
-use tower_http::services::{ServeDir, ServeFile};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HubEvent {
+    Stored,
+    Approval(Uuid),
+}
+
+/// Per-conversation event fan-out hub with automatic pruning when no subscriber remains.
+#[derive(Default)]
+pub(crate) struct EventHub {
+    channels: Mutex<HashMap<Uuid, broadcast::Sender<HubEvent>>>,
+}
+
+impl EventHub {
+    pub fn subscribe(&self, conversation_id: Uuid) -> broadcast::Receiver<HubEvent> {
+        let mut map = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = map.get(&conversation_id) {
+            return tx.subscribe();
+        }
+        let (tx, rx) = broadcast::channel(64);
+        map.insert(conversation_id, tx);
+        rx
+    }
+
+    pub fn notify_stored(&self, conversation_id: Uuid) {
+        self.send(conversation_id, HubEvent::Stored);
+    }
+
+    pub fn notify_approval(&self, conversation_id: Uuid, approval_id: Uuid) {
+        self.send(conversation_id, HubEvent::Approval(approval_id));
+    }
+
+    fn send(&self, conversation_id: Uuid, event: HubEvent) {
+        let mut map = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = map.get(&conversation_id)
+            && tx.send(event).is_err()
+            && tx.receiver_count() == 0
+        {
+            map.remove(&conversation_id);
+        }
+    }
+
+    pub fn prune_if_empty(&self, conversation_id: Uuid) {
+        let mut map = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(&conversation_id)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            map.remove(&conversation_id);
+        }
+    }
+}
+
+/// Registry of active in-memory run cancellation tokens for immediate `interrupt()` and shutdown.
+#[derive(Default)]
+pub(crate) struct RunRegistry {
+    tokens: Mutex<HashMap<Uuid, CancellationToken>>,
+}
+
+impl RunRegistry {
+    pub fn register(&self, run_id: Uuid) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id, token.clone());
+        token
+    }
+
+    pub fn cancel(&self, run_id: Uuid) {
+        if let Some(token) = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&run_id)
+            .cloned()
+        {
+            token.cancel();
+        }
+    }
+
+    pub fn cancel_all(&self) {
+        let tokens: Vec<_> = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    pub fn remove(&self, run_id: Uuid) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+    }
+}
 
 #[derive(Clone)]
 struct App {
     db: PgPool,
+    /// Streaming-capable HTTP client (no overall body timeout; callers apply TTFB/idle timeouts).
     http: reqwest::Client,
+    /// Bounded HTTP client (20s total timeout) for control-plane & metadata API calls.
+    http_api: reqwest::Client,
     storage: Arc<storage::Storage>,
     ventic: Option<Arc<Ventic>>,
     standalone: Option<Arc<standalone::Standalone>>,
     computers: Option<Arc<computer::Computers>>,
-    events: broadcast::Sender<Uuid>,
+    events: Arc<EventHub>,
+    runs: Arc<RunRegistry>,
+    tasks: TaskTracker,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -100,36 +216,75 @@ fn require_env(name: &str) -> std::result::Result<String, Box<dyn std::error::Er
     env::var(name).map_err(|_| format!("Missing required environment variable: {name}").into())
 }
 
+/// Join all `Cookie` headers (handling HTTP/2 multi-header cookie splitting).
+pub(crate) fn merged_cookies(h: &HeaderMap) -> Option<String> {
+    let mut out = String::new();
+    for v in h.get_all(header::COOKIE) {
+        let Ok(s) = v.to_str() else { continue };
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(s);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 impl App {
+    fn control_request_with(
+        &self,
+        client: &reqwest::Client,
+        h: &HeaderMap,
+        method: Method,
+        path: &str,
+        forward_content_type: bool,
+    ) -> Result<reqwest::RequestBuilder> {
+        let ventic = self.ventic.as_ref().ok_or_else(missing)?;
+        let mut req = client.request(
+            method,
+            format!("{}/internal/venticode/{path}", ventic.control),
+        );
+        for name in [header::HOST, header::ORIGIN] {
+            if let Some(v) = h.get(&name) {
+                req = req.header(name, v);
+            }
+        }
+        if let Some(cookies) = merged_cookies(h) {
+            req = req.header(header::COOKIE, cookies);
+        }
+        if forward_content_type && let Some(ct) = h.get(header::CONTENT_TYPE) {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        Ok(req.header("x-service-token", &ventic.service_token))
+    }
+
     fn control_request(
         &self,
         h: &HeaderMap,
         method: Method,
         path: &str,
     ) -> Result<reqwest::RequestBuilder> {
-        let ventic = self.ventic.as_ref().ok_or_else(missing)?;
-        let mut req = self.http.request(
-            method,
-            format!("{}/internal/venticode/{path}", ventic.control),
-        );
-        for name in [
-            header::HOST,
-            header::ORIGIN,
-            header::COOKIE,
-            header::CONTENT_TYPE,
-        ] {
-            if let Some(v) = h.get(&name) {
-                req = req.header(name, v);
-            }
-        }
-        Ok(req.header("x-service-token", &ventic.service_token))
+        self.control_request_with(&self.http, h, method, path, false)
     }
+
+    fn control_api_request(
+        &self,
+        h: &HeaderMap,
+        method: Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        self.control_request_with(&self.http_api, h, method, path, false)
+    }
+
     async fn control_json(&self, h: &HeaderMap, path: &str) -> Result<Value> {
         if let Some(local) = &self.standalone {
             return local.json(self, h, path).await;
         }
         let res = self
-            .control_request(h, Method::GET, path)?
+            .control_api_request(h, Method::GET, path)?
             .send()
             .await
             .map_err(|_| unavailable())?;
@@ -237,7 +392,7 @@ async fn proxy(
         };
     }
     let upstream = app
-        .control_request(&h, method, path)?
+        .control_request_with(&app.http_api, &h, method, path, true)?
         .body(body)
         .send()
         .await
@@ -281,12 +436,14 @@ async fn security_headers(
         .insert(header::CACHE_CONTROL, cache.parse().unwrap());
     res.headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
+    // `same-origin` avoids leaking referrers cross-origin while allowing browsers
+    // to send the real `Origin` header on same-origin POST forms such as `/venticode/login`.
     res.headers_mut()
-        .insert("referrer-policy", "no-referrer".parse().unwrap());
+        .insert("referrer-policy", "same-origin".parse().unwrap());
     res
 }
 
-async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>, runs: Arc<RunRegistry>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -306,6 +463,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
         _ = terminate => tracing::info!("received SIGTERM, draining"),
     }
     let _ = shutdown_tx.send(true);
+    runs.cancel_all();
 }
 
 #[tokio::main]
@@ -346,24 +504,42 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let db = PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(10))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET statement_timeout = '30s'").await?;
+                Ok(())
+            })
+        })
         .connect(&database_url)
         .await
         .map_err(|e| format!("Failed to connect to DATABASE_URL: {e}"))?;
     sqlx::migrate!("./server/migrations").run(&db).await?;
-    let (events, _) = broadcast::channel(512);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+    let http_api = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()?;
+    let runs = Arc::new(RunRegistry::default());
     let app = App {
         db,
-        http: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(15))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()?,
+        http,
+        http_api,
         ventic,
         standalone,
         computers: computer::Computers::from_env()?.map(Arc::new),
         storage: Arc::new(storage::Storage::new()?),
-        events,
+        events: Arc::new(EventHub::default()),
+        runs: runs.clone(),
+        tasks: TaskTracker::new(),
         shutdown: shutdown_rx,
     };
     if let Some(local) = &app.standalone {
@@ -399,7 +575,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_else(|| "'none'".into());
-    let frame_policy = header::HeaderValue::from_str(&format!("frame-ancestors {frame_ancestor}"))?;
+    let csp = header::HeaderValue::from_str(&format!(
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors {frame_ancestor}"
+    ))?;
     let router = if app.ventic.is_some() {
         Router::new()
             .route("/internal/privacy/{action}", post(privacy::handle))
@@ -423,9 +601,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
-            frame_policy,
+            csp,
         ))
         .layer(axum::middleware::from_fn(security_headers))
+        .layer(TraceLayer::new_for_http())
         .with_state(app.clone());
     let mentions_task = tokio::spawn(mentions::worker(app.clone()));
     let computer_task = app
@@ -444,9 +623,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "venticode server started"
     );
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx, runs))
         .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+    app.tasks.close();
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        app.tasks.wait().await;
         let _ = mentions_task.await;
         if let Some(task) = computer_task {
             let _ = task.await;

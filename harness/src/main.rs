@@ -53,15 +53,13 @@ fn init_logging() {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let use_rich = !matches!(cli.command, Command::Mcp(_));
-    if !matches!(cli.command, Command::Mcp(_)) {
-        #[cfg(target_os = "linux")]
-        let is_worker = matches!(cli.command, Command::Worker);
-        #[cfg(not(target_os = "linux"))]
-        let is_worker = false;
-        if !is_worker {
-            init_logging();
-        }
+    #[cfg(target_os = "linux")]
+    let is_worker = matches!(cli.command, Command::Worker);
+    #[cfg(not(target_os = "linux"))]
+    let is_worker = false;
+    let use_rich = !matches!(cli.command, Command::Mcp(_)) && !is_worker;
+    if !matches!(cli.command, Command::Mcp(_)) && !is_worker {
+        init_logging();
     }
     let result: Result<()> = match cli.command {
         Command::Mcp(command) => mcp::manage(&command).await,

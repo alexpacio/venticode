@@ -5,24 +5,28 @@ use rmcp::transport::auth::{
     OAuthState, StoredCredentials,
 };
 use serde_json::json;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 struct Store {
     id: String,
     url: String,
 }
-fn store_error(_: impl std::fmt::Display) -> AuthError {
+fn store_error(error: impl std::fmt::Display) -> AuthError {
+    tracing::warn!(error = %error, "local MCP credential store error");
     AuthError::CredentialStoreError("Local MCP credential store unavailable".into())
-}
-impl Store {
-    fn entry(&self) -> Result<keyring::Entry, keyring::Error> {
-        keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &self.id)
-    }
 }
 #[async_trait::async_trait]
 impl CredentialStore for Store {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        match self.entry().map_err(store_error)?.get_password() {
+        let id = self.id.clone();
+        let fetched = tokio::task::spawn_blocking(move || {
+            let entry = keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &id)?;
+            entry.get_password()
+        })
+        .await
+        .map_err(store_error)?;
+        match fetched {
             Ok(raw) => {
                 let raw = zeroize::Zeroizing::new(raw);
                 let value: serde_json::Value = serde_json::from_str(&raw).map_err(store_error)?;
@@ -38,15 +42,26 @@ impl CredentialStore for Store {
         }
     }
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        let id = self.id.clone();
         let raw =
             zeroize::Zeroizing::new(json!({"url":self.url,"credentials":credentials}).to_string());
-        self.entry()
-            .map_err(store_error)?
-            .set_password(&raw)
-            .map_err(store_error)
+        tokio::task::spawn_blocking(move || {
+            let entry = keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &id)?;
+            entry.set_password(&raw)
+        })
+        .await
+        .map_err(store_error)?
+        .map_err(store_error)
     }
     async fn clear(&self) -> Result<(), AuthError> {
-        match self.entry().map_err(store_error)?.delete_credential() {
+        let id = self.id.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            let entry = keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &id)?;
+            entry.delete_credential()
+        })
+        .await
+        .map_err(store_error)?;
+        match deleted {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(store_error(error)),
         }
@@ -62,7 +77,7 @@ impl CredentialStore for Store {
             .write(true)
             .open(path)
             .map_err(store_error)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Some(CredentialRefreshGuard::new(file))),
@@ -72,7 +87,7 @@ impl CredentialStore for Store {
                             "Timed out waiting for OAuth credential refresh lock".into(),
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                    tokio::time::sleep(Duration::from_millis(25)).await
                 }
                 Err(error) => return Err(store_error(error)),
             }
@@ -97,12 +112,41 @@ pub async fn manager(server: &Server) -> Result<AuthorizationManager> {
     manager.initialize_from_store().await?;
     Ok(manager)
 }
+
+async fn drain_http_headers(stream: &mut BufReader<tokio::net::TcpStream>) {
+    let mut header = String::new();
+    for _ in 0..64 {
+        header.clear();
+        match (&mut *stream).take(4096).read_line(&mut header).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if header == "\r\n" || header == "\n" {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn write_http_response(
+    stream: &mut BufReader<tokio::net::TcpStream>,
+    response: &[u8],
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream.get_mut().write_all(response).await?;
+        stream.get_mut().flush().await?;
+        let _ = stream.get_mut().shutdown().await;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .context("Timed out writing OAuth callback response")??;
+    Ok(())
+}
+
 pub async fn login(server: &Server) -> Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-    let redirect = format!(
-        "http://127.0.0.1:{}/callback",
-        listener.local_addr()?.port()
-    );
+    let port = listener.local_addr()?.port();
+    let redirect = format!("http://127.0.0.1:{port}/callback");
     let mut state = OAuthState::Unauthorized(manager(server).await?);
     let mut request = AuthorizationRequest::new(&redirect)
         .with_client_name("ventiharness")
@@ -114,39 +158,76 @@ pub async fn login(server: &Server) -> Result<()> {
     let url = state.get_authorization_url().await?;
     eprintln!("Aprire / Open: {url}");
     let _ = open::that_detached(&url);
-    tokio::time::timeout(std::time::Duration::from_secs(300),async {
+    tokio::time::timeout(Duration::from_secs(300), async {
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (stream, peer) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(error = %error, "OAuth callback accept error");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             if !peer.ip().is_loopback() {
                 continue;
             }
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
-            if (&mut stream).take(8192).read_line(&mut line).await.is_err() {
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                let n = (&mut stream).take(8192).read_line(&mut line).await?;
+                if n > 0 {
+                    drain_http_headers(&mut stream).await;
+                }
+                Ok::<usize, std::io::Error>(n)
+            })
+            .await;
+            let Ok(Ok(n)) = read else {
+                continue;
+            };
+            if n == 0 {
                 continue;
             }
             let Some(target) = line.split_whitespace().nth(1) else {
                 continue;
             };
             if !line.starts_with("GET /callback?") {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
+                let _ = write_http_response(
+                    &mut stream,
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
                 continue;
             }
-            let callback = format!("http://127.0.0.1:{}{target}", listener.local_addr()?.port());
+            let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let has_oauth_param = query
+                .split('&')
+                .any(|pair| pair.starts_with("code=") || pair.starts_with("error="));
+            if !has_oauth_param {
+                let _ = write_http_response(
+                    &mut stream,
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                continue;
+            }
+            let callback = format!("http://127.0.0.1:{port}{target}");
             if let Err(err) = state.handle_callback_url(&callback).await {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nSign-in failed.")
-                    .await;
+                let _ = write_http_response(
+                    &mut stream,
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nSign-in failed.",
+                )
+                .await;
                 return Err(err.into());
             }
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nSigned in. Close window.")
-                .await?;
+            let _ = write_http_response(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nSigned in. Close window.",
+            )
+            .await;
             return Ok::<_, anyhow::Error>(());
         }
-    }).await??;
+    })
+    .await??;
     eprintln!("Accesso MCP completato / MCP signed in");
     Ok(())
 }

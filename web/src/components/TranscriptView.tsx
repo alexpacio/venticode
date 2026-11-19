@@ -6,8 +6,19 @@ import type { ApprovalDecision } from "../api/client.ts";
 import type { ToolBlock } from "../transcript.ts";
 import { t } from "../i18n/index.ts";
 
-export function ToolActions({ block, harness }: { block: ToolBlock; harness: string }) {
-  if (block.approval?.state === "pending") return <Approval id={block.approval.id} operation={block.operation} target={block.target} summary={block.approval.summary} harness={harness} />;
+export function ToolActions({ block, harness, disconnected = false }: { block: ToolBlock; harness: string; disconnected?: boolean }) {
+  if (block.approval?.state === "pending") {
+    return (
+      <Approval
+        id={block.approval.id}
+        operation={block.operation}
+        target={block.target}
+        summary={block.approval.summary}
+        harness={harness}
+        disconnected={disconnected}
+      />
+    );
+  }
   if (block.interactive && block.status === "running") return <SessionControls block={block} />;
   return null;
 }
@@ -17,14 +28,32 @@ function SessionControls({ block }: { block: ToolBlock }) {
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const pendingRef = useRef<{ key: string; id: string } | null>(null);
+
+  useEffect(() => {
+    pendingRef.current = null;
+  }, [id, block.id]);
+
   async function submit(action: "send" | "stop") {
     setBusy(true);
     setError("");
+    const payloadText = action === "send" ? text : "";
+    const key = JSON.stringify([id, block.id, action, payloadText]);
+    const request = pendingRef.current?.key === key ? pendingRef.current : { key, id: crypto.randomUUID() };
+    pendingRef.current = request;
     try {
-      await api(`/conversations/${id}/sessions/${block.id}/input`, "POST", { id: crypto.randomUUID(), action, ...(action === "send" ? { text } : {}) });
+      await api(`/conversations/${id}/sessions/${block.id}/input`, "POST", {
+        id: request.id,
+        action,
+        ...(action === "send" ? { text: payloadText } : {}),
+      });
+      if (pendingRef.current === request) pendingRef.current = null;
       setText("");
-    } catch (failure) { setError((failure as Error).message); }
-    finally { setBusy(false); }
+    } catch (failure) {
+      setError((failure as Error).message);
+    } finally {
+      setBusy(false);
+    }
   }
   return <form className="session-controls" onSubmit={e => { e.preventDefault(); void submit("send"); }}>
     <label className="field">{block.interactive === "terminal" ? t("Riga da inviare al terminale") : t("Messaggio per l’agente")}
@@ -35,7 +64,9 @@ function SessionControls({ block }: { block: ToolBlock }) {
   </form>;
 }
 
-function Approval({ id, operation, target, summary, harness }: { id: string; operation: string; target: string; summary?: string; harness: string }) {
+function Approval({ id, operation, target, summary, harness, disconnected }: {
+  id: string; operation: string; target: string; summary?: string; harness: string; disconnected: boolean;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const container = useRef<HTMLElement>(null);
@@ -44,9 +75,22 @@ function Approval({ id, operation, target, summary, harness }: { id: string; ope
     const active = document.activeElement;
     if (!active || active === document.body) container.current?.focus();
   }, []);
+  useEffect(() => {
+    setBusy(false);
+    setError("");
+  }, [id]);
+  useEffect(() => {
+    if (disconnected && busy) setBusy(false);
+  }, [disconnected, busy]);
   const decide = async (decision: ApprovalDecision) => {
     setBusy(true);
-    try { await api(`/approvals/${id}`, "POST", { decision }); } catch (failure) { setError((failure as Error).message); setBusy(false); }
+    setError("");
+    try {
+      await api(`/approvals/${id}`, "POST", { decision });
+    } catch (failure) {
+      setError((failure as Error).message);
+      setBusy(false);
+    }
   };
   const details = summary && summary !== target ? summary : target;
   return (

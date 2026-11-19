@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 use rmcp::{
     ServiceExt,
@@ -8,7 +8,26 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+const BLOCKED_ENV_VARS: &[&str] = &[
+    "VENTICODE_HARNESS_TOKEN",
+    "VENTICLI_TOKEN",
+    "VENTIHARNESS_TOKEN",
+    "OPEN_TERMINAL_API_KEY",
+];
+
+fn is_blocked_env(name: &str) -> bool {
+    BLOCKED_ENV_VARS
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(name))
+}
 
 #[derive(Subcommand)]
 pub enum Mcp {
@@ -52,6 +71,7 @@ pub enum Mcp {
         project: PathBuf,
     },
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Server {
     pub id: String,
@@ -60,66 +80,117 @@ pub struct Server {
     pub revision: String,
     pub config: Value,
 }
+
+enum ConfigLocation {
+    Host(PathBuf),
+    Project(PathBuf),
+}
+
 fn registry() -> Result<PathBuf> {
     Ok(crate::config::directory()?.join("mcp.json"))
 }
-fn paths(root: &Path) -> Vec<(String, PathBuf)> {
+
+fn config_locations(root: &Path) -> Vec<(String, PathBuf, ConfigLocation)> {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let mut locations = Vec::new();
+    if let Ok(reg) = registry() {
+        locations.push((
+            "ventiharness".into(),
+            reg.clone(),
+            ConfigLocation::Host(reg),
+        ));
+    }
+    if let Some(home_dir) = &home {
+        let p = home_dir.join(".claude.json");
+        locations.push(("claude-code".into(), p.clone(), ConfigLocation::Host(p)));
+        let p = home_dir.join(".cursor/mcp.json");
+        locations.push(("cursor".into(), p.clone(), ConfigLocation::Host(p)));
+    }
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_default();
-    let mut paths = vec![
-        ("ventiharness".into(), registry().unwrap_or_default()),
-        ("claude-code".into(), home.join(".claude.json")),
-        ("cursor".into(), home.join(".cursor/mcp.json")),
-        (
-            "codex".into(),
-            std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("config.toml"),
-        ),
-        ("project".into(), root.join(".mcp.json")),
-        ("cursor-project".into(), root.join(".cursor/mcp.json")),
-        ("vscode-project".into(), root.join(".vscode/mcp.json")),
-        ("codex-project".into(), root.join(".codex/config.toml")),
-    ];
+        .or_else(|| home.as_ref().map(|h| h.join(".codex")))
+    {
+        let p = codex_home.join("config.toml");
+        locations.push(("codex".into(), p.clone(), ConfigLocation::Host(p)));
+    }
+    for (source, rel) in [
+        ("project", ".mcp.json"),
+        ("cursor-project", ".cursor/mcp.json"),
+        ("vscode-project", ".vscode/mcp.json"),
+        ("codex-project", ".codex/config.toml"),
+    ] {
+        let rel_path = PathBuf::from(rel);
+        locations.push((
+            source.into(),
+            root.join(&rel_path),
+            ConfigLocation::Project(rel_path),
+        ));
+    }
+
     #[cfg(target_os = "macos")]
-    let config = home.join("Library/Application Support");
+    let config_dir = home.as_ref().map(|h| h.join("Library/Application Support"));
     #[cfg(windows)]
-    let config = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let config_dir = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     #[cfg(all(unix, not(target_os = "macos")))]
-    let config = std::env::var_os("XDG_CONFIG_HOME")
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    paths.push((
-        "claude-desktop".into(),
-        config.join("Claude/claude_desktop_config.json"),
-    ));
-    paths.push(("vscode".into(), config.join("Code/User/mcp.json")));
-    paths
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+
+    if let Some(config) = config_dir {
+        let p = config.join("Claude/claude_desktop_config.json");
+        locations.push(("claude-desktop".into(), p.clone(), ConfigLocation::Host(p)));
+        let p = config.join("Code/User/mcp.json");
+        locations.push(("vscode".into(), p.clone(), ConfigLocation::Host(p)));
+    }
+    locations
 }
-fn decode(path: &Path) -> Result<Value> {
-    let raw = std::fs::read_to_string(path)?;
-    ensure!(raw.len() <= 1024 * 1024, "MCP config too large");
+
+fn decode_bytes(path: &Path, raw_bytes: Vec<u8>) -> Result<Value> {
+    ensure!(raw_bytes.len() <= MAX_CONFIG_BYTES, "MCP config too large");
+    let raw = String::from_utf8(raw_bytes).context("MCP config must be valid UTF-8")?;
     if path.extension().is_some_and(|v| v == "toml") {
         Ok(serde_json::to_value(toml::from_str::<toml::Value>(&raw)?)?)
     } else {
         Ok(json5::from_str(&raw)?)
     }
 }
+
+fn decode(path: &Path) -> Result<Value> {
+    let bytes = ventiharness_terminal::files::read_host_bounded_file(path, MAX_CONFIG_BYTES)?
+        .context("MCP config not found")?;
+    decode_bytes(path, bytes)
+}
+
 pub fn discover(root: &Path) -> Result<(Vec<Server>, Vec<Value>)> {
     let mut servers = Vec::new();
     let mut errors = Vec::new();
-    for (source, path) in paths(root) {
-        if !path.is_file() {
-            continue;
-        }
-        let value = match decode(&path) {
+    for (source, display_path, location) in config_locations(root) {
+        let raw_opt = match &location {
+            ConfigLocation::Project(rel) => {
+                ventiharness_terminal::files::read_sandboxed_nofollow(root, rel, MAX_CONFIG_BYTES)
+            }
+            ConfigLocation::Host(path) => {
+                ventiharness_terminal::files::read_host_bounded_file(path, MAX_CONFIG_BYTES)
+            }
+        };
+        let raw_bytes = match raw_opt {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(_) => {
+                errors.push(json!({"source": source, "error": "Invalid MCP configuration"}));
+                continue;
+            }
+        };
+        let value = match decode_bytes(&display_path, raw_bytes) {
             Ok(value) => value,
             Err(_) => {
-                errors.push(json!({"source":source,"error":"Invalid MCP configuration"}));
+                errors.push(json!({"source": source, "error": "Invalid MCP configuration"}));
                 continue;
             }
         };
@@ -139,7 +210,10 @@ pub fn discover(root: &Path) -> Result<(Vec<Server>, Vec<Value>)> {
         }
         for table in tables.into_iter().flatten().filter_map(Value::as_object) {
             for (name, config) in table {
-                let id = hex::encode(Sha256::digest(format!("{}\0{name}", path.display())));
+                let id = hex::encode(Sha256::digest(format!(
+                    "{}\0{name}",
+                    display_path.display()
+                )));
                 let revision = hex::encode(Sha256::digest(serde_json::to_vec(config)?));
                 servers.push(Server {
                     id,
@@ -155,15 +229,18 @@ pub fn discover(root: &Path) -> Result<(Vec<Server>, Vec<Value>)> {
     servers.dedup_by(|a, b| a.id == b.id);
     Ok((servers, errors))
 }
+
 fn source_disabled(config: &Value) -> bool {
     config["disabled"] == true || config["enabled"] == false
 }
+
 pub fn list(root: &Path) -> Result<Value> {
     let (servers, errors) = discover(root)?;
     Ok(
         json!({"servers":servers.into_iter().map(|s|json!({"id":s.id,"name":s.name,"source":s.source,"revision":s.revision,"transport":if s.config["url"].is_string(){"http"}else{"stdio"},"source_disabled":source_disabled(&s.config)})).collect::<Vec<_>>(),"errors":errors}),
     )
 }
+
 fn resolve_from(servers: Vec<Server>, id: &str, allow_disabled: bool) -> Result<Server> {
     let server = if let Some(exact) = servers.iter().find(|s| s.id == id).cloned() {
         exact
@@ -182,97 +259,156 @@ fn resolve_from(servers: Vec<Server>, id: &str, allow_disabled: bool) -> Result<
     );
     Ok(server)
 }
+
 fn selected(root: &Path, id: &str, allow_disabled: bool) -> Result<Server> {
     resolve_from(discover(root)?.0, id, allow_disabled)
 }
+
 fn expanded(value: &str, root: &Path) -> Result<String> {
-    let mut value = value.replace(
-        "${workspaceFolder}",
-        root.to_str().context("Invalid project path")?,
-    );
-    while let Some(start) = value.find("${env:") {
-        let end = value[start..]
-            .find('}')
-            .context("Invalid environment reference")?
-            + start;
-        let env =
-            std::env::var(&value[start + 6..end]).context("MCP environment variable missing")?;
-        value.replace_range(start..=end, &env);
-    }
-    ensure!(
-        !value.contains("${"),
-        "MCP config requires local input setup"
-    );
-    Ok(value)
-}
-async fn list_all_tools(service: &Service) -> Result<Vec<rmcp::model::Tool>> {
-    let mut tools = Vec::new();
-    let mut cursor = None;
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        let page = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            service.list_tools(
-                cursor
-                    .clone()
-                    .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor))),
-            ),
-        )
-        .await
-        .context("MCP list_tools timed out")??;
-        tools.extend(page.tools);
-        ensure!(tools.len() <= 4096, "Too many MCP tools");
-        cursor = page.next_cursor;
-        if let Some(cursor) = &cursor {
-            ensure!(seen.insert(cursor.clone()), "MCP pagination cycle");
-        } else {
+    let root_str = root.to_str().context("Invalid project path")?;
+    let mut out = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let rest = &value[cursor..];
+        let Some(rel_start) = rest.find("${") else {
+            out.push_str(rest);
             break;
+        };
+        out.push_str(&rest[..rel_start]);
+        let after_open = cursor + rel_start + 2;
+        let rel_end = value[after_open..]
+            .find('}')
+            .context("Invalid environment reference")?;
+        let end = after_open + rel_end;
+        let token = &value[after_open..end];
+        if token == "workspaceFolder" {
+            out.push_str(root_str);
+        } else if let Some(var_name) = token.strip_prefix("env:") {
+            ensure!(!var_name.is_empty(), "Invalid environment reference");
+            ensure!(
+                !is_blocked_env(var_name),
+                "Access to harness secret environment variable '{var_name}' is blocked"
+            );
+            let env_val = std::env::var(var_name).context("MCP environment variable missing")?;
+            out.push_str(&env_val);
+        } else {
+            bail!("MCP config requires local input setup");
         }
+        cursor = end + 1;
     }
-    Ok(tools)
+    Ok(out)
 }
 
-async fn invoke(cached: &mut CachedService, operation: &str, args: &Value) -> Result<Value> {
+async fn list_all_tools(service: &Service) -> Result<Vec<rmcp::model::Tool>> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = tokio::time::timeout(
+                Duration::from_secs(30),
+                service.list_tools(
+                    cursor
+                        .clone()
+                        .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor))),
+                ),
+            )
+            .await
+            .context("MCP list_tools timed out")??;
+            tools.extend(page.tools);
+            ensure!(tools.len() <= 4096, "Too many MCP tools");
+            cursor = page.next_cursor;
+            if let Some(cursor) = &cursor {
+                ensure!(seen.insert(cursor.clone()), "MCP pagination cycle");
+            } else {
+                break;
+            }
+        }
+        Ok(tools)
+    })
+    .await
+    .context("MCP list_tools overall timeout")?
+}
+
+enum InvokeError {
+    Validation(anyhow::Error),
+    Transport(anyhow::Error),
+}
+
+async fn invoke(
+    cached: &mut CachedService,
+    operation: &str,
+    args: &Value,
+) -> std::result::Result<Value, InvokeError> {
     if operation == "mcp_list_tools" || cached.tools.is_none() {
-        cached.tools = Some(list_all_tools(&cached.service).await?);
+        let tools = list_all_tools(&cached.service)
+            .await
+            .map_err(InvokeError::Transport)?;
+        cached.tools = Some(tools);
+        cached.validators.clear();
     }
-    let tools = cached.tools.as_ref().unwrap();
     if operation == "mcp_list_tools" {
-        return Ok(json!({"tools":tools}));
+        return Ok(json!({"tools": cached.tools.as_ref().unwrap()}));
     }
-    let name = args["tool"].as_str().context("Tool required")?;
-    let tool = tools
+    let name = args["tool"]
+        .as_str()
+        .context("Tool required")
+        .map_err(InvokeError::Validation)?;
+    let tool = cached
+        .tools
+        .as_ref()
+        .unwrap()
         .iter()
         .find(|t| t.name == name)
-        .context("Unknown MCP tool")?;
+        .context("Unknown MCP tool")
+        .map_err(InvokeError::Validation)?;
     let parameters = args["parameters"]
         .as_object()
-        .context("Tool parameters must be an object")?;
-    let schema = serde_json::to_value(&tool.input_schema)?;
-    ensure!(
-        jsonschema::is_valid(&schema, &Value::Object(parameters.clone())),
-        "Invalid MCP tool arguments"
-    );
+        .context("Tool parameters must be an object")
+        .map_err(InvokeError::Validation)?;
+
+    if !cached.validators.contains_key(name) {
+        let schema = serde_json::to_value(&tool.input_schema)
+            .map_err(|e| InvokeError::Validation(e.into()))?;
+        let validator = jsonschema::validator_for(&schema).map_err(|e| {
+            InvokeError::Validation(anyhow::anyhow!("Invalid MCP tool schema: {e}"))
+        })?;
+        cached.validators.insert(name.to_owned(), validator);
+    }
+    let validator = cached.validators.get(name).unwrap();
+    let instance = Value::Object(parameters.clone());
+    if let Err(err) = validator.validate(&instance) {
+        return Err(InvokeError::Validation(anyhow::anyhow!(
+            "Invalid MCP tool arguments: {err}"
+        )));
+    }
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        Duration::from_secs(60),
         cached.service.call_tool(
             CallToolRequestParams::new(name.to_owned()).with_arguments(parameters.clone()),
         ),
     )
     .await
-    .context("MCP call_tool timed out")??;
-    Ok(serde_json::to_value(result)?)
+    .context("MCP call_tool timed out")
+    .map_err(InvokeError::Transport)?
+    .map_err(|e| InvokeError::Transport(e.into()))?;
+    serde_json::to_value(result).map_err(|e| InvokeError::Transport(e.into()))
 }
+
 type Service = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
 struct CachedService {
     service: Service,
     tools: Option<Vec<rmcp::model::Tool>>,
+    validators: HashMap<String, jsonschema::Validator>,
+    last_used: Instant,
 }
+
 type Slot = std::sync::Arc<tokio::sync::Mutex<Option<CachedService>>>;
+
 #[derive(Default)]
-pub struct Clients(
-    std::sync::Mutex<std::collections::HashMap<(uuid::Uuid, PathBuf, String), Slot>>,
-);
+pub struct Clients(std::sync::Mutex<HashMap<(uuid::Uuid, PathBuf, String), Slot>>);
+
 impl Clients {
     pub fn release(&self, request: uuid::Uuid) {
         self.0
@@ -280,6 +416,31 @@ impl Clients {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(id, _, _), _| *id != request);
     }
+
+    pub fn evict_idle(&self, max_idle: Duration) {
+        let now = Instant::now();
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, slot| {
+            let Ok(mut guard) = slot.try_lock() else {
+                return true;
+            };
+            let Some(cached) = guard.as_ref() else {
+                return false;
+            };
+            if cached.service.is_closed() || now.duration_since(cached.last_used) >= max_idle {
+                if let Some(evicted) = guard.take() {
+                    tokio::spawn(async move {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(2), evicted.service.cancel())
+                                .await;
+                    });
+                }
+                return false;
+            }
+            true
+        });
+    }
+
     #[cfg(feature = "ventic-relay")]
     pub fn retain(&self, consents: &[Value]) {
         self.0
@@ -292,6 +453,7 @@ impl Clients {
                     .any(|value| uuid::Uuid::parse_str(value).ok().as_ref() == Some(id))
             });
     }
+
     pub async fn call(
         &self,
         consent: uuid::Uuid,
@@ -323,18 +485,40 @@ impl Clients {
             .clone();
         let mut slot = slot.lock().await;
         if slot.as_ref().is_none_or(|c| c.service.is_closed()) {
-            let service =
-                tokio::time::timeout(std::time::Duration::from_secs(30), connect(root, &server))
-                    .await
-                    .context("MCP server connection timed out")??;
+            let service = tokio::time::timeout(Duration::from_secs(30), connect(root, &server))
+                .await
+                .context("MCP server connection timed out")??;
             *slot = Some(CachedService {
                 service,
                 tools: None,
+                validators: HashMap::new(),
+                last_used: Instant::now(),
             });
         }
-        invoke(slot.as_mut().unwrap(), operation, args).await
+        match invoke(slot.as_mut().unwrap(), operation, args).await {
+            Ok(val) => {
+                if let Some(cached) = slot.as_mut() {
+                    cached.last_used = Instant::now();
+                }
+                Ok(val)
+            }
+            Err(InvokeError::Validation(err)) => {
+                if let Some(cached) = slot.as_mut() {
+                    cached.last_used = Instant::now();
+                }
+                Err(err)
+            }
+            Err(InvokeError::Transport(err)) => {
+                if let Some(evicted) = slot.take() {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), evicted.service.cancel())
+                        .await;
+                }
+                Err(err)
+            }
+        }
     }
 }
+
 async fn connect(root: &Path, server: &Server) -> Result<Service> {
     if let Some(url) = server.config["url"].as_str() {
         let url = url::Url::parse(url)?;
@@ -364,6 +548,10 @@ async fn connect(root: &Path, server: &Server) -> Result<Service> {
             }
         }
         if let Some(name) = server.config["bearer_token_env_var"].as_str() {
+            ensure!(
+                !is_blocked_env(name),
+                "Access to harness secret environment variable '{name}' is blocked"
+            );
             headers.insert(
                 reqwest_mcp::header::AUTHORIZATION,
                 format!("Bearer {}", std::env::var(name)?).parse()?,
@@ -407,14 +595,14 @@ async fn connect(root: &Path, server: &Server) -> Result<Service> {
         if let Some(env) = server.config["env_vars"].as_array() {
             for name in env {
                 let key = name.as_str().context("Invalid environment name")?;
+                ensure!(
+                    !is_blocked_env(key),
+                    "Access to harness secret environment variable '{key}' is blocked"
+                );
                 cmd.env(key, std::env::var(key)?);
             }
         }
-        for name in [
-            "VENTICLI_TOKEN",
-            "VENTIHARNESS_TOKEN",
-            "VENTICODE_HARNESS_TOKEN",
-        ] {
+        for name in BLOCKED_ENV_VARS {
             cmd.env_remove(name);
         }
         let mut cmd = process_wrap::tokio::CommandWrap::from(cmd);
@@ -462,7 +650,7 @@ async fn connect(root: &Path, server: &Server) -> Result<Service> {
         match ().serve(transport).await {
             Ok(service) => Ok(service),
             Err(err) => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 let stderr_text = stderr_buf.lock().unwrap().trim().to_owned();
                 if stderr_text.is_empty() {
                     Err(err.into())
@@ -475,9 +663,21 @@ async fn connect(root: &Path, server: &Server) -> Result<Service> {
         }
     }
 }
+
+fn managed_server_dir(entry: &Value, servers_root: &Path) -> Option<PathBuf> {
+    let command = entry["command"].as_str()?;
+    let rel = Path::new(command).strip_prefix(servers_root).ok()?;
+    match rel.components().next()? {
+        Component::Normal(dir_name) => Some(servers_root.join(dir_name)),
+        _ => None,
+    }
+}
+
 fn save(name: &str, value: Option<Value>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 80, "Invalid server name");
-    let path = registry()?;
+    let config_dir = crate::config::directory()?;
+    let servers_root = config_dir.join("servers");
+    let path = config_dir.join("mcp.json");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -492,44 +692,72 @@ fn save(name: &str, value: Option<Value>) -> Result<()> {
     let entries = config["mcpServers"]
         .as_object_mut()
         .context("Invalid MCP registry")?;
-    if let Some(value) = value {
-        entries.insert(name.into(), value);
+    let new_dir = value
+        .as_ref()
+        .and_then(|v| managed_server_dir(v, &servers_root));
+    let previous = if let Some(value) = value {
+        entries.insert(name.into(), value)
     } else {
-        entries.remove(name);
-    }
+        entries.remove(name)
+    };
     use std::io::Write;
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     temporary.write_all(&serde_json::to_vec_pretty(&config)?)?;
     temporary.as_file().sync_all()?;
     temporary.persist(path)?;
+    if let Some(old_dir) = previous
+        .as_ref()
+        .and_then(|entry| managed_server_dir(entry, &servers_root))
+        && new_dir.as_ref() != Some(&old_dir)
+    {
+        let _ = std::fs::remove_dir_all(old_dir);
+    }
     Ok(())
 }
+
+fn valid_pkg_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.as_bytes()[0].is_ascii_alphanumeric()
+        && seg
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-._".contains(&c))
+}
+
 fn pinned(package: &str, npm: bool) -> bool {
-    let pair = if npm {
-        package.rsplit_once('@')
-    } else {
-        package.split_once("==")
-    };
-    pair.is_some_and(|(name, version)| {
-        let name = if npm {
-            name.strip_prefix('@').unwrap_or(name)
-        } else {
-            name
+    if npm {
+        let Some((raw_name, version)) = package.rsplit_once('@') else {
+            return false;
         };
-        !name.is_empty()
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-            && name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"-._/".contains(&c))
+        let valid_name = if let Some(scoped) = raw_name.strip_prefix('@') {
+            scoped.split_once('/').is_some_and(|(scope, pkg)| {
+                !pkg.contains('/') && valid_pkg_segment(scope) && valid_pkg_segment(pkg)
+            })
+        } else {
+            !raw_name.contains('/') && valid_pkg_segment(raw_name)
+        };
+        valid_name
             && !version.is_empty()
             && version.as_bytes()[0].is_ascii_digit()
             && version
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b".-+".contains(&c))
             && !version.contains('*')
-            && (!npm || semver::Version::parse(version).is_ok())
-    })
+            && semver::Version::parse(version).is_ok()
+    } else {
+        let Some((name, version)) = package.split_once("==") else {
+            return false;
+        };
+        !name.contains('/')
+            && valid_pkg_segment(name)
+            && !version.is_empty()
+            && version.as_bytes()[0].is_ascii_digit()
+            && version
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".-+".contains(&c))
+            && !version.contains('*')
+    }
 }
+
 pub async fn manage(command: &Mcp) -> Result<()> {
     match command {
         Mcp::List { project } => println!(
@@ -618,17 +846,29 @@ pub async fn manage(command: &Mcp) -> Result<()> {
         }
         Mcp::Logout { server, project } => {
             let resolved = selected(&project.canonicalize()?, server, true)?;
-            keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &resolved.id)?
-                .delete_credential()?;
+            let id = resolved.id.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                keyring::Entry::new(crate::config::CREDENTIAL_SERVICE, &id)?.delete_credential()
+            })
+            .await?;
+            match res {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Mcp::Test { server, project } => {
             let root = project.canonicalize()?;
             let resolved = selected(&root, server, true)?;
-            let started = std::time::Instant::now();
-            let service = connect(&root, &resolved).await?;
-            let tools_val = json!({"tools": list_all_tools(&service).await?});
+            let started = Instant::now();
+            let tools_val = tokio::time::timeout(Duration::from_secs(30), async {
+                let service = connect(&root, &resolved).await?;
+                let tools_result = list_all_tools(&service).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), service.cancel()).await;
+                Ok::<_, anyhow::Error>(json!({"tools": tools_result?}))
+            })
+            .await
+            .context("MCP test timed out after 30s")??;
             let elapsed_ms = started.elapsed().as_millis();
-            let _ = service.cancel().await;
             let tools = tools_val["tools"].as_array().cloned().unwrap_or_default();
             let tool_names: Vec<Value> = tools
                 .iter()
@@ -656,6 +896,7 @@ pub async fn manage(command: &Mcp) -> Result<()> {
     }
     Ok(())
 }
+
 async fn oauth_login(server: &Server) -> Result<()> {
     crate::oauth::login(server).await
 }
@@ -686,16 +927,22 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
         let mut service = CachedService {
             service: connect(root.path(), &server).await.unwrap(),
             tools: None,
+            validators: HashMap::new(),
+            last_used: Instant::now(),
         };
-        assert!(
-            invoke(
-                &mut service,
-                "mcp_call_tool",
-                &json!({"tool":"counter","parameters":{"unexpected":true}})
-            )
-            .await
-            .is_err()
-        );
+        let invalid = invoke(
+            &mut service,
+            "mcp_call_tool",
+            &json!({"tool":"counter","parameters":{"unexpected":true}}),
+        )
+        .await;
+        match invalid {
+            Err(InvokeError::Validation(err)) => {
+                assert!(err.to_string().contains("Invalid MCP tool arguments:"));
+            }
+            _ => panic!("expected validation error"),
+        }
+        assert!(service.validators.contains_key("counter"));
         for expected in ["1", "2"] {
             let result = invoke(
                 &mut service,
@@ -703,11 +950,13 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
                 &json!({"tool":"counter","parameters":{}}),
             )
             .await
+            .ok()
             .unwrap();
             assert_eq!(result["content"][0]["text"], expected);
         }
         service.service.cancel().await.unwrap();
     }
+
     #[test]
     fn installs_require_exact_package_versions() {
         for value in [
@@ -716,15 +965,78 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
             "server@^1.0.0",
             "--script=bad@1.0.0",
             "https://host/package@1.0.0",
+            "unscoped/slash@1.0.0",
+            "@scope/sub/pkg@1.0.0",
+            "@scope/@1.0.0",
         ] {
-            assert!(!pinned(value, true));
+            assert!(!pinned(value, true), "expected npm reject for {value}");
         }
         assert!(pinned("@scope/server@1.2.3", true));
+        assert!(pinned("server@1.2.3", true));
         assert!(pinned("server==1.2.3", false));
-        for value in ["server>=1", "server==1.*", "server==1;extra", "-r==1"] {
-            assert!(!pinned(value, false));
+        for value in [
+            "server>=1",
+            "server==1.*",
+            "server==1;extra",
+            "-r==1",
+            "org/pkg==1.2.3",
+            "@scope/pkg==1.2.3",
+        ] {
+            assert!(!pinned(value, false), "expected python reject for {value}");
         }
     }
+
+    #[test]
+    fn expanded_blocks_harness_secrets_and_is_single_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        for secret in BLOCKED_ENV_VARS {
+            let expr = format!("Bearer ${{env:{secret}}}");
+            let err = expanded(&expr, dir.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("blocked"),
+                "expected blocked error for {secret}, got: {err}"
+            );
+        }
+        // Single-pass check: an env value containing ${env:...} must NOT re-expand or infinite-loop.
+        let key = "VENTICODE_TEST_RECURSIVE_EXPAND";
+        unsafe {
+            std::env::set_var(key, "${env:VENTICODE_TEST_RECURSIVE_EXPAND}");
+        }
+        let result = expanded(&format!("prefix-${{env:{key}}}-suffix"), dir.path()).unwrap();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(
+            result,
+            "prefix-${env:VENTICODE_TEST_RECURSIVE_EXPAND}-suffix"
+        );
+
+        // Workspace folder expansion works and unknown placeholders fail.
+        let ws = expanded("${workspaceFolder}/sub", dir.path()).unwrap();
+        assert_eq!(ws, format!("{}/sub", dir.path().display()));
+        assert!(expanded("${input:secret}", dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_rejects_symlinked_project_mcp_config() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("evil.json"),
+            r#"{"mcpServers":{"evil":{"command":"echo"}}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("evil.json"),
+            root.path().join(".mcp.json"),
+        )
+        .unwrap();
+        let (servers, errors) = discover(root.path()).unwrap();
+        assert!(!servers.iter().any(|s| s.name == "evil"));
+        assert!(errors.iter().any(|e| e["source"] == "project"));
+    }
+
     #[test]
     fn parse_jsonc_and_codex_toml_without_starting_processes() {
         let dir = tempfile::tempdir().unwrap();
@@ -745,6 +1057,7 @@ else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result
             "never-run"
         );
     }
+
     #[test]
     fn resolve_rejects_disabled_servers_and_supports_unambiguous_names() {
         let servers = vec![

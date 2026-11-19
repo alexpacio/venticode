@@ -216,6 +216,10 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!expires || expires < Date.now()) return fail(409, "Ticket scaduto o già usato / Ticket expired or already used");
       return login(fields.get("browser") === "1" ? "/browser" : "/");
     }
+    if (method === "POST" && path === "/venticode/login") {
+      if (headers.origin !== origin) return fail(403, "Origine non consentita / Origin not allowed");
+      return login("/");
+    }
     if (method === "GET" && path === "/__dev/login") {
       const id = body.query.get("conversation");
       const result = login(body.query.get("browser") === "1" ? "/browser" : "/");

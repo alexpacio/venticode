@@ -1,37 +1,21 @@
-import { Component, useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { LoaderCircle, Menu, PanelRight } from "lucide-react";
 import { isUnauthorized, useSession, useProjects, useConversations } from "./queries.ts";
 import { t, useLanguage } from "./i18n/index.ts";
+import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
 import { Home } from "./components/Home.tsx";
 import { ProjectView } from "./components/ProjectView.tsx";
 import { ConversationView } from "./components/ConversationView.tsx";
-import { BotView } from "./components/BotView.tsx";
-import { DesktopView } from "./components/DesktopView.tsx";
-import { BrowserView } from "./components/BrowserView.tsx";
 
-import { Connections } from "./components/Connections.tsx";
-
-class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
-  state: { error: Error | null } = { error: null };
-  static getDerivedStateFromError(error: Error) { return { error }; }
-  render() {
-    if (this.state.error) {
-      return (
-        <main className="empty" role="alert">
-          <h1>{t("Si è verificato un errore imprevisto")}</h1>
-          <p>{this.state.error.message}</p>
-          <button className="btn btn-primary" onClick={() => location.reload()}>{t("Riprova")}</button>
-        </main>
-      );
-    }
-    return this.props.children;
-  }
-}
+const BotView = lazy(() => import("./components/BotView.tsx").then((m) => ({ default: m.BotView })));
+const DesktopView = lazy(() => import("./components/DesktopView.tsx").then((m) => ({ default: m.DesktopView })));
+const BrowserView = lazy(() => import("./components/BrowserView.tsx").then((m) => ({ default: m.BrowserView })));
+const Connections = lazy(() => import("./components/Connections.tsx").then((m) => ({ default: m.Connections })));
 
 export function App() {
-  return <ErrorBoundary><AppShell /></ErrorBoundary>;
+  return <ErrorBoundary reloadOnRetry><AppShell /></ErrorBoundary>;
 }
 
 function AppShell() {
@@ -50,13 +34,16 @@ function AppShell() {
   useEffect(() => {
     if (!navOpen && !panelOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !document.querySelector("dialog[open]")) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
         setNavOpen(false);
         setPanelOpen(false);
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [navOpen, panelOpen]);
 
   if (session.isPending)
@@ -74,21 +61,33 @@ function AppShell() {
       <PanelRight size={17} aria-hidden="true" />
     </button>
   );
+  const routeFallback = (
+    <main className="main">
+      <div className="empty" role="status">
+        <LoaderCircle className="spin" aria-hidden="true" />
+        {t("Caricamento…")}
+      </div>
+    </main>
+  );
   return (
     <div className={`shell${withPanel ? " with-panel" : ""}${navOpen ? " nav-open" : ""}${panelOpen ? " panel-open" : ""}`}>
       <WorkspaceShortcuts />
       <Sidebar session={session.data} onNavigate={() => setNavOpen(false)} />
       <button className="scrim" aria-label={t("Chiudi il menu")} onClick={() => { setNavOpen(false); setPanelOpen(false); }} />
-      <Routes>
-        <Route path="/" element={<Home session={session.data} menu={menu} />} />
-        <Route path="/p/:id" element={<ProjectView menu={menu} />} />
-        <Route path="/c/:id" element={<ConversationView menu={menu} panelToggle={panelToggle} />} />
-        <Route path="/bots/:id" element={<BotView menu={menu} admin={admin} />} />
-        <Route path="/connections" element={<Connections menu={menu} admin={admin} />} />
-        <Route path="/browser" element={<BrowserView menu={menu} />} />
-        {session.data.bot_runtimes?.includes("computer") && <Route path="/computer" element={<DesktopView menu={menu} />} />}
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+      <ErrorBoundary resetKey={location.pathname}>
+        <Suspense fallback={routeFallback}>
+          <Routes>
+            <Route path="/" element={<Home session={session.data} menu={menu} />} />
+            <Route path="/p/:id" element={<ProjectView menu={menu} />} />
+            <Route path="/c/:id" element={<ConversationView menu={menu} panelToggle={panelToggle} />} />
+            <Route path="/bots/:id" element={<BotView menu={menu} admin={admin} />} />
+            <Route path="/connections" element={<Connections menu={menu} admin={admin} />} />
+            <Route path="/browser" element={<BrowserView menu={menu} />} />
+            {session.data.bot_runtimes?.includes("computer") && <Route path="/computer" element={<DesktopView menu={menu} />} />}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
+      </ErrorBoundary>
     </div>
   );
 }

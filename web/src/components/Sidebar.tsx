@@ -209,7 +209,7 @@ function AddProject({ harness, onClose, onNavigate }: { harness: Harness; onClos
           </select>
         </label>
         <label className="field"><span>{t("Sottocartella (relativa, . per la radice)")}</span>
-          <input className="input mono" name="path" defaultValue="." maxLength={1024} pattern="^(\.|[^/\\][^\\]*)$" title={t("Percorso relativo senza ..")} />
+          <input className="input mono" name="path" defaultValue="." maxLength={1024} pattern="^(\.|[^\/\\][^\\]*)$" title={t("Percorso relativo senza ..")} />
         </label>
         <label className="field"><span>{t("Nome (facoltativo)")}</span>
           <input className="input" name="name" maxLength={80} />

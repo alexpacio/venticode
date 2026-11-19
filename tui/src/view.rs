@@ -7,6 +7,67 @@ use ftui::{
     text::{Line, Span, Text, WrapMode},
     widgets::paragraph::Paragraph,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+const MAX_MARKDOWN_CACHE_ENTRIES: usize = 256;
+
+struct CachedMarkdown {
+    text_len: usize,
+    width: usize,
+    hash: u64,
+    lines: Vec<Line<'static>>,
+}
+
+thread_local! {
+    static MARKDOWN_CACHE: RefCell<HashMap<usize, CachedMarkdown>> = RefCell::new(HashMap::new());
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_markdown(idx: usize, text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let hash = hash_str(text);
+    MARKDOWN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.get(&idx)
+            && entry.text_len == text.len()
+            && entry.width == width
+            && entry.hash == hash
+        {
+            return entry.lines.clone();
+        }
+        let lines: Vec<Line<'static>> = ftui_extras::markdown::render_markdown(text)
+            .lines()
+            .iter()
+            .flat_map(|line| line.wrap(width, WrapMode::WordChar))
+            .collect();
+        if cache.len() >= MAX_MARKDOWN_CACHE_ENTRIES && !cache.contains_key(&idx) {
+            cache.clear();
+        }
+        cache.insert(
+            idx,
+            CachedMarkdown {
+                text_len: text.len(),
+                width,
+                hash,
+                lines: lines.clone(),
+            },
+        );
+        lines
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_markdown_cache() {
+    MARKDOWN_CACHE.with(|cache| cache.borrow_mut().clear());
+}
 
 fn paint<'a>(frame: &mut Frame, area: Rect, lines: impl IntoIterator<Item = Line<'a>>) {
     Paragraph::new(Text::from_lines(lines)).render(area, frame);
@@ -27,14 +88,16 @@ pub struct Message {
     pub text: String,
 }
 
-fn transcript<'a>(msg: &'a Message, compact: bool, en: bool, width: usize) -> Vec<Line<'a>> {
+fn transcript<'a>(
+    idx: usize,
+    msg: &'a Message,
+    compact: bool,
+    en: bool,
+    width: usize,
+) -> Vec<Line<'a>> {
     let (marker, style) = match msg.role {
         Role::Assistant => {
-            return ftui_extras::markdown::render_markdown(&msg.text)
-                .lines()
-                .iter()
-                .flat_map(|line| line.wrap(width.max(1), WrapMode::WordChar))
-                .collect();
+            return cached_markdown(idx, &msg.text, width);
         }
         Role::User => ("› ", Style::new().fg(Color::Cyan)),
         Role::Tool => ("→ ", Style::new().fg(Color::Yellow)),
@@ -44,8 +107,29 @@ fn transcript<'a>(msg: &'a Message, compact: bool, en: bool, width: usize) -> Ve
     };
     let mut lines = Vec::new();
     let preview = matches!(msg.role, Role::Output) && compact;
+    let body_width = width.saturating_sub(2).max(1);
+    let word_wrap = matches!(msg.role, Role::User | Role::Notice | Role::Error);
     for content in msg.text.split('\n') {
-        for row in editor::rows(content, width.saturating_sub(2))
+        if word_wrap {
+            let wrapped = if content.is_empty() {
+                vec![String::new()]
+            } else {
+                Line::raw(content)
+                    .wrap(body_width, WrapMode::WordChar)
+                    .into_iter()
+                    .map(|l| l.to_plain_text())
+                    .collect()
+            };
+            for row_text in wrapped {
+                let prefix = if lines.is_empty() { marker } else { "  " };
+                lines.push(Line::from_spans(vec![
+                    Span::styled(prefix, style.bold()),
+                    Span::styled(row_text, style),
+                ]));
+            }
+            continue;
+        }
+        for row in editor::rows(content, body_width)
             .into_iter()
             .filter(|r| !r.text.is_empty() || content.is_empty())
         {
@@ -122,12 +206,12 @@ pub fn draw(
     // Traverse from the tail so the redraw cost follows the visible history.
     let needed = app.scroll as usize + body.height as usize;
     let mut history = Vec::new();
-    for msg in app.lines.iter().rev() {
+    for (idx, msg) in app.lines.iter().enumerate().rev() {
         if !history.is_empty() {
             history.push(Line::default());
         }
         history.extend(
-            transcript(msg, app.compact_tools, app.en, width)
+            transcript(idx, msg, app.compact_tools, app.en, width)
                 .into_iter()
                 .rev(),
         );
@@ -180,6 +264,14 @@ pub fn draw(
     );
 
     let start = (selection + 1).saturating_sub(menu.height as usize);
+    let max_item_width = suggestions
+        .iter()
+        .skip(start)
+        .take(menu.height as usize)
+        .map(|cmd| ftui::text::display_width(cmd))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(menu.width).saturating_sub(3));
     for (i, cmd) in suggestions
         .iter()
         .enumerate()
@@ -187,12 +279,20 @@ pub fn draw(
         .take(menu.height as usize)
     {
         let (marker, style) = if i == selection {
-            ("› ", Style::new().fg(Color::Black).bg(Color::Cyan))
+            ("› ", Style::new().fg(Color::Black).bg(Color::Cyan).bold())
         } else {
             ("  ", Style::default())
         };
         let row = Rect::new(menu.x, menu.y + (i - start) as u16, menu.width, 1);
-        paint(f, row, [Line::styled(format!("{marker}{cmd}"), style)]);
+        let pad = max_item_width.saturating_sub(ftui::text::display_width(cmd)) + 1;
+        paint(
+            f,
+            row,
+            [Line::styled(
+                format!("{marker}{cmd}{}", " ".repeat(pad)),
+                style,
+            )],
+        );
     }
 
     let (cursor_row, col) = editor::position(&rows, caret);
@@ -259,11 +359,12 @@ mod tests {
 
     #[test]
     fn assistant_markdown_preserves_visible_text_and_emphasis() {
+        clear_markdown_cache();
         let message = Message {
             role: Role::Assistant,
             text: "Use **Venticode** locally.".into(),
         };
-        let lines = transcript(&message, false, true, 80);
+        let lines = transcript(0, &message, false, true, 80);
         let line = lines
             .iter()
             .find(|line| line.to_plain_text().contains("Venticode"))
@@ -274,6 +375,23 @@ mod tests {
                 .iter()
                 .any(|span| span.as_str() == "Venticode" && span.style.is_some())
         );
+        // Second call hits the cache and returns identical content.
+        let cached = transcript(0, &message, false, true, 80);
+        assert_eq!(
+            cached.iter().map(Line::to_plain_text).collect::<Vec<_>>(),
+            lines.iter().map(Line::to_plain_text).collect::<Vec<_>>()
+        );
+        // Changing text at the same index invalidates the entry.
+        let updated = Message {
+            role: Role::Assistant,
+            text: "Different **text**.".into(),
+        };
+        let updated_lines = transcript(0, &updated, false, true, 80);
+        assert!(
+            updated_lines
+                .iter()
+                .any(|l| l.to_plain_text().contains("Different text."))
+        );
     }
 
     #[test]
@@ -283,7 +401,7 @@ mod tests {
             text: "abcdefghijklmnop".into(),
         };
         let render = |compact, en| {
-            transcript(&message, compact, en, 6)
+            transcript(0, &message, compact, en, 6)
                 .iter()
                 .map(Line::to_plain_text)
                 .collect::<Vec<_>>()

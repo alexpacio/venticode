@@ -45,7 +45,12 @@ pub(super) async fn member(
     write: bool,
     admin: bool,
 ) -> Result<(Uuid, Uuid)> {
-    if write && h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(&origin(app, h)?) {
+    if write
+        && !h
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|o| o.eq_ignore_ascii_case(&origin(app, h).unwrap_or_default()))
+    {
         return Err(forbidden());
     }
     let v = app.control_json(h, "session").await?;
@@ -62,7 +67,7 @@ pub(super) async fn private(app: &App, h: &HeaderMap, b: Value) -> Result<Value>
         return local.bot_identity(app, h, b).await;
     }
     let res = app
-        .control_request(h, Method::POST, "connection")?
+        .control_api_request(h, Method::POST, "connection")?
         .json(&b)
         .send()
         .await
@@ -86,10 +91,9 @@ pub(super) async fn provider(app: &App, b: Value) -> Result<Value> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:4190/exchange".into());
     let res = app
-        .http
+        .http_api
         .post(&url)
         .json(&b)
-        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
         .map_err(|err| {
@@ -126,9 +130,20 @@ fn credential_binding(workspace: Uuid, connection: Uuid) -> Vec<u8> {
     .concat()
 }
 
-async fn store_creds(
+async fn store_creds_remote(app: &App, h: &HeaderMap, id: Uuid, credentials: &Value) -> Result<()> {
+    if app.standalone.is_none() {
+        private(
+            app,
+            h,
+            json!({"action":"store","connection_id":id,"credentials":credentials}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn store_creds_local(
     app: &App,
-    h: &HeaderMap,
     tx: &mut sqlx::PgTransaction<'_>,
     id: Uuid,
     credentials: &Value,
@@ -144,13 +159,6 @@ async fn store_creds(
         .bind(local.workspace)
         .bind(sealed)
         .execute(&mut **tx)
-        .await?;
-    } else {
-        private(
-            app,
-            h,
-            json!({"action":"store","connection_id":id,"credentials":credentials}),
-        )
         .await?;
     }
     Ok(())
@@ -174,7 +182,7 @@ fn summary(r: &PgRow, origin: &str) -> Value {
 async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     let (w, u) = member(&app, &h, false, false).await?;
     let origin = origin(&app, &h)?;
-    let rows = sqlx::query("SELECT c.*,l.external_id AS linked_user_id FROM connections c LEFT JOIN external_links l ON l.connection_id=c.id AND l.user_id=$2 WHERE c.workspace=$1 ORDER BY c.id")
+    let rows = sqlx::query("SELECT c.*,l.external_id AS linked_user_id FROM connections c LEFT JOIN external_links l ON l.connection_id=c.id AND l.user_id=$2 WHERE c.workspace=$1 ORDER BY c.id LIMIT 200")
         .bind(w).bind(u)
         .fetch_all(&app.db)
         .await?;
@@ -232,20 +240,12 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
     }
     let m = Member::load(app, h, true).await?;
     let id = existing.unwrap_or_else(Uuid::new_v4);
-    let mut tx = app.db.begin().await?;
-    if existing.is_some() {
-        let row=sqlx::query("SELECT kind,destination,project_id,runtime FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE")
-            .bind(id).bind(w).fetch_one(&mut *tx).await?;
-        if row.get::<String, _>("kind") != b.kind
-            || row.get::<String, _>("destination") != b.destination
-            || row.get::<Option<Uuid>, _>("project_id") != b.project_id
-            || b.runtime
-                .as_deref()
-                .is_some_and(|v| v != row.get::<&str, _>("runtime"))
-        {
-            return Err(conflict());
-        }
-    } else {
+    b.credentials["webhook_secret"] = json!(random());
+    let public_origin = origin(app, h)?;
+    let webhook = format!("{public_origin}/hooks/{}/{id}", b.kind);
+
+    // Validate existing/new metadata and external provider credentials BEFORE holding DB locks.
+    if existing.is_none() {
         let runtime = b.runtime.as_deref().unwrap_or("project");
         validate_runtime(app, runtime, b.project_id)?;
         if let Some(project) = b.project_id {
@@ -255,23 +255,12 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
             .bind(w)
             .bind(u)
             .bind(project)
-            .fetch_one(&mut *tx)
+            .fetch_one(&app.db)
             .await?;
             m.harness(project.get("harness_id"), project.get("root"))?;
         }
-        sqlx::query("INSERT INTO connections(id,workspace,created_by,kind,destination,project_id,runtime) VALUES($1,$2,$3,$4,$5,$6,$7)")
-            .bind(id).bind(w).bind(u).bind(&b.kind).bind(&b.destination).bind(b.project_id).bind(runtime).execute(&mut *tx).await?;
     }
-    tx.commit().await?;
-    let mut tx = app.db.begin().await?;
-    sqlx::query("SELECT id FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE")
-        .bind(id)
-        .bind(w)
-        .fetch_one(&mut *tx)
-        .await?;
-    b.credentials["webhook_secret"] = json!(random());
-    let public_origin = origin(app, h)?;
-    let webhook = format!("{public_origin}/hooks/{}/{id}", b.kind);
+
     if b.kind == "slack" {
         let state = random();
         let redirect = format!("{public_origin}/oauth/slack");
@@ -288,47 +277,58 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
             )
             .append_pair("redirect_uri", &redirect)
             .append_pair("state", &state);
+        store_creds_remote(app, h, id, &b.credentials).await?;
+        let mut tx = app.db.begin().await?;
+        if existing.is_some() {
+            let row=sqlx::query("SELECT kind,destination,project_id,runtime FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE")
+                .bind(id).bind(w).fetch_one(&mut *tx).await?;
+            if row.get::<String, _>("kind") != b.kind
+                || row.get::<String, _>("destination") != b.destination
+                || row.get::<Option<Uuid>, _>("project_id") != b.project_id
+                || b.runtime
+                    .as_deref()
+                    .is_some_and(|v| v != row.get::<&str, _>("runtime"))
+            {
+                return Err(conflict());
+            }
+        } else {
+            let runtime = b.runtime.as_deref().unwrap_or("project");
+            sqlx::query("INSERT INTO connections(id,workspace,created_by,kind,destination,project_id,runtime) VALUES($1,$2,$3,$4,$5,$6,$7)")
+                .bind(id).bind(w).bind(u).bind(&b.kind).bind(&b.destination).bind(b.project_id).bind(runtime).execute(&mut *tx).await?;
+        }
         sqlx::query("UPDATE connections SET status='pending',enabled=false,state_hash=$2,state_until=now()+interval '10 minutes',oauth_user=$3 WHERE id=$1")
             .bind(id).bind(digest(&state)).bind(u).execute(&mut *tx).await?;
-        store_creds(app, h, &mut tx, id, &b.credentials).await?;
+        store_creds_local(app, &mut tx, id, &b.credentials).await?;
         tx.commit().await?;
         return Ok(json!({"id":id,"authorize_url":url.as_str(),"webhook_url":webhook}));
     }
-    let identity=provider(app,json!({"kind":b.kind,"operation":"identify","credentials":b.credentials,"destination":b.destination})).await?;
+
+    // Validate Telegram/GitLab credentials and discover existing GitLab hook outside DB transactions.
+    let identity = provider(
+        app,
+        json!({"kind":b.kind,"operation":"identify","credentials":b.credentials,"destination":b.destination}),
+    )
+    .await?;
     let info = if b.kind == "telegram" {
         &identity["result"]
     } else {
         &identity
     };
     let external = info["id"].as_i64().ok_or_else(bad)?.to_string();
-    let username = info["username"].as_str().ok_or_else(bad)?;
-    provider(app,json!({"kind":b.kind,"operation":"inspect","credentials":b.credentials,"destination":b.destination})).await?;
-    // Serialize ownership before changing the provider's webhook. Telegram allows only one per bot.
-    let binding = if b.kind == "telegram" {
-        format!("telegram:{external}")
-    } else {
-        format!("gitlab:{}", b.destination)
-    };
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(&binding)
-        .execute(&mut *tx)
-        .await?;
-    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT FROM connections WHERE kind=$1 AND id<>$2 AND status<>'disconnected' AND external_id IS NOT NULL AND (CASE WHEN kind='telegram' THEN external_id=$3 ELSE destination=$4 END))")
-        .bind(&b.kind).bind(id).bind(&external).bind(&b.destination).fetch_one(&mut *tx).await?;
-    if occupied {
-        return Err(conflict());
-    }
-    let old: Option<String> = sqlx::query_scalar("SELECT external_id FROM connections WHERE id=$1")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if old.is_some_and(|v| v != external) {
-        return Err(conflict());
-    }
+    let username = info["username"].as_str().ok_or_else(bad)?.to_owned();
+    provider(
+        app,
+        json!({"kind":b.kind,"operation":"inspect","credentials":b.credentials,"destination":b.destination}),
+    )
+    .await?;
     let mut hook_id = None;
     if b.kind == "gitlab" {
         for page in 1..=100 {
-            let result=provider(app,json!({"kind":"gitlab","operation":"hooks","page":page.to_string(),"credentials":b.credentials,"destination":b.destination})).await?;
+            let result = provider(
+                app,
+                json!({"kind":"gitlab","operation":"hooks","page":page.to_string(),"credentials":b.credentials,"destination":b.destination}),
+            )
+            .await?;
             let hooks = result.as_array().ok_or_else(unavailable)?;
             if let Some(hook) = hooks.iter().find(|v| v["url"] == webhook) {
                 hook_id = Some(hook["id"].as_i64().ok_or_else(unavailable)?.to_string());
@@ -342,30 +342,83 @@ async fn setup(app: &App, h: &HeaderMap, existing: Option<Uuid>, mut b: Setup) -
             }
         }
     }
-    // Keep the binding locked while installing and recording the external hook.
-    sqlx::query("UPDATE connections SET status='pending',enabled=false,identity=$2,external_id=$3 WHERE id=$1")
-        .bind(id).bind(username).bind(&external).execute(&mut *tx).await?;
-    store_creds(app, h, &mut tx, id, &b.credentials).await?;
-    let revision: i64 = sqlx::query_scalar(
-        "UPDATE connections SET revision=revision+1 WHERE id=$1 RETURNING revision",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    // A retry can find the reserved binding and sealed credentials even after an ambiguous remote install.
+
+    store_creds_remote(app, h, id, &b.credentials).await?;
+
+    // Short transaction #1: reserve binding + record pending state + optimistic revision.
     let mut tx = app.db.begin().await?;
-    sqlx::query(
-        "SELECT id FROM connections WHERE id=$1 AND revision=$2 AND status='pending' FOR UPDATE",
+    let binding = if b.kind == "telegram" {
+        format!("telegram:{external}")
+    } else {
+        format!("gitlab:{}", b.destination)
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(&binding)
+        .execute(&mut *tx)
+        .await?;
+    if existing.is_some() {
+        let row=sqlx::query("SELECT kind,destination,project_id,runtime,external_id FROM connections WHERE id=$1 AND workspace=$2 FOR UPDATE")
+            .bind(id).bind(w).fetch_one(&mut *tx).await?;
+        if row.get::<String, _>("kind") != b.kind
+            || row.get::<String, _>("destination") != b.destination
+            || row.get::<Option<Uuid>, _>("project_id") != b.project_id
+            || b.runtime
+                .as_deref()
+                .is_some_and(|v| v != row.get::<&str, _>("runtime"))
+            || row
+                .get::<Option<String>, _>("external_id")
+                .is_some_and(|v| v != external)
+        {
+            return Err(conflict());
+        }
+    }
+    let occupied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT FROM connections WHERE kind=$1 AND id<>$2 AND status<>'disconnected' AND external_id IS NOT NULL AND (CASE WHEN kind='telegram' THEN external_id=$3 ELSE destination=$4 END))",
     )
+    .bind(&b.kind)
     .bind(id)
-    .bind(revision)
+    .bind(&external)
+    .bind(&b.destination)
     .fetch_one(&mut *tx)
     .await?;
-    let installed=provider(app,json!({"kind":b.kind,"operation":"install","credentials":b.credentials,"destination":b.destination,"webhook_url":webhook,"hook_id":hook_id})).await?;
-    let row=sqlx::query("UPDATE connections SET status='connected',identity=$2,external_id=$3,hook_id=$4,revision=revision+1 WHERE id=$1 RETURNING *")
-        .bind(id).bind(username).bind(&external).bind(installed["id"].as_i64().map(|n|n.to_string())).fetch_one(&mut *tx).await?;
+    if occupied {
+        return Err(conflict());
+    }
+    if existing.is_none() {
+        let runtime = b.runtime.as_deref().unwrap_or("project");
+        sqlx::query("INSERT INTO connections(id,workspace,created_by,kind,destination,project_id,runtime) VALUES($1,$2,$3,$4,$5,$6,$7)")
+            .bind(id).bind(w).bind(u).bind(&b.kind).bind(&b.destination).bind(b.project_id).bind(runtime).execute(&mut *tx).await?;
+    }
+    let revision: i64 = sqlx::query_scalar(
+        "UPDATE connections SET status='pending',enabled=false,identity=$2,external_id=$3,revision=revision+1 WHERE id=$1 RETURNING revision",
+    )
+    .bind(id)
+    .bind(&username)
+    .bind(&external)
+    .fetch_one(&mut *tx)
+    .await?;
+    store_creds_local(app, &mut tx, id, &b.credentials).await?;
     tx.commit().await?;
+
+    // Install webhook outside any Postgres transaction.
+    let installed = provider(
+        app,
+        json!({"kind":b.kind,"operation":"install","credentials":b.credentials,"destination":b.destination,"webhook_url":webhook,"hook_id":hook_id}),
+    )
+    .await?;
+
+    // Short transaction #2: finalize connected state with optimistic revision check.
+    let row = sqlx::query(
+        "UPDATE connections SET status='connected',identity=$2,external_id=$3,hook_id=$4,revision=revision+1 WHERE id=$1 AND revision=$5 AND status='pending' RETURNING *",
+    )
+    .bind(id)
+    .bind(&username)
+    .bind(&external)
+    .bind(installed["id"].as_i64().map(|n| n.to_string()))
+    .bind(revision)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or_else(conflict)?;
     Ok(summary(&row, &public_origin))
 }
 #[derive(Deserialize)]
@@ -386,13 +439,26 @@ pub(super) async fn callback(
     let state = q.state.as_deref().ok_or_else(bad)?;
     let code = q.code.as_deref().ok_or_else(bad)?;
     let (w, u) = member(&app, &h, false, true).await?;
-    let mut tx = app.db.begin().await?;
-    let r=sqlx::query("SELECT id,destination,external_id,identity FROM connections WHERE kind='slack' AND workspace=$1 AND oauth_user=$2 AND state_hash=$3 AND state_until>now() FOR UPDATE")
-        .bind(w).bind(u).bind(digest(state)).fetch_one(&mut *tx).await?;
+    let state_hash = digest(state);
+    // Read pending connection without holding a transaction across Slack OAuth HTTP calls.
+    let r = sqlx::query(
+        "SELECT id,destination,external_id,identity,revision FROM connections WHERE kind='slack' AND workspace=$1 AND oauth_user=$2 AND state_hash=$3 AND state_until>now()",
+    )
+    .bind(w)
+    .bind(u)
+    .bind(&state_hash)
+    .fetch_one(&app.db)
+    .await?;
     let id: Uuid = r.get("id");
+    let revision: i64 = r.get("revision");
+    let destination: String = r.get("destination");
     let mut c = creds(&app, &h, id).await?;
     let public_origin = origin(&app, &h)?;
-    let result=provider(&app,json!({"kind":"slack","operation":"exchange","code":code,"credentials":c,"redirect_uri":format!("{public_origin}/oauth/slack")})).await?;
+    let result = provider(
+        &app,
+        json!({"kind":"slack","operation":"exchange","code":code,"credentials":c,"redirect_uri":format!("{public_origin}/oauth/slack")}),
+    )
+    .await?;
     c["token"] = json!(result["access_token"].as_str().ok_or_else(forbidden)?);
     let team = result["team"]["id"].as_str().ok_or_else(forbidden)?;
     let bot = result["bot_user_id"].as_str().ok_or_else(forbidden)?;
@@ -401,18 +467,42 @@ pub(super) async fn callback(
     {
         return Err(conflict());
     }
-    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT FROM connections WHERE id<>$1 AND kind='slack' AND external_id=$2 AND destination=$3 AND status<>'disconnected')")
-        .bind(id).bind(team).bind(r.get::<String,_>("destination")).fetch_one(&mut *tx).await?;
-    if occupied {
-        return Err(conflict());
-    }
-    provider(&app,json!({"kind":"slack","operation":"inspect","credentials":c,"destination":r.get::<String,_>("destination")})).await?;
+    provider(
+        &app,
+        json!({"kind":"slack","operation":"inspect","credentials":c,"destination":destination}),
+    )
+    .await?;
     // OAuth state and user binding replace the cross-site browser callback's Origin.
     let mut trusted = h.clone();
     trusted.insert(header::ORIGIN, public_origin.parse().map_err(|_| bad())?);
-    store_creds(&app, &trusted, &mut tx, id, &c).await?;
-    sqlx::query("UPDATE connections SET state_hash=NULL,state_until=NULL,status='connected',identity=$2,external_id=$3,revision=revision+1 WHERE id=$1")
-        .bind(id).bind(bot).bind(team).execute(&mut *tx).await?;
+    store_creds_remote(&app, &trusted, id, &c).await?;
+
+    let mut tx = app.db.begin().await?;
+    let occupied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT FROM connections WHERE id<>$1 AND kind='slack' AND external_id=$2 AND destination=$3 AND status<>'disconnected')",
+    )
+    .bind(id)
+    .bind(team)
+    .bind(&destination)
+    .fetch_one(&mut *tx)
+    .await?;
+    if occupied {
+        return Err(conflict());
+    }
+    let updated = sqlx::query(
+        "UPDATE connections SET state_hash=NULL,state_until=NULL,status='connected',identity=$2,external_id=$3,revision=revision+1 WHERE id=$1 AND revision=$4 AND state_hash=$5 AND state_until>now()",
+    )
+    .bind(id)
+    .bind(bot)
+    .bind(team)
+    .bind(revision)
+    .bind(&state_hash)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(conflict());
+    }
+    store_creds_local(&app, &mut tx, id, &c).await?;
     tx.commit().await?;
     Ok(Redirect::to("/connections"))
 }
@@ -422,26 +512,26 @@ async fn disconnect(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let (w, owner) = member(&app, &h, true, true).await?;
-    let mut tx = app.db.begin().await?;
-    let r=sqlx::query("UPDATE connections SET status='disconnected',enabled=false,state_hash=NULL,revision=revision+1 WHERE id=$1 AND workspace=$2 RETURNING *")
-        .bind(id).bind(w).fetch_one(&mut *tx).await?;
-    let kind: &str = r.get("kind");
-    if let Some(external) = r.get::<Option<String>, _>("external_id") {
-        let destination: &str = r.get("destination");
-        let binding = if kind == "telegram" {
-            format!("telegram:{external}")
-        } else {
-            format!("{kind}:{destination}")
-        };
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-            .bind(binding)
-            .execute(&mut *tx)
-            .await?;
+    // Step 1: mark disconnected locally in a short transaction (capturing metadata for remote cleanup).
+    let r = sqlx::query(
+        "UPDATE connections SET status='disconnected',enabled=false,state_hash=NULL,revision=revision+1 WHERE id=$1 AND workspace=$2 RETURNING kind,destination,external_id,hook_id",
+    )
+    .bind(id)
+    .bind(w)
+    .fetch_one(&app.db)
+    .await?;
+    let kind: String = r.get("kind");
+    let destination: String = r.get("destination");
+    let external: Option<String> = r.get("external_id");
+    let hook_id: Option<String> = r.get("hook_id");
+
+    // Step 2: revoke remote webhook & control-plane credentials OUTSIDE any Postgres transaction.
+    if external.is_some() {
         match creds(&app, &h, id).await {
             Ok(c) => {
                 if let Err(err) = provider(
                     &app,
-                    json!({"kind":kind,"operation":"remove","credentials":c,"destination":destination,"hook_id":r.get::<Option<String>,_>("hook_id")}),
+                    json!({"kind":kind,"operation":"remove","credentials":c,"destination":destination,"hook_id":hook_id}),
                 )
                 .await
                 {
@@ -454,14 +544,18 @@ async fn disconnect(
             }
         }
     }
+    if app.standalone.is_none() {
+        private(&app, &h, json!({"action":"remove","connection_id":id})).await?;
+    }
+
+    // Step 3: purge local credentials, grants, and links in a short transaction.
+    let mut tx = app.db.begin().await?;
     if app.standalone.is_some() {
         sqlx::query("UPDATE connections SET standalone_credentials=NULL WHERE id=$1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         remove_grant(&mut tx, id, owner).await?;
-    } else {
-        private(&app, &h, json!({"action":"remove","connection_id":id})).await?;
     }
     sqlx::query("DELETE FROM external_links WHERE connection_id=$1")
         .bind(id)
@@ -534,10 +628,11 @@ async fn unlink(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> R
     }
     if app.standalone.is_some() {
         remove_grant(&mut tx, id, user).await?;
-    } else {
-        private(&app, &h, json!({"action":"unlink","connection_id":id})).await?;
     }
     tx.commit().await?;
+    if app.standalone.is_none() {
+        private(&app, &h, json!({"action":"unlink","connection_id":id})).await?;
+    }
     Ok(Json(json!({"deleted":true})))
 }
 
@@ -561,10 +656,12 @@ fn bot_document(r: &PgRow) -> Value {
 }
 async fn bots(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     let (w, _) = member(&app, &h, false, false).await?;
-    let rows = sqlx::query(&format!("{BOT} AND c.status='connected' ORDER BY c.id"))
-        .bind(w)
-        .fetch_all(&app.db)
-        .await?;
+    let rows = sqlx::query(&format!(
+        "{BOT} AND c.status='connected' ORDER BY c.id LIMIT 200"
+    ))
+    .bind(w)
+    .fetch_all(&app.db)
+    .await?;
     Ok(Json(
         json!({"items":rows.iter().map(bot_document).collect::<Vec<_>>()}),
     ))
@@ -626,10 +723,15 @@ async fn edit_bot(
         .await?;
         validate_runtime(&app, runtime, project)?;
     }
-    let n=sqlx::query("UPDATE connections SET enabled=COALESCE($4,enabled),instructions=COALESCE($5,instructions),rate_limit_per_hour=COALESCE($6,rate_limit_per_hour),triggers=COALESCE($7,triggers),tools=COALESCE($8,tools),runtime=COALESCE($9,runtime),revision=revision+1 WHERE id=$1 AND workspace=$2 AND revision=$3 AND status='connected'")
+    let n = sqlx::query("UPDATE connections SET enabled=COALESCE($4,enabled),instructions=COALESCE($5,instructions),rate_limit_per_hour=COALESCE($6,rate_limit_per_hour),triggers=COALESCE($7,triggers),tools=COALESCE($8,tools),runtime=COALESCE($9,runtime),revision=revision+1 WHERE id=$1 AND workspace=$2 AND revision=$3 AND status='connected'")
         .bind(id).bind(w).bind(b.revision).bind(b.enabled).bind(b.instructions).bind(b.rate_limit_per_hour).bind(b.triggers).bind(b.tools).bind(b.runtime).execute(&app.db).await?;
     if n.rows_affected() != 1 {
         return Err(conflict());
     }
-    bot(State(app), h, Path(id)).await
+    let row = sqlx::query(&format!("{BOT} AND c.id=$2 AND c.status='connected'"))
+        .bind(w)
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?;
+    Ok(Json(bot_document(&row)))
 }

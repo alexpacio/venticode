@@ -2,13 +2,15 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use globset::{GlobBuilder, GlobMatcher};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
@@ -17,6 +19,7 @@ pub const FILE_LIMIT: usize = 4 * 1024 * 1024;
 pub const INLINE_TEXT_LIMIT: usize = 512 * 1024;
 pub const RANGE_FILE_LIMIT: usize = 8 * 1024 * 1024;
 const IGNORE_FILE_LIMIT: usize = 64 * 1024;
+const SEARCH_FILE_LIMIT: usize = 2 * 1024 * 1024;
 
 const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -63,63 +66,117 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn glob_match_segment(pat: &[u8], text: &[u8]) -> bool {
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
-    while ti < text.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
-            pi += 1;
-            star_ti = ti;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
+struct CompiledGlob {
+    matcher: GlobMatcher,
+    basename_only: bool,
 }
 
-fn glob_match_parts(pat: &[&str], parts: &[&str]) -> bool {
-    if pat.is_empty() {
-        return parts.is_empty();
-    }
-    if pat[0] == "**" {
-        if glob_match_parts(&pat[1..], parts) {
-            return true;
+impl CompiledGlob {
+    fn compile(pattern: &str) -> Result<Option<Self>> {
+        let pat = pattern.trim().trim_start_matches("./").trim_matches('/');
+        if pat.is_empty() {
+            return Ok(None);
         }
-        if !parts.is_empty() {
-            return glob_match_parts(pat, &parts[1..]);
+        let basename_only = !pat.contains('/');
+        let matcher = GlobBuilder::new(pat)
+            .literal_separator(true)
+            .build()
+            .with_context(|| format!("Invalid glob pattern '{pattern}'"))?
+            .compile_matcher();
+        Ok(Some(Self {
+            matcher,
+            basename_only,
+        }))
+    }
+
+    fn is_match(&self, rel_path: &str) -> bool {
+        if self.basename_only {
+            let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+            self.matcher.is_match(file_name)
+        } else {
+            let normalized = rel_path.trim_start_matches("./").trim_matches('/');
+            self.matcher.is_match(normalized)
         }
-        return false;
     }
-    if parts.is_empty() {
-        return false;
-    }
-    glob_match_segment(pat[0].as_bytes(), parts[0].as_bytes())
-        && glob_match_parts(&pat[1..], &parts[1..])
 }
 
 pub fn glob_matches(pattern: &str, rel_path: &str) -> bool {
-    let pat = pattern.trim().trim_start_matches("./").trim_matches('/');
-    if pat.is_empty() {
-        return true;
+    match CompiledGlob::compile(pattern) {
+        Ok(Some(compiled)) => compiled.is_match(rel_path),
+        Ok(None) => true,
+        Err(_) => false,
     }
-    if !pat.contains('/') {
-        let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-        return glob_match_segment(pat.as_bytes(), file_name.as_bytes());
+}
+
+/// Read a bounded regular file relative to `root` using `cap_std::fs::Dir` without following
+/// symlinks on any directory component or the target file, using `O_NONBLOCK` on Unix.
+/// Returns `Ok(None)` if the file or any parent directory does not exist.
+pub fn read_sandboxed_nofollow(
+    root: &Path,
+    rel: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let base = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => parts.push(seg),
+            _ => bail!("Invalid relative config path"),
+        }
     }
-    let pat_parts: Vec<&str> = pat.split('/').filter(|s| !s.is_empty()).collect();
-    let path_parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
-    glob_match_parts(&pat_parts, &path_parts)
+    let Some((file_name, parent_parts)) = parts.split_last() else {
+        bail!("Config path requires a file name");
+    };
+    let mut current: Option<Dir> = None;
+    for dir_name in parent_parts {
+        let parent_ref = current.as_ref().unwrap_or(&base);
+        match parent_ref.open_dir_nofollow(dir_name) {
+            Ok(next) => current = Some(next),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let parent_ref = current.as_ref().unwrap_or(&base);
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match parent_ref.open_with(file_name, &options) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    ensure!(file.metadata()?.is_file(), "Regular file required");
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= max_bytes, "Config file exceeds size limit");
+    Ok(Some(bytes))
+}
+
+/// Read a bounded regular file on the host with `O_NONBLOCK` on Unix.
+/// Returns `Ok(None)` if the file does not exist.
+pub fn read_host_bounded_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    ensure!(file.metadata()?.is_file(), "Regular file required");
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= max_bytes, "Config file exceeds size limit");
+    Ok(Some(bytes))
 }
 
 #[derive(Default)]
@@ -183,19 +240,6 @@ impl IgnoreRules {
         }
     }
 
-    fn within<T>(
-        &mut self,
-        prefix: &str,
-        matcher: Option<Gitignore>,
-        visit: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let depth = self.0.len();
-        self.push(Path::new(prefix), matcher);
-        let result = visit(self);
-        self.0.truncate(depth);
-        result
-    }
-
     fn is_ignored(&self, rel_path: &str, name: &str, is_dir: bool) -> bool {
         if is_dir && DEFAULT_IGNORED_DIRS.contains(&name) {
             return true;
@@ -225,16 +269,61 @@ fn yolo_resolve(base: &Path, path: &str) -> Result<PathBuf> {
     })
 }
 
-fn read_host_regular_file(target: &Path, limit: usize) -> Result<Vec<u8>> {
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+fn is_transient_walk_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+fn open_host_regular_file(target: &Path, reject_symlink: bool) -> Result<(std::fs::File, u64)> {
+    if reject_symlink {
+        let meta = std::fs::symlink_metadata(target)?;
+        ensure!(
+            !meta.file_type().is_symlink(),
+            "Cannot edit through a symlink"
+        );
+        ensure!(meta.is_file(), "Regular file required");
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        let mut flags = libc::O_NONBLOCK;
+        if reject_symlink {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
     }
     let file = options.open(target)?;
-    ensure!(file.metadata()?.is_file(), "Regular file required");
+    let meta = file.metadata()?;
+    ensure!(meta.is_file(), "Regular file required");
+    Ok((file, meta.len()))
+}
+
+fn read_host_regular_file(target: &Path, limit: usize, reject_symlink: bool) -> Result<Vec<u8>> {
+    let (file, _) = open_host_regular_file(target, reject_symlink)?;
     let mut bytes = Vec::new();
     file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
     ensure!(
@@ -266,7 +355,13 @@ fn write_host_atomic(target: &Path, bytes: &[u8], limit: usize) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let mut file = options.open(&temp_path)?;
+        file.write_all(bytes)?;
         match std::fs::symlink_metadata(target) {
             Ok(metadata) if metadata.is_file() => {
                 file.set_permissions(metadata.permissions())?;
@@ -275,7 +370,6 @@ fn write_host_atomic(target: &Path, bytes: &[u8], limit: usize) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         let dest = parent.join(name);
@@ -286,6 +380,297 @@ fn write_host_atomic(target: &Path, bytes: &[u8], limit: usize) -> Result<()> {
         let _ = std::fs::remove_file(&temp_path);
     }
     result
+}
+
+fn detect_line_ending(text: &str) -> &'static str {
+    let bytes = text.as_bytes();
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                crlf += 1;
+            } else {
+                lf += 1;
+            }
+        }
+    }
+    if crlf > 0 && crlf >= lf { "\r\n" } else { "\n" }
+}
+
+fn normalize_to_lf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn restore_line_endings(text: &str, ending: &str) -> String {
+    if ending == "\r\n" {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
+struct NormalizedMap {
+    text: String,
+    orig_starts: Vec<usize>,
+    orig_ends: Vec<usize>,
+    /// When a character is the last non-whitespace char on a line with stripped trailing spaces,
+    /// records the byte offset right after the stripped trailing whitespace.
+    line_trailing_end: Vec<usize>,
+}
+
+impl NormalizedMap {
+    fn lf_only(input: &str) -> Self {
+        let mut text = String::with_capacity(input.len());
+        let mut orig_starts = Vec::with_capacity(input.len());
+        let mut orig_ends = Vec::with_capacity(input.len());
+        let mut line_trailing_end = Vec::with_capacity(input.len());
+        let mut iter = input.char_indices().peekable();
+        while let Some((idx, ch)) = iter.next() {
+            let (out_ch, end_idx) = if ch == '\r' {
+                if let Some(&(next_idx, '\n')) = iter.peek() {
+                    iter.next();
+                    ('\n', next_idx + 1)
+                } else {
+                    ('\n', idx + 1)
+                }
+            } else {
+                (ch, idx + ch.len_utf8())
+            };
+            let mut buf = [0u8; 4];
+            let encoded = out_ch.encode_utf8(&mut buf);
+            for _ in encoded.as_bytes() {
+                orig_starts.push(idx);
+                orig_ends.push(end_idx);
+                line_trailing_end.push(end_idx);
+            }
+            text.push_str(encoded);
+        }
+        Self {
+            text,
+            orig_starts,
+            orig_ends,
+            line_trailing_end,
+        }
+    }
+
+    fn fuzzy(input: &str) -> Self {
+        let mut text = String::with_capacity(input.len());
+        let mut orig_starts = Vec::with_capacity(input.len());
+        let mut orig_ends = Vec::with_capacity(input.len());
+        let mut line_trailing_end = Vec::with_capacity(input.len());
+
+        let bytes = input.as_bytes();
+        let mut pos = 0usize;
+        while pos < input.len() {
+            let line_start = pos;
+            let mut line_content_end = pos;
+            let mut newline_end = None;
+            while pos < bytes.len() {
+                if bytes[pos] == b'\r' {
+                    line_content_end = pos;
+                    if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
+                        newline_end = Some(pos + 2);
+                        pos += 2;
+                    } else {
+                        newline_end = Some(pos + 1);
+                        pos += 1;
+                    }
+                    break;
+                } else if bytes[pos] == b'\n' {
+                    line_content_end = pos;
+                    newline_end = Some(pos + 1);
+                    pos += 1;
+                    break;
+                }
+                pos += 1;
+                line_content_end = pos;
+            }
+
+            let line_slice = &input[line_start..line_content_end];
+            let trimmed = line_slice.trim_end_matches(is_fuzzy_horizontal_ws);
+            let trimmed_orig_end = line_start + trimmed.len();
+
+            for (rel_idx, ch) in trimmed.char_indices() {
+                let abs_start = line_start + rel_idx;
+                let abs_end = abs_start + ch.len_utf8();
+                let mapped = normalize_fuzzy_char(ch);
+                let mut buf = [0u8; 4];
+                let encoded = mapped.encode_utf8(&mut buf);
+                for _ in encoded.as_bytes() {
+                    orig_starts.push(abs_start);
+                    orig_ends.push(abs_end);
+                    line_trailing_end.push(abs_end);
+                }
+                text.push_str(encoded);
+            }
+
+            // If this line had trailing whitespace stripped and at least one char was emitted,
+            // record the end of the stripped trailing whitespace on the final byte of the line.
+            if line_content_end > trimmed_orig_end
+                && !trimmed.is_empty()
+                && let Some(last) = line_trailing_end.last_mut()
+            {
+                *last = line_content_end;
+            }
+
+            if let Some(nl_end) = newline_end {
+                text.push('\n');
+                orig_starts.push(line_content_end);
+                orig_ends.push(nl_end);
+                line_trailing_end.push(nl_end);
+            }
+        }
+
+        Self {
+            text,
+            orig_starts,
+            orig_ends,
+            line_trailing_end,
+        }
+    }
+
+    fn map_span(&self, norm_start: usize, norm_end: usize) -> (usize, usize) {
+        let orig_start = self.orig_starts[norm_start];
+        let last_idx = norm_end - 1;
+        let at_line_end = norm_end == self.text.len() || self.text.as_bytes()[norm_end] == b'\n';
+        let orig_end = if at_line_end {
+            self.line_trailing_end[last_idx]
+        } else {
+            self.orig_ends[last_idx]
+        };
+        (orig_start, orig_end)
+    }
+}
+
+fn is_fuzzy_horizontal_ws(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t' | '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+fn normalize_fuzzy_char(ch: char) -> char {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
+fn apply_spans(content: &str, spans: &[(usize, usize)], replacement: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for &(start, end) in spans {
+        out.push_str(&content[cursor..start]);
+        out.push_str(replacement);
+        cursor = end;
+    }
+    out.push_str(&content[cursor..]);
+    out
+}
+
+fn stream_read_range(reader_src: Box<dyn Read>, req_start: usize, req_end: usize) -> Result<Value> {
+    let mut reader = BufReader::with_capacity(64 * 1024, reader_src);
+    let mut current_line = 1usize;
+    let mut saw_any_bytes_on_line = false;
+
+    while current_line < req_start {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            let total_lines = if saw_any_bytes_on_line {
+                current_line
+            } else {
+                current_line - 1
+            };
+            return Ok(json!({
+                "encoding": "utf8",
+                "content": "",
+                "sha256": Value::Null,
+                "total_lines": total_lines,
+                "start_line": req_start,
+                "end_line": 0,
+                "truncated": false
+            }));
+        }
+        ensure!(
+            memchr::memchr(0, chunk).is_none(),
+            "Line-range read requires UTF-8 text file / Lettura per righe richiede file UTF-8"
+        );
+        let mut consumed = 0usize;
+        while current_line < req_start && consumed < chunk.len() {
+            if let Some(pos) = memchr::memchr(b'\n', &chunk[consumed..]) {
+                consumed += pos + 1;
+                current_line += 1;
+                saw_any_bytes_on_line = false;
+            } else {
+                consumed = chunk.len();
+                saw_any_bytes_on_line = true;
+            }
+        }
+        reader.consume(consumed);
+    }
+
+    let mut out = String::new();
+    let mut actual_end = 0usize;
+    let mut truncated = false;
+    let mut reached_eof = false;
+    let mut line_buf = Vec::new();
+    let mut line_no = req_start;
+
+    while line_no <= req_end {
+        line_buf.clear();
+        let n = (&mut reader)
+            .take((INLINE_TEXT_LIMIT + 1) as u64)
+            .read_until(b'\n', &mut line_buf)?;
+        if n == 0 {
+            reached_eof = true;
+            break;
+        }
+        ensure!(
+            memchr::memchr(0, &line_buf).is_none(),
+            "Line-range read requires UTF-8 text file / Lettura per righe richiede file UTF-8"
+        );
+        let line_str = std::str::from_utf8(&line_buf).context(
+            "Line-range read requires UTF-8 text file / Lettura per righe richiede file UTF-8",
+        )?;
+        if out.len() + line_str.len() > INLINE_TEXT_LIMIT {
+            ensure!(
+                actual_end != 0,
+                "Line {req_start} exceeds the {INLINE_TEXT_LIMIT}-byte inline read limit"
+            );
+            truncated = true;
+            break;
+        }
+        out.push_str(line_str);
+        actual_end = line_no;
+        line_no += 1;
+    }
+
+    Ok(json!({
+        "encoding": "utf8",
+        "content": out,
+        "sha256": Value::Null,
+        "total_lines": if reached_eof { json!(line_no - 1) } else { Value::Null },
+        "start_line": req_start,
+        "end_line": actual_end,
+        "truncated": truncated
+    }))
 }
 
 impl Files {
@@ -333,33 +718,54 @@ impl Files {
         }
     }
 
-    fn open_regular_file(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
+    fn open_file_handle(&self, path: &str, reject_symlink: bool) -> Result<(Box<dyn Read>, u64)> {
         match &self.inner {
             FilesInner::Sandboxed { dir, .. } => {
                 let rel = relative(path)?;
+                if reject_symlink {
+                    let meta = dir.symlink_metadata(rel)?;
+                    ensure!(
+                        !meta.file_type().is_symlink(),
+                        "Cannot edit through a symlink"
+                    );
+                    ensure!(meta.is_file(), "Regular file required");
+                }
                 let mut options = OpenOptions::new();
                 options.read(true);
+                if reject_symlink {
+                    options.follow(FollowSymlinks::No);
+                }
                 #[cfg(unix)]
                 {
                     use cap_std::fs::OpenOptionsExt;
                     options.custom_flags(libc::O_NONBLOCK);
                 }
                 let file = dir.open_with(rel, &options)?;
-                ensure!(file.metadata()?.is_file(), "Regular file required");
-                let mut bytes = Vec::new();
-                file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
-                ensure!(
-                    bytes.len() <= limit,
-                    if limit == FILE_LIMIT {
-                        "File exceeds 4 MiB"
-                    } else {
-                        "File exceeds 8 MiB"
-                    }
-                );
-                Ok(bytes)
+                let meta = file.metadata()?;
+                ensure!(meta.is_file(), "Regular file required");
+                Ok((Box::new(file), meta.len()))
             }
-            FilesInner::Yolo { base } => read_host_regular_file(&yolo_resolve(base, path)?, limit),
+            FilesInner::Yolo { base } => {
+                let (file, len) =
+                    open_host_regular_file(&yolo_resolve(base, path)?, reject_symlink)?;
+                Ok((Box::new(file), len))
+            }
         }
+    }
+
+    fn open_regular_file(&self, path: &str, limit: usize, reject_symlink: bool) -> Result<Vec<u8>> {
+        let (file, _) = self.open_file_handle(path, reject_symlink)?;
+        let mut bytes = Vec::new();
+        file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= limit,
+            if limit == FILE_LIMIT {
+                "File exceeds 4 MiB"
+            } else {
+                "File exceeds 8 MiB"
+            }
+        );
+        Ok(bytes)
     }
 
     pub fn list(&self, path: &str) -> Result<Value> {
@@ -371,12 +777,25 @@ impl Files {
                         items.len() < 4096,
                         "Too many entries; choose a narrower directory"
                     );
-                    let entry = entry?;
-                    let metadata = entry.metadata()?;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
+                    let metadata = match entry.metadata() {
+                        Ok(meta) => meta,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
                     items.push(json!({
                         "name": entry.file_name().to_string_lossy(),
                         "directory": metadata.is_dir(),
-                        "symlink": entry.file_type()?.is_symlink(),
+                        "symlink": ft.is_symlink(),
                         "bytes": metadata.len()
                     }));
                 }
@@ -387,8 +806,16 @@ impl Files {
                         items.len() < 4096,
                         "Too many entries; choose a narrower directory"
                     );
-                    let entry = entry?;
-                    let ft = entry.file_type()?;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
                     let Ok(metadata) = entry
                         .metadata()
                         .or_else(|_| std::fs::symlink_metadata(entry.path()))
@@ -418,16 +845,53 @@ impl Files {
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> Result<Value> {
+        if let Some(start) = start_line {
+            ensure!(start >= 1, "start_line must be >= 1");
+        }
+        if let Some(end) = end_line {
+            ensure!(end >= 1, "end_line must be >= 1");
+        }
+        if let (Some(start), Some(end)) = (start_line, end_line) {
+            ensure!(
+                end >= start,
+                "end_line ({end}) must be >= start_line ({start})"
+            );
+        }
         let has_range = start_line.is_some() || end_line.is_some();
+        let req_start = start_line.unwrap_or(1);
+        let req_end = end_line.unwrap_or(usize::MAX);
+
+        let (file, file_len) = self.open_file_handle(path, false)?;
+        if has_range && file_len > RANGE_FILE_LIMIT as u64 {
+            return stream_read_range(file, req_start, req_end);
+        }
+
         let limit = if has_range {
             RANGE_FILE_LIMIT
         } else {
             FILE_LIMIT
         };
-        let bytes = self.open_regular_file(path, limit)?;
+        let mut bytes = Vec::new();
+        file.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            if has_range {
+                // File grew past RANGE_FILE_LIMIT while reading; reopen and stream.
+                let (stream_file, _) = self.open_file_handle(path, false)?;
+                return stream_read_range(stream_file, req_start, req_end);
+            }
+            bail!("File exceeds 4 MiB");
+        }
+
         let digest = sha256_hex(&bytes);
-        match String::from_utf8(bytes) {
-            Ok(full) => {
+        let is_binary = memchr::memchr(0, &bytes).is_some();
+        let text_opt = if is_binary {
+            None
+        } else {
+            String::from_utf8(bytes.clone()).ok()
+        };
+
+        match text_opt {
+            Some(full) => {
                 let segments: Vec<&str> = if full.is_empty() {
                     Vec::new()
                 } else {
@@ -447,8 +911,6 @@ impl Files {
                         "truncated": false
                     }));
                 }
-                let req_start = start_line.unwrap_or(1).max(1);
-                let req_end = end_line.unwrap_or(usize::MAX).max(req_start);
                 if total_lines == 0 || req_start > total_lines {
                     return Ok(json!({
                         "encoding": "utf8",
@@ -486,16 +948,15 @@ impl Files {
                     "truncated": truncated
                 }))
             }
-            Err(error) => {
-                let raw = error.as_bytes();
+            None => {
                 ensure!(
                     !has_range,
                     "Line-range read requires UTF-8 text file / Lettura per righe richiede file UTF-8"
                 );
                 Ok(json!({
                     "encoding": "base64",
-                    "content": STANDARD.encode(raw),
-                    "bytes": raw.len(),
+                    "content": STANDARD.encode(&bytes),
+                    "bytes": bytes.len(),
                     "sha256": digest
                 }))
             }
@@ -524,7 +985,13 @@ impl Files {
                 let result = (|| -> Result<()> {
                     let mut options = OpenOptions::new();
                     options.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use cap_std::fs::OpenOptionsExt;
+                        options.mode(0o600);
+                    }
                     let mut file = parent.open_with(&temporary, &options)?;
+                    file.write_all(bytes)?;
                     match parent.symlink_metadata(name) {
                         Ok(metadata) if metadata.is_file() => {
                             file.set_permissions(metadata.permissions())?
@@ -533,7 +1000,6 @@ impl Files {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
-                    file.write_all(bytes)?;
                     file.sync_all()?;
                     drop(file);
                     parent.rename(&temporary, &parent, name)?;
@@ -556,7 +1022,7 @@ impl Files {
 
     pub fn edit(&self, path: &str, edits: &[Edit], expected_sha256: Option<&str>) -> Result<Value> {
         ensure!(!edits.is_empty(), "At least one edit is required");
-        let bytes = self.open_regular_file(path, RANGE_FILE_LIMIT)?;
+        let bytes = self.open_regular_file(path, RANGE_FILE_LIMIT, true)?;
         let current_sha = sha256_hex(&bytes);
         if let Some(expected) = expected_sha256 {
             ensure!(
@@ -575,36 +1041,76 @@ impl Files {
                 "Edit #{} target must not be empty",
                 idx + 1
             );
-            let mut target = Cow::Borrowed(item.target.as_str());
-            let mut count = content.matches(target.as_ref()).count();
-            if count == 0
-                && item.target.contains('\n')
-                && !item.target.contains('\r')
-                && content
-                    .split("\r\n")
-                    .all(|part| !part.contains(['\r', '\n']))
-            {
-                target = Cow::Owned(item.target.replace('\n', "\r\n"));
-                count = content.matches(target.as_ref()).count();
+            // Tier 1: exact match (preserves verbatim replacement and mixed line endings).
+            let exact_count = content.matches(&item.target).count();
+            if exact_count > 0 {
+                if !item.replace_all && exact_count > 1 {
+                    bail!(
+                        "Edit #{} target matched {} occurrences in {}; provide more context or set replace_all=true",
+                        idx + 1,
+                        exact_count,
+                        path
+                    );
+                }
+                content = content.replace(&item.target, &item.replacement);
+                total_replacements += exact_count;
+                continue;
             }
-            if count == 0 {
+
+            // Tier 2: line-ending normalized match (detect -> normalize_to_lf -> restore_line_endings).
+            let ending = detect_line_ending(&content);
+            let lf_map = NormalizedMap::lf_only(&content);
+            let lf_target = normalize_to_lf(&item.target);
+            let lf_spans: Vec<(usize, usize)> = if !lf_target.is_empty() {
+                lf_map
+                    .text
+                    .match_indices(&lf_target)
+                    .map(|(start, _)| lf_map.map_span(start, start + lf_target.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !lf_spans.is_empty() {
+                if !item.replace_all && lf_spans.len() > 1 {
+                    bail!(
+                        "Edit #{} target matched {} occurrences in {}; provide more context or set replace_all=true",
+                        idx + 1,
+                        lf_spans.len(),
+                        path
+                    );
+                }
+                let restored = restore_line_endings(&normalize_to_lf(&item.replacement), ending);
+                content = apply_spans(&content, &lf_spans, &restored);
+                total_replacements += lf_spans.len();
+                continue;
+            }
+
+            // Tier 3: fuzzy normalized match (trailing ws, smart quotes, Unicode dashes, NBSP).
+            let fuzzy_map = NormalizedMap::fuzzy(&content);
+            let fuzzy_target = NormalizedMap::fuzzy(&item.target).text;
+            let fuzzy_spans: Vec<(usize, usize)> = if !fuzzy_target.is_empty() {
+                fuzzy_map
+                    .text
+                    .match_indices(&fuzzy_target)
+                    .map(|(start, _)| fuzzy_map.map_span(start, start + fuzzy_target.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if fuzzy_spans.is_empty() {
                 bail!("Edit #{} target not found in {}", idx + 1, path);
             }
-            if !item.replace_all && count > 1 {
+            if !item.replace_all && fuzzy_spans.len() > 1 {
                 bail!(
                     "Edit #{} target matched {} occurrences in {}; provide more context or set replace_all=true",
                     idx + 1,
-                    count,
+                    fuzzy_spans.len(),
                     path
                 );
             }
-            let replacement = if matches!(target, Cow::Owned(_)) {
-                Cow::Owned(item.replacement.replace("\r\n", "\n").replace('\n', "\r\n"))
-            } else {
-                Cow::Borrowed(item.replacement.as_str())
-            };
-            content = content.replace(target.as_ref(), replacement.as_ref());
-            total_replacements += count;
+            let restored = restore_line_endings(&normalize_to_lf(&item.replacement), ending);
+            content = apply_spans(&content, &fuzzy_spans, &restored);
+            total_replacements += fuzzy_spans.len();
         }
         self.write_atomic_target(path, content.as_bytes(), RANGE_FILE_LIMIT)?;
         let new_sha = sha256_hex(content.as_bytes());
@@ -622,9 +1128,27 @@ impl Files {
         max_results: usize,
     ) -> Result<Value> {
         let max_results = max_results.clamp(1, 2000);
+        let compiled_glob = match pattern.filter(|p| !p.trim().is_empty()) {
+            Some(pat) => CompiledGlob::compile(pat)?,
+            None => None,
+        };
         let mut items = Vec::new();
         let mut truncated = false;
         let mut visited_dirs = 0usize;
+
+        enum FindWork {
+            PopIgnore(usize),
+            Dir {
+                dir_path: PathBuf,
+                prefix: String,
+                is_initial: bool,
+            },
+            File {
+                rel: String,
+                bytes: u64,
+            },
+        }
+
         match &self.inner {
             FilesInner::Sandboxed { dir, .. } => {
                 let rel_base = relative(path)?;
@@ -638,83 +1162,134 @@ impl Files {
                     .collect::<Vec<_>>()
                     .join("/");
                 let mut ignore = IgnoreRules::for_sandbox(dir, &start_dir, Path::new(&base_prefix));
+                drop(start_dir);
 
-                #[allow(clippy::too_many_arguments)]
-                fn walk_find(
-                    dir: &Dir,
-                    prefix: &str,
-                    pattern: Option<&str>,
-                    ignore: &mut IgnoreRules,
-                    max_results: usize,
-                    visited_dirs: &mut usize,
-                    items: &mut Vec<Value>,
-                    truncated: &mut bool,
-                ) -> Result<()> {
-                    *visited_dirs += 1;
-                    if *visited_dirs > 4096 {
-                        *truncated = true;
-                        return Ok(());
-                    }
-                    let mut entries = Vec::new();
-                    for entry in dir.entries()? {
-                        let entry = entry?;
-                        let ft = entry.file_type()?;
-                        if ft.is_symlink() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        entries.push((name, entry, ft.is_dir(), ft.is_file()));
-                    }
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (name, entry, is_dir, is_file) in entries {
-                        let rel = if prefix.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{prefix}/{name}")
-                        };
-                        if ignore.is_ignored(&rel, &name, is_dir) {
-                            continue;
-                        }
-                        if is_dir {
-                            if let Ok(sub) = dir.open_dir_nofollow(entry.file_name()) {
-                                ignore.within(&rel, IgnoreRules::read_matcher(&sub), |ignore| {
-                                    walk_find(
-                                        &sub,
-                                        &rel,
-                                        pattern,
-                                        ignore,
-                                        max_results,
-                                        visited_dirs,
-                                        items,
-                                        truncated,
-                                    )
-                                })?;
-                                if *truncated {
-                                    return Ok(());
-                                }
-                            }
-                        } else if is_file && pattern.is_none_or(|p| glob_matches(p, &rel)) {
+                let mut stack = vec![FindWork::Dir {
+                    dir_path: if base_prefix.is_empty() {
+                        PathBuf::new()
+                    } else {
+                        PathBuf::from(&base_prefix)
+                    },
+                    prefix: base_prefix,
+                    is_initial: true,
+                }];
+
+                while let Some(work) = stack.pop() {
+                    match work {
+                        FindWork::PopIgnore(depth) => ignore.0.truncate(depth),
+                        FindWork::File { rel, bytes } => {
                             if items.len() >= max_results {
-                                *truncated = true;
-                                return Ok(());
+                                truncated = true;
+                                break;
                             }
-                            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
                             items.push(json!({"path": rel, "bytes": bytes}));
                         }
-                    }
-                    Ok(())
-                }
+                        FindWork::Dir {
+                            dir_path,
+                            prefix,
+                            is_initial,
+                        } => {
+                            visited_dirs += 1;
+                            if visited_dirs > 4096 {
+                                truncated = true;
+                                break;
+                            }
+                            let opened_holder;
+                            let current_dir: &Dir = if dir_path.as_os_str().is_empty() {
+                                dir
+                            } else {
+                                if !is_initial {
+                                    match dir.symlink_metadata(&dir_path) {
+                                        Ok(meta) if !meta.file_type().is_symlink() => {}
+                                        _ => continue,
+                                    }
+                                }
+                                match dir.open_dir(&dir_path) {
+                                    Ok(d) => {
+                                        opened_holder = d;
+                                        &opened_holder
+                                    }
+                                    Err(err) if !is_initial && is_transient_walk_error(&err) => {
+                                        continue;
+                                    }
+                                    Err(_) if !is_initial => continue,
+                                    Err(err) => return Err(err.into()),
+                                }
+                            };
 
-                walk_find(
-                    &start_dir,
-                    &base_prefix,
-                    pattern.filter(|p| !p.trim().is_empty()),
-                    &mut ignore,
-                    max_results,
-                    &mut visited_dirs,
-                    &mut items,
-                    &mut truncated,
-                )?;
+                            let prev_depth = ignore.0.len();
+                            if !is_initial {
+                                ignore.push(
+                                    Path::new(&prefix),
+                                    IgnoreRules::read_matcher(current_dir),
+                                );
+                            }
+
+                            let rd = match current_dir.entries() {
+                                Ok(rd) => rd,
+                                Err(err) if !is_initial && is_transient_walk_error(&err) => {
+                                    ignore.0.truncate(prev_depth);
+                                    continue;
+                                }
+                                Err(err) => return Err(err.into()),
+                            };
+                            let mut entries = Vec::new();
+                            for entry in rd {
+                                let entry = match entry {
+                                    Ok(e) => e,
+                                    Err(err) if is_transient_walk_error(&err) => continue,
+                                    Err(err) => return Err(err.into()),
+                                };
+                                let ft = match entry.file_type() {
+                                    Ok(ft) => ft,
+                                    Err(err) if is_transient_walk_error(&err) => continue,
+                                    Err(err) => return Err(err.into()),
+                                };
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                let bytes = if ft.is_file() {
+                                    entry.metadata().map(|m| m.len()).unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                entries.push((name, ft.is_dir(), ft.is_file(), bytes));
+                            }
+                            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            if ignore.0.len() > prev_depth {
+                                stack.push(FindWork::PopIgnore(prev_depth));
+                            }
+                            for (name, is_dir, is_file, bytes) in entries.into_iter().rev() {
+                                let rel = if prefix.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{prefix}/{name}")
+                                };
+                                if ignore.is_ignored(&rel, &name, is_dir) {
+                                    continue;
+                                }
+                                if is_dir {
+                                    let child_path = if dir_path.as_os_str().is_empty() {
+                                        PathBuf::from(&name)
+                                    } else {
+                                        dir_path.join(&name)
+                                    };
+                                    stack.push(FindWork::Dir {
+                                        dir_path: child_path,
+                                        prefix: rel,
+                                        is_initial: false,
+                                    });
+                                } else if is_file
+                                    && compiled_glob.as_ref().is_none_or(|g| g.is_match(&rel))
+                                {
+                                    stack.push(FindWork::File { rel, bytes });
+                                }
+                            }
+                        }
+                    }
+                }
             }
             FilesInner::Yolo { base } => {
                 let start_dir = yolo_resolve(base, path)?;
@@ -722,86 +1297,89 @@ impl Files {
                 let mut ignore = IgnoreRules::default();
                 ignore.push(Path::new(""), IgnoreRules::read_host_matcher(&start_dir));
 
-                #[allow(clippy::too_many_arguments)]
-                fn walk_find_host(
-                    dir: &Path,
-                    prefix: &str,
-                    pattern: Option<&str>,
-                    ignore: &mut IgnoreRules,
-                    max_results: usize,
-                    visited_dirs: &mut usize,
-                    items: &mut Vec<Value>,
-                    truncated: &mut bool,
-                ) -> Result<()> {
-                    *visited_dirs += 1;
-                    if *visited_dirs > 4096 {
-                        *truncated = true;
-                        return Ok(());
-                    }
-                    let Ok(rd) = std::fs::read_dir(dir) else {
-                        return Ok(());
-                    };
-                    let mut entries = Vec::new();
-                    for entry in rd.flatten() {
-                        let Ok(ft) = entry.file_type() else { continue };
-                        if ft.is_symlink() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        entries.push((name, entry.path(), ft.is_dir(), ft.is_file()));
-                    }
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (name, full_path, is_dir, is_file) in entries {
-                        let rel = if prefix.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{prefix}/{name}")
-                        };
-                        if ignore.is_ignored(&rel, &name, is_dir) {
-                            continue;
-                        }
-                        if is_dir {
-                            ignore.within(
-                                &rel,
-                                IgnoreRules::read_host_matcher(&full_path),
-                                |ignore| {
-                                    walk_find_host(
-                                        &full_path,
-                                        &rel,
-                                        pattern,
-                                        ignore,
-                                        max_results,
-                                        visited_dirs,
-                                        items,
-                                        truncated,
-                                    )
-                                },
-                            )?;
-                            if *truncated {
-                                return Ok(());
-                            }
-                        } else if is_file && pattern.is_none_or(|p| glob_matches(p, &rel)) {
+                let mut stack = vec![FindWork::Dir {
+                    dir_path: start_dir,
+                    prefix: String::new(),
+                    is_initial: true,
+                }];
+
+                while let Some(work) = stack.pop() {
+                    match work {
+                        FindWork::PopIgnore(depth) => ignore.0.truncate(depth),
+                        FindWork::File { rel, bytes } => {
                             if items.len() >= max_results {
-                                *truncated = true;
-                                return Ok(());
+                                truncated = true;
+                                break;
                             }
-                            let bytes = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
                             items.push(json!({"path": rel, "bytes": bytes}));
                         }
-                    }
-                    Ok(())
-                }
+                        FindWork::Dir {
+                            dir_path,
+                            prefix,
+                            is_initial,
+                        } => {
+                            visited_dirs += 1;
+                            if visited_dirs > 4096 {
+                                truncated = true;
+                                break;
+                            }
+                            let Ok(rd) = std::fs::read_dir(&dir_path) else {
+                                continue;
+                            };
+                            let prev_depth = ignore.0.len();
+                            if !is_initial {
+                                ignore.push(
+                                    Path::new(&prefix),
+                                    IgnoreRules::read_host_matcher(&dir_path),
+                                );
+                            }
+                            let mut entries = Vec::new();
+                            for entry in rd {
+                                let Ok(entry) = entry else { continue };
+                                let Ok(ft) = entry.file_type() else { continue };
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                let full_path = entry.path();
+                                let bytes = if ft.is_file() {
+                                    std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                entries.push((name, full_path, ft.is_dir(), ft.is_file(), bytes));
+                            }
+                            entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-                walk_find_host(
-                    &start_dir,
-                    "",
-                    pattern.filter(|p| !p.trim().is_empty()),
-                    &mut ignore,
-                    max_results,
-                    &mut visited_dirs,
-                    &mut items,
-                    &mut truncated,
-                )?;
+                            if ignore.0.len() > prev_depth {
+                                stack.push(FindWork::PopIgnore(prev_depth));
+                            }
+                            for (name, full_path, is_dir, is_file, bytes) in
+                                entries.into_iter().rev()
+                            {
+                                let rel = if prefix.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{prefix}/{name}")
+                                };
+                                if ignore.is_ignored(&rel, &name, is_dir) {
+                                    continue;
+                                }
+                                if is_dir {
+                                    stack.push(FindWork::Dir {
+                                        dir_path: full_path,
+                                        prefix: rel,
+                                        is_initial: false,
+                                    });
+                                } else if is_file
+                                    && compiled_glob.as_ref().is_none_or(|g| g.is_match(&rel))
+                                {
+                                    stack.push(FindWork::File { rel, bytes });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(json!({
@@ -816,18 +1394,68 @@ impl Files {
         query: &str,
         pattern: Option<&str>,
         case_sensitive: bool,
+        use_regex: bool,
         max_results: usize,
     ) -> Result<Value> {
         ensure!(!query.is_empty(), "Search query must not be empty");
         let max_results = max_results.clamp(1, 1000);
-        let needle = if case_sensitive {
-            query.to_string()
-        } else {
-            query.to_lowercase()
+        let compiled_glob = match pattern.filter(|p| !p.trim().is_empty()) {
+            Some(pat) => CompiledGlob::compile(pat)?,
+            None => None,
         };
+        let pattern_str = if use_regex {
+            Cow::Borrowed(query)
+        } else {
+            Cow::Owned(regex::escape(query))
+        };
+        let matcher = RegexBuilder::new(&pattern_str)
+            .case_insensitive(!case_sensitive)
+            .size_limit(2 * 1024 * 1024)
+            .dfa_size_limit(2 * 1024 * 1024)
+            .build()
+            .context("Invalid search pattern")?;
+
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut visited_dirs = 0usize;
+
+        enum SearchWork {
+            PopIgnore(usize),
+            Dir {
+                dir_path: PathBuf,
+                prefix: String,
+                is_initial: bool,
+            },
+            File {
+                file_path: PathBuf,
+                rel: String,
+            },
+        }
+
+        let mut scan_buffer = |rel: &str, buf: Vec<u8>| -> bool {
+            if memchr::memchr(0, &buf).is_some() {
+                return false;
+            }
+            let Ok(text) = String::from_utf8(buf) else {
+                return false;
+            };
+            for (idx, line) in text.lines().enumerate() {
+                if let Some(m) = matcher.find(line) {
+                    if matches.len() >= max_results {
+                        return true;
+                    }
+                    let col = line[..m.start()].chars().count() + 1;
+                    let preview: String = line.chars().take(300).collect();
+                    matches.push(json!({
+                        "path": rel,
+                        "line": idx + 1,
+                        "column": col,
+                        "text": preview
+                    }));
+                }
+            }
+            false
+        };
 
         match &self.inner {
             FilesInner::Sandboxed { dir, .. } => {
@@ -842,70 +1470,29 @@ impl Files {
                     .collect::<Vec<_>>()
                     .join("/");
                 let mut ignore = IgnoreRules::for_sandbox(dir, &start_dir, Path::new(&base_prefix));
+                drop(start_dir);
 
-                #[allow(clippy::too_many_arguments)]
-                fn walk_search(
-                    dir: &Dir,
-                    prefix: &str,
-                    needle: &str,
-                    case_sensitive: bool,
-                    pattern: Option<&str>,
-                    ignore: &mut IgnoreRules,
-                    max_results: usize,
-                    visited_dirs: &mut usize,
-                    matches: &mut Vec<Value>,
-                    truncated: &mut bool,
-                ) -> Result<()> {
-                    *visited_dirs += 1;
-                    if *visited_dirs > 4096 {
-                        *truncated = true;
-                        return Ok(());
-                    }
-                    let mut entries = Vec::new();
-                    for entry in dir.entries()? {
-                        let entry = entry?;
-                        let ft = entry.file_type()?;
-                        if ft.is_symlink() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        entries.push((name, entry, ft.is_dir(), ft.is_file()));
-                    }
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (name, entry, is_dir, is_file) in entries {
-                        let rel = if prefix.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{prefix}/{name}")
-                        };
-                        if ignore.is_ignored(&rel, &name, is_dir) {
-                            continue;
-                        }
-                        if is_dir {
-                            if let Ok(sub) = dir.open_dir_nofollow(entry.file_name()) {
-                                ignore.within(&rel, IgnoreRules::read_matcher(&sub), |ignore| {
-                                    walk_search(
-                                        &sub,
-                                        &rel,
-                                        needle,
-                                        case_sensitive,
-                                        pattern,
-                                        ignore,
-                                        max_results,
-                                        visited_dirs,
-                                        matches,
-                                        truncated,
-                                    )
-                                })?;
-                                if *truncated {
-                                    return Ok(());
-                                }
-                            }
-                        } else if is_file && pattern.is_none_or(|p| glob_matches(p, &rel)) {
-                            let Ok(meta) = entry.metadata() else {
+                let mut stack = vec![SearchWork::Dir {
+                    dir_path: if base_prefix.is_empty() {
+                        PathBuf::new()
+                    } else {
+                        PathBuf::from(&base_prefix)
+                    },
+                    prefix: base_prefix,
+                    is_initial: true,
+                }];
+
+                while let Some(work) = stack.pop() {
+                    match work {
+                        SearchWork::PopIgnore(depth) => ignore.0.truncate(depth),
+                        SearchWork::File { file_path, rel } => {
+                            let Ok(meta) = dir.symlink_metadata(&file_path) else {
                                 continue;
                             };
-                            if meta.len() > (2 * 1024 * 1024) as u64 {
+                            if meta.file_type().is_symlink()
+                                || !meta.is_file()
+                                || meta.len() > SEARCH_FILE_LIMIT as u64
+                            {
                                 continue;
                             }
                             let mut options = OpenOptions::new();
@@ -915,56 +1502,126 @@ impl Files {
                                 use cap_std::fs::OpenOptionsExt;
                                 options.custom_flags(libc::O_NONBLOCK);
                             }
-                            let Ok(file) = dir.open_with(entry.file_name(), &options) else {
+                            let Ok(file) = dir.open_with(&file_path, &options) else {
                                 continue;
                             };
                             let mut buf = Vec::new();
-                            if file.take(2 * 1024 * 1024).read_to_end(&mut buf).is_err() {
+                            if file
+                                .take(SEARCH_FILE_LIMIT as u64)
+                                .read_to_end(&mut buf)
+                                .is_err()
+                            {
                                 continue;
                             }
-                            if buf.contains(&0) {
-                                continue;
+                            if scan_buffer(&rel, buf) {
+                                truncated = true;
+                                break;
                             }
-                            let Ok(text) = String::from_utf8(buf) else {
-                                continue;
-                            };
-                            for (idx, line) in text.lines().enumerate() {
-                                let matched_col = if case_sensitive {
-                                    line.find(needle)
-                                } else {
-                                    line.to_lowercase().find(needle)
-                                };
-                                if let Some(col) = matched_col {
-                                    if matches.len() >= max_results {
-                                        *truncated = true;
-                                        return Ok(());
+                        }
+                        SearchWork::Dir {
+                            dir_path,
+                            prefix,
+                            is_initial,
+                        } => {
+                            visited_dirs += 1;
+                            if visited_dirs > 4096 {
+                                truncated = true;
+                                break;
+                            }
+                            let opened_holder;
+                            let current_dir: &Dir = if dir_path.as_os_str().is_empty() {
+                                dir
+                            } else {
+                                if !is_initial {
+                                    match dir.symlink_metadata(&dir_path) {
+                                        Ok(meta) if !meta.file_type().is_symlink() => {}
+                                        _ => continue,
                                     }
-                                    let preview: String = line.chars().take(300).collect();
-                                    matches.push(json!({
-                                        "path": rel,
-                                        "line": idx + 1,
-                                        "column": col + 1,
-                                        "text": preview
-                                    }));
+                                }
+                                match dir.open_dir(&dir_path) {
+                                    Ok(d) => {
+                                        opened_holder = d;
+                                        &opened_holder
+                                    }
+                                    Err(err) if !is_initial && is_transient_walk_error(&err) => {
+                                        continue;
+                                    }
+                                    Err(_) if !is_initial => continue,
+                                    Err(err) => return Err(err.into()),
+                                }
+                            };
+
+                            let prev_depth = ignore.0.len();
+                            if !is_initial {
+                                ignore.push(
+                                    Path::new(&prefix),
+                                    IgnoreRules::read_matcher(current_dir),
+                                );
+                            }
+
+                            let rd = match current_dir.entries() {
+                                Ok(rd) => rd,
+                                Err(err) if !is_initial && is_transient_walk_error(&err) => {
+                                    ignore.0.truncate(prev_depth);
+                                    continue;
+                                }
+                                Err(err) => return Err(err.into()),
+                            };
+                            let mut entries = Vec::new();
+                            for entry in rd {
+                                let entry = match entry {
+                                    Ok(e) => e,
+                                    Err(err) if is_transient_walk_error(&err) => continue,
+                                    Err(err) => return Err(err.into()),
+                                };
+                                let ft = match entry.file_type() {
+                                    Ok(ft) => ft,
+                                    Err(err) if is_transient_walk_error(&err) => continue,
+                                    Err(err) => return Err(err.into()),
+                                };
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                entries.push((name, ft.is_dir(), ft.is_file()));
+                            }
+                            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            if ignore.0.len() > prev_depth {
+                                stack.push(SearchWork::PopIgnore(prev_depth));
+                            }
+                            for (name, is_dir, is_file) in entries.into_iter().rev() {
+                                let rel = if prefix.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{prefix}/{name}")
+                                };
+                                if ignore.is_ignored(&rel, &name, is_dir) {
+                                    continue;
+                                }
+                                let child_path = if dir_path.as_os_str().is_empty() {
+                                    PathBuf::from(&name)
+                                } else {
+                                    dir_path.join(&name)
+                                };
+                                if is_dir {
+                                    stack.push(SearchWork::Dir {
+                                        dir_path: child_path,
+                                        prefix: rel,
+                                        is_initial: false,
+                                    });
+                                } else if is_file
+                                    && compiled_glob.as_ref().is_none_or(|g| g.is_match(&rel))
+                                {
+                                    stack.push(SearchWork::File {
+                                        file_path: child_path,
+                                        rel,
+                                    });
                                 }
                             }
                         }
                     }
-                    Ok(())
                 }
-
-                walk_search(
-                    &start_dir,
-                    &base_prefix,
-                    &needle,
-                    case_sensitive,
-                    pattern.filter(|p| !p.trim().is_empty()),
-                    &mut ignore,
-                    max_results,
-                    &mut visited_dirs,
-                    &mut matches,
-                    &mut truncated,
-                )?;
             }
             FilesInner::Yolo { base } => {
                 let start_dir = yolo_resolve(base, path)?;
@@ -972,122 +1629,97 @@ impl Files {
                 let mut ignore = IgnoreRules::default();
                 ignore.push(Path::new(""), IgnoreRules::read_host_matcher(&start_dir));
 
-                #[allow(clippy::too_many_arguments)]
-                fn walk_search_host(
-                    dir: &Path,
-                    prefix: &str,
-                    needle: &str,
-                    case_sensitive: bool,
-                    pattern: Option<&str>,
-                    ignore: &mut IgnoreRules,
-                    max_results: usize,
-                    visited_dirs: &mut usize,
-                    matches: &mut Vec<Value>,
-                    truncated: &mut bool,
-                ) -> Result<()> {
-                    *visited_dirs += 1;
-                    if *visited_dirs > 4096 {
-                        *truncated = true;
-                        return Ok(());
-                    }
-                    let Ok(rd) = std::fs::read_dir(dir) else {
-                        return Ok(());
-                    };
-                    let mut entries = Vec::new();
-                    for entry in rd.flatten() {
-                        let Ok(ft) = entry.file_type() else { continue };
-                        if ft.is_symlink() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        entries.push((name, entry.path(), ft.is_dir(), ft.is_file()));
-                    }
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (name, full_path, is_dir, is_file) in entries {
-                        let rel = if prefix.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{prefix}/{name}")
-                        };
-                        if ignore.is_ignored(&rel, &name, is_dir) {
-                            continue;
-                        }
-                        if is_dir {
-                            ignore.within(
-                                &rel,
-                                IgnoreRules::read_host_matcher(&full_path),
-                                |ignore| {
-                                    walk_search_host(
-                                        &full_path,
-                                        &rel,
-                                        needle,
-                                        case_sensitive,
-                                        pattern,
-                                        ignore,
-                                        max_results,
-                                        visited_dirs,
-                                        matches,
-                                        truncated,
-                                    )
-                                },
-                            )?;
-                            if *truncated {
-                                return Ok(());
-                            }
-                        } else if is_file && pattern.is_none_or(|p| glob_matches(p, &rel)) {
-                            let Ok(meta) = std::fs::metadata(&full_path) else {
+                let mut stack = vec![SearchWork::Dir {
+                    dir_path: start_dir,
+                    prefix: String::new(),
+                    is_initial: true,
+                }];
+
+                while let Some(work) = stack.pop() {
+                    match work {
+                        SearchWork::PopIgnore(depth) => ignore.0.truncate(depth),
+                        SearchWork::File { file_path, rel } => {
+                            let Ok(meta) = std::fs::symlink_metadata(&file_path) else {
                                 continue;
                             };
-                            if meta.len() > (2 * 1024 * 1024) as u64 {
+                            if meta.file_type().is_symlink()
+                                || !meta.is_file()
+                                || meta.len() > SEARCH_FILE_LIMIT as u64
+                            {
                                 continue;
                             }
-                            let Ok(buf) = read_host_regular_file(&full_path, 2 * 1024 * 1024)
+                            let Ok(buf) =
+                                read_host_regular_file(&file_path, SEARCH_FILE_LIMIT, true)
                             else {
                                 continue;
                             };
-                            if buf.contains(&0) {
-                                continue;
+                            if scan_buffer(&rel, buf) {
+                                truncated = true;
+                                break;
                             }
-                            let Ok(text) = String::from_utf8(buf) else {
+                        }
+                        SearchWork::Dir {
+                            dir_path,
+                            prefix,
+                            is_initial,
+                        } => {
+                            visited_dirs += 1;
+                            if visited_dirs > 4096 {
+                                truncated = true;
+                                break;
+                            }
+                            let Ok(rd) = std::fs::read_dir(&dir_path) else {
                                 continue;
                             };
-                            for (idx, line) in text.lines().enumerate() {
-                                let matched_col = if case_sensitive {
-                                    line.find(needle)
+                            let prev_depth = ignore.0.len();
+                            if !is_initial {
+                                ignore.push(
+                                    Path::new(&prefix),
+                                    IgnoreRules::read_host_matcher(&dir_path),
+                                );
+                            }
+                            let mut entries = Vec::new();
+                            for entry in rd {
+                                let Ok(entry) = entry else { continue };
+                                let Ok(ft) = entry.file_type() else { continue };
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                entries.push((name, entry.path(), ft.is_dir(), ft.is_file()));
+                            }
+                            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            if ignore.0.len() > prev_depth {
+                                stack.push(SearchWork::PopIgnore(prev_depth));
+                            }
+                            for (name, full_path, is_dir, is_file) in entries.into_iter().rev() {
+                                let rel = if prefix.is_empty() {
+                                    name.clone()
                                 } else {
-                                    line.to_lowercase().find(needle)
+                                    format!("{prefix}/{name}")
                                 };
-                                if let Some(col) = matched_col {
-                                    if matches.len() >= max_results {
-                                        *truncated = true;
-                                        return Ok(());
-                                    }
-                                    let preview: String = line.chars().take(300).collect();
-                                    matches.push(json!({
-                                        "path": rel,
-                                        "line": idx + 1,
-                                        "column": col + 1,
-                                        "text": preview
-                                    }));
+                                if ignore.is_ignored(&rel, &name, is_dir) {
+                                    continue;
+                                }
+                                if is_dir {
+                                    stack.push(SearchWork::Dir {
+                                        dir_path: full_path,
+                                        prefix: rel,
+                                        is_initial: false,
+                                    });
+                                } else if is_file
+                                    && compiled_glob.as_ref().is_none_or(|g| g.is_match(&rel))
+                                {
+                                    stack.push(SearchWork::File {
+                                        file_path: full_path,
+                                        rel,
+                                    });
                                 }
                             }
                         }
                     }
-                    Ok(())
                 }
-
-                walk_search_host(
-                    &start_dir,
-                    "",
-                    &needle,
-                    case_sensitive,
-                    pattern.filter(|p| !p.trim().is_empty()),
-                    &mut ignore,
-                    max_results,
-                    &mut visited_dirs,
-                    &mut matches,
-                    &mut truncated,
-                )?;
             }
         }
         Ok(json!({
@@ -1129,11 +1761,25 @@ impl Files {
             }
             FilesInner::Yolo { base } => {
                 let target = yolo_resolve(base, path)?;
+                let normalized = normalize_lexical(&target);
                 ensure!(
-                    target != *base && target != Path::new("/"),
+                    normalized != *base
+                        && normalized != Path::new("/")
+                        && normalized.parent().is_some(),
                     "Cannot remove base or filesystem root"
                 );
-                if std::fs::symlink_metadata(&target)?.is_dir() {
+                let meta = std::fs::symlink_metadata(&target)?;
+                if !meta.file_type().is_symlink()
+                    && let Ok(canonical) = target.canonicalize()
+                {
+                    ensure!(
+                        canonical != *base
+                            && canonical != Path::new("/")
+                            && canonical.parent().is_some(),
+                        "Cannot remove base or filesystem root"
+                    );
+                }
+                if meta.is_dir() {
                     std::fs::remove_dir(&target)?;
                 } else {
                     std::fs::remove_file(&target)?;
@@ -1246,12 +1892,157 @@ mod tests {
         assert_eq!(paths, vec!["src/nested/lib.rs"]);
 
         let searched = files
-            .search_files(".", "NEEDLE_UPDATED", None, false, 100)
+            .search_files(".", "NEEDLE_UPDATED", None, false, false, 100)
             .unwrap();
         let hits = searched["items"].as_array().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["path"], "src/nested/lib.rs");
         assert_eq!(hits[0]["line"], 2);
+        assert_eq!(hits[0]["column"], 7);
+    }
+
+    #[test]
+    fn glob_is_linear_time_and_supports_braces_and_ranges() {
+        let evil_pattern = "**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/target.rs";
+        let deep_path = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z/other.txt";
+        let started = std::time::Instant::now();
+        assert!(!glob_matches(evil_pattern, deep_path));
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(glob_matches("**/*.{ts,tsx}", "src/app/Page.tsx"));
+        assert!(!glob_matches("**/*.{ts,tsx}", "src/app/Page.js"));
+        assert!(glob_matches("file_[a-z].txt", "dir/file_k.txt"));
+        assert!(!glob_matches("file_[a-z].txt", "dir/file_9.txt"));
+    }
+
+    #[test]
+    fn search_files_reports_utf8_character_columns_and_supports_regex() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Files::open(root.path()).unwrap();
+        files
+            .write("utf8.txt", "café naïve TARGET_123\nfoo bar\n".as_bytes())
+            .unwrap();
+        // "café naïve " is 11 Unicode chars (13 UTF-8 bytes).
+        let literal = files
+            .search_files(".", "target_123", None, false, false, 50)
+            .unwrap();
+        let hits = literal["items"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["line"], 1);
+        assert_eq!(hits[0]["column"], 12);
+
+        let regex_res = files
+            .search_files(".", r"target_\d+", None, false, true, 50)
+            .unwrap();
+        let regex_hits = regex_res["items"].as_array().unwrap();
+        assert_eq!(regex_hits.len(), 1);
+        assert_eq!(regex_hits[0]["column"], 12);
+
+        // Literal mode treats regex metacharacters as literals
+        let no_hit = files
+            .search_files(".", r"target_\d+", None, false, false, 50)
+            .unwrap();
+        assert!(no_hit["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_range_validates_bounds_and_streams_oversized_files() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Files::open(root.path()).unwrap();
+        files.write("small.txt", b"a\nb\nc\n").unwrap();
+        assert!(files.read_range("small.txt", Some(0), Some(2)).is_err());
+        assert!(files.read_range("small.txt", Some(3), Some(2)).is_err());
+        assert!(files.read_range("small.txt", None, Some(0)).is_err());
+
+        // Write a > 8 MiB file directly on disk to test streaming range read.
+        let big_path = root.path().join("big.log");
+        {
+            let mut f = std::fs::File::create(&big_path).unwrap();
+            let line = format!("{}\n", "x".repeat(1023));
+            for i in 1..=8500usize {
+                if i == 5000 {
+                    f.write_all(b"target-line-5000\n").unwrap();
+                } else {
+                    f.write_all(line.as_bytes()).unwrap();
+                }
+            }
+        }
+        assert!(std::fs::metadata(&big_path).unwrap().len() > RANGE_FILE_LIMIT as u64);
+        let streamed = files.read_range("big.log", Some(5000), Some(5000)).unwrap();
+        assert_eq!(streamed["content"], "target-line-5000\n");
+        assert!(streamed["sha256"].is_null());
+        assert_eq!(streamed["start_line"], 5000);
+        assert_eq!(streamed["end_line"], 5000);
+
+        // File with NUL byte is rejected for line-range read and returned as base64 for full read
+        files.write("nul.bin", b"hello\0world\n").unwrap();
+        assert!(files.read_range("nul.bin", Some(1), Some(1)).is_err());
+        assert_eq!(files.read("nul.bin").unwrap()["encoding"], "base64");
+    }
+
+    #[test]
+    fn edit_supports_fuzzy_match_and_optimistic_sha256() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Files::open(root.path()).unwrap();
+        let original = "prefix\r\nsay “hello”—world\u{00A0}now   \r\nsuffix\r\n";
+        files.write("doc.txt", original.as_bytes()).unwrap();
+        let sha = sha256_hex(original.as_bytes());
+
+        // Fuzzy match handles smart quotes, em-dash, NBSP, and trailing whitespace while restoring CRLF
+        let edited = files
+            .edit(
+                "doc.txt",
+                &[Edit {
+                    target: "say \"hello\"-world now".into(),
+                    replacement: "say \"hi\"-there\nnext".into(),
+                    replace_all: false,
+                }],
+                Some(&sha),
+            )
+            .unwrap();
+        assert_eq!(edited["replacements"], 1);
+        assert_eq!(
+            files.read("doc.txt").unwrap()["content"],
+            "prefix\r\nsay \"hi\"-there\r\nnext\r\nsuffix\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_rejects_symlinks_in_both_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.txt"), b"hello world\n").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real.txt"), root.path().join("link.txt"))
+            .unwrap();
+        let edit = [Edit {
+            target: "hello".into(),
+            replacement: "bye".into(),
+            replace_all: false,
+        }];
+        let sandboxed = Files::open(root.path()).unwrap();
+        assert!(sandboxed.edit("link.txt", &edit, None).is_err());
+        let yolo = Files::open_yolo(root.path()).unwrap();
+        assert!(yolo.edit("link.txt", &edit, None).is_err());
+        assert!(
+            std::fs::symlink_metadata(root.path().join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("real.txt")).unwrap(),
+            "hello world\n"
+        );
+    }
+
+    #[test]
+    fn yolo_remove_cannot_bypass_base_with_dotdot() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("sub")).unwrap();
+        let files = Files::open_yolo(base.path()).unwrap();
+        assert!(files.remove("sub/..").is_err());
+        assert!(files.remove(".").is_err());
+        assert!(files.remove("/").is_err());
+        assert!(base.path().exists());
     }
 
     #[test]
@@ -1351,7 +2142,7 @@ mod tests {
     fn assert_find_and_search_paths(files: &Files, directory: &str, expected: &[&str]) {
         let found = files.find_files(directory, None, 100).unwrap();
         let searched = files
-            .search_files(directory, "match me", None, true, 100)
+            .search_files(directory, "match me", None, true, false, 100)
             .unwrap();
         for result in [&found, &searched] {
             let paths: Vec<_> = result["items"]
@@ -1489,6 +2280,7 @@ mod tests {
             0o750
         );
     }
+
     #[cfg(unix)]
     #[test]
     fn symlink_cannot_escape_root() {
@@ -1507,7 +2299,9 @@ mod tests {
             0
         );
         assert_eq!(
-            files.search_files(".", "needle", None, false, 100).unwrap()["items"]
+            files
+                .search_files(".", "needle", None, false, false, 100)
+                .unwrap()["items"]
                 .as_array()
                 .unwrap()
                 .len(),

@@ -9,7 +9,7 @@ User=desktop
 Group=desktop
 UMask=0002
 WorkingDirectory=/data/work
-EnvironmentFile=/run/venticode.env
+EnvironmentFile=-/run/venticode-desktop.env
 Environment=HOME=/data/desktop
 Environment=XDG_RUNTIME_DIR=/run/venticode-desktop
 RuntimeDirectory=venticode-desktop

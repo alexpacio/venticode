@@ -25,6 +25,7 @@ export function BrowserScreen({ frame, human, desktop = false, exit, onInput, on
   const canvas = useRef<HTMLCanvasElement>(null);
   const present = useRef<(next: BrowserFrame | null) => void>(ignore);
   const control = useRef<(human: boolean) => void>(ignore);
+  const setDesktop = useRef<(value: boolean) => void>(ignore);
   const current = useRef({ frame, human, desktop, onInput, onFailure });
   useLayoutEffect(() => { current.current = { frame, human, desktop, onInput, onFailure }; });
 
@@ -53,8 +54,10 @@ export function BrowserScreen({ frame, human, desktop = false, exit, onInput, on
         const image = await createImageBitmap(next.jpeg);
         try {
           if (disposed || !screen || current.current.frame?.tab !== next.tab) return;
-          scratch.canvas.width = image.width;
-          scratch.canvas.height = image.height;
+          if (scratch.canvas.width !== image.width || scratch.canvas.height !== image.height) {
+            scratch.canvas.width = image.width;
+            scratch.canvas.height = image.height;
+          }
           scratch.drawImage(image, 0, 0);
           const pixels = scratch.getImageData(0, 0, image.width, image.height).data;
           screen.set_frame(new Uint8Array(pixels.buffer), image.width, image.height, next.width, next.height);
@@ -90,6 +93,10 @@ export function BrowserScreen({ frame, human, desktop = false, exit, onInput, on
           return;
         }
         started = true;
+        setDesktop.current = (value) => {
+          screen?.set_desktop(value);
+        };
+        setDesktop.current(current.current.desktop);
         control.current = (allowed) => {
           element.tabIndex = allowed ? 0 : -1;
           screen?.set_control(allowed);
@@ -115,12 +122,18 @@ export function BrowserScreen({ frame, human, desktop = false, exit, onInput, on
       window.clearTimeout(starting);
       present.current = ignore;
       control.current = ignore;
+      setDesktop.current = ignore;
+      if (scratch) {
+        scratch.canvas.width = 0;
+        scratch.canvas.height = 0;
+      }
       if (started) destroy();
     };
   }, []);
 
   useEffect(() => present.current(frame), [frame]);
   useEffect(() => control.current(human), [human]);
+  useEffect(() => setDesktop.current(desktop), [desktop]);
   return <canvas
     ref={canvas}
     className="browser-canvas"

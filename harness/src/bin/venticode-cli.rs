@@ -28,12 +28,12 @@ fn main() -> anyhow::Result<()> {
     );
     let mut socket = UnixStream::connect(path).context("Model access expired or unavailable")?;
     socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-    socket.set_read_timeout(Some(Duration::from_secs(28)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(55)))?;
     serde_json::to_writer(&mut socket, &serde_json::json!({"prompt":prompt}))?;
     socket.write_all(b"\n")?;
     let mut text = String::new();
     BufReader::new(socket)
-        .take(256 * 1024)
+        .take(1024 * 1024)
         .read_line(&mut text)?;
     ensure!(text.ends_with('\n'), "Incomplete model response");
     let mut response: serde_json::Value = serde_json::from_str(&text)?;

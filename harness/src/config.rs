@@ -21,5 +21,10 @@ pub fn directory() -> Result<PathBuf> {
             .join(".config/venticode-harness")
     };
     std::fs::create_dir_all(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(path)
 }

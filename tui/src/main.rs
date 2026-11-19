@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+const MAX_DRAFT_HISTORY: usize = 200;
+const MAX_PATCHES: usize = 200;
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_EVENTS_PER_FRAME: usize = 32;
+const REPLAY_BELL_GRACE: Duration = Duration::from_millis(500);
+
 const COMMANDS: &[&str] = &[
     "/help",
     "/browser",
@@ -134,6 +140,92 @@ fn ring_bell() {
     let _ = io::stdout().flush();
 }
 
+fn delete_prev_word(input: &mut String, caret: &mut usize) {
+    let trimmed = input[..*caret].trim_end_matches(char::is_whitespace);
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    input.drain(start..*caret);
+    *caret = start;
+}
+
+fn append_capped_output(dest: &mut String, chunk: &str, max_bytes: usize) {
+    const TRUNCATED: &str = "\n… [output truncated]";
+    if dest.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes - dest.len();
+    if chunk.len() <= remaining {
+        dest.push_str(chunk);
+    } else {
+        let mut cut = remaining.min(chunk.len());
+        while cut > 0 && !chunk.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        dest.push_str(&chunk[..cut]);
+        dest.push_str(TRUNCATED);
+    }
+}
+
+fn slash_suggestions(input: &str, hide_menu: bool) -> Vec<&'static str> {
+    if hide_menu || !input.starts_with('/') {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| cmd.starts_with(input))
+        .collect()
+}
+
+fn needs_tab_completion(line: &str, suggestions: &[&str]) -> bool {
+    line.starts_with('/')
+        && !line.starts_with("//")
+        && !line.contains(' ')
+        && !COMMANDS.contains(&line)
+        && !suggestions.is_empty()
+}
+
+fn picker_options(app: &App, picker: Option<Picker>) -> Vec<String> {
+    match picker {
+        Some(Picker::Models) => app
+            .models
+            .iter()
+            .map(|m| clean(m["name"].as_str().or(m["id"].as_str()).unwrap_or("?")))
+            .collect(),
+        Some(Picker::Projects) if app.projects.is_empty() => app
+            .folder_options()
+            .iter()
+            .map(|(h, root)| clean(&format!("{} · {}", string(h, "name"), root)))
+            .collect(),
+        Some(Picker::Projects) => app
+            .projects
+            .iter()
+            .map(|p| {
+                clean(&format!(
+                    "{} · {}/{}",
+                    string(p, "name"),
+                    string(p, "root"),
+                    string(p, "path")
+                ))
+            })
+            .collect(),
+        Some(Picker::Chats) => std::iter::once(
+            app.msg("Nuova conversazione", "New conversation")
+                .to_owned(),
+        )
+        .chain(
+            app.project_chats()
+                .iter()
+                .map(|c| clean(&string(c, "title"))),
+        )
+        .collect(),
+        None => Vec::new(),
+    }
+}
+
 struct FeedHandle {
     task: asupersync::runtime::TaskHandle<()>,
 }
@@ -168,6 +260,9 @@ struct App {
     goal: String,
     approval: String,
     scroll: u16,
+    last_sequence: i64,
+    replaying: bool,
+    opened_at: Instant,
     feed: Option<FeedHandle>,
     tx: mpsc::Sender<(String, StreamUpdate)>,
 }
@@ -275,26 +370,87 @@ impl App {
         self.record(view::Role::Notice, s);
     }
 
+    fn working(&self) -> bool {
+        self.chat["state"] == "running" && self.feed.is_some()
+    }
+
+    fn notify_bell(&mut self) {
+        if self.replaying {
+            if self.opened_at.elapsed() < REPLAY_BELL_GRACE {
+                return;
+            }
+            self.replaying = false;
+        }
+        ring_bell();
+    }
+
     fn record(&mut self, role: view::Role, s: impl AsRef<str>) {
         self.last_text.clear();
         let text = clean(s.as_ref());
-        if matches!(role, view::Role::Output)
-            && let Some(last) = self.lines.last_mut()
-            && matches!(last.role, view::Role::Output)
-        {
-            if !text.is_empty() {
-                last.text.push_str(&text);
+        if matches!(role, view::Role::Output) {
+            if let Some(last) = self.lines.last_mut()
+                && matches!(last.role, view::Role::Output)
+            {
+                if !text.is_empty() {
+                    append_capped_output(&mut last.text, &text, MAX_OUTPUT_BYTES);
+                }
+                return;
             }
+            let mut capped = String::new();
+            append_capped_output(&mut capped, &text, MAX_OUTPUT_BYTES);
+            self.lines.push(view::Message { role, text: capped });
             return;
         }
         self.lines.push(view::Message { role, text });
     }
 
     async fn refresh(&mut self, cx: &Cx) -> Result<()> {
-        let projects = self.remote.list(cx, "/projects").await?;
-        let models = self.remote.list(cx, "/models").await?;
-        let harnesses = self.remote.list(cx, "/harnesses").await?;
-        let chats = self.remote.list(cx, "/conversations").await?;
+        let r_projects = self.remote.clone();
+        let r_models = self.remote.clone();
+        let r_harnesses = self.remote.clone();
+        let mut t_projects = cx
+            .spawn(move |child_cx| async move { r_projects.list(&child_cx, "/projects").await })
+            .map_err(|e| anyhow!("Failed to fetch projects: {e}"))?;
+        let mut t_models = cx
+            .spawn(move |child_cx| async move { r_models.list(&child_cx, "/models").await })
+            .map_err(|e| anyhow!("Failed to fetch models: {e}"))?;
+        let mut t_harnesses = cx
+            .spawn(move |child_cx| async move { r_harnesses.list(&child_cx, "/harnesses").await })
+            .map_err(|e| anyhow!("Failed to fetch harnesses: {e}"))?;
+        let chats = match self.remote.list(cx, "/conversations").await {
+            Ok(v) => v,
+            Err(err) => {
+                t_projects.abort();
+                t_models.abort();
+                t_harnesses.abort();
+                return Err(err);
+            }
+        };
+        let projects = match t_projects.join(cx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => {
+                t_models.abort();
+                t_harnesses.abort();
+                return Err(err);
+            }
+            Err(err) => {
+                t_models.abort();
+                t_harnesses.abort();
+                return Err(err.into());
+            }
+        };
+        let models = match t_models.join(cx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => {
+                t_harnesses.abort();
+                return Err(err);
+            }
+            Err(err) => {
+                t_harnesses.abort();
+                return Err(err.into());
+            }
+        };
+        let harnesses = t_harnesses.join(cx).await??;
         self.projects = projects;
         self.models = models;
         self.harnesses = harnesses;
@@ -316,6 +472,7 @@ impl App {
         }
         self.chat = Value::Null;
         self.lines.clear();
+        view::clear_markdown_cache();
         self.patches.clear();
         self.question.clear();
         self.choices.clear();
@@ -325,6 +482,8 @@ impl App {
         self.approval.clear();
         self.last_text.clear();
         self.scroll = 0;
+        self.last_sequence = 0;
+        self.replaying = false;
     }
 
     async fn open(&mut self, cx: &Cx, id: &str) -> Result<()> {
@@ -353,6 +512,8 @@ impl App {
         self.question = string(&self.chat, "question_id");
         self.plan = string(&self.chat, "plan_id");
         self.goal = string(&self.chat, "goal_id");
+        self.replaying = true;
+        self.opened_at = Instant::now();
         self.start_feed(cx, id);
         Ok(())
     }
@@ -363,14 +524,22 @@ impl App {
         }
         let remote = self.remote.clone();
         let tx = self.tx.clone();
+        let start_cursor = self.last_sequence;
+        let en = self.en;
         if let Ok(task) = cx.spawn(move |child_cx| async move {
-            remote.follow(child_cx, id, tx).await;
+            remote.follow(child_cx, id, start_cursor, en, tx).await;
         }) {
             self.feed = Some(FeedHandle { task });
         }
     }
 
     fn event(&mut self, e: Value) {
+        if let Some(seq) = e["sequence"].as_i64() {
+            if seq <= self.last_sequence {
+                return;
+            }
+            self.last_sequence = seq;
+        }
         let val = |k| string(&e, k);
         let prev_newlines: usize = self
             .lines
@@ -428,12 +597,12 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.note(format!("? {}\n{}", val("content"), choices));
-                ring_bell();
+                self.notify_bell();
             }
             Some("plan") => {
                 self.plan = val("reference_id");
                 self.note(format!("{}\n/build", val("content")));
-                ring_bell();
+                self.notify_bell();
             }
             Some("goal_completed" | "goal_cancelled") => {
                 self.goal.clear();
@@ -443,7 +612,7 @@ impl App {
                     self.choices.clear();
                 }
                 self.note(format!("✓ {}", val("content")));
-                ring_bell();
+                self.notify_bell();
             }
             Some("tool_call") => self.record(
                 view::Role::Tool,
@@ -454,6 +623,10 @@ impl App {
                 self.note(format!("{} {}", val("status"), val("summary")));
                 if let Some(patch) = e["diff"]["patch"].as_str().filter(|s| !s.is_empty()) {
                     let diff = format!("{}\n{}", string(&e["diff"], "path"), patch);
+                    if self.patches.len() >= MAX_PATCHES {
+                        let excess = self.patches.len() + 1 - MAX_PATCHES;
+                        self.patches.drain(..excess);
+                    }
                     self.patches.push(clean(&diff));
                     self.record(view::Role::Output, diff);
                 }
@@ -462,7 +635,7 @@ impl App {
                 if e["approval_state"] == "pending" {
                     self.approval = val("approval_id");
                     self.note(format!("{}\n/allow  /deny", val("summary")));
-                    ring_bell();
+                    self.notify_bell();
                 } else {
                     self.approval.clear();
                 }
@@ -483,7 +656,7 @@ impl App {
                 if e["state"] == "idle" || e["state"] == "failed" {
                     self.approval.clear();
                     if was_running {
-                        ring_bell();
+                        self.notify_bell();
                     }
                 }
             }
@@ -560,6 +733,7 @@ impl App {
             .unwrap_or_else(Uuid::new_v4);
         self.retry = Some((path.clone(), req.clone(), id));
         req["id"] = json!(id.to_string());
+        self.replaying = false;
         self.remote.api(cx, Method::Post, &path, Some(req)).await?;
         self.retry = None;
         Ok(())
@@ -567,6 +741,8 @@ impl App {
 
     async fn patch_chat(&mut self, cx: &Cx, mut patch: Value) -> Result<()> {
         let path = self.path()?;
+        // Always fetch the latest revision before PATCH because turns and agent
+        // transitions advance `revision` server-side without pushing it over SSE.
         let latest = self.remote.api(cx, Method::Get, &path, None).await?;
         patch["revision"] = latest["revision"].clone();
         self.chat = self
@@ -587,7 +763,7 @@ impl App {
         let argument = argument.trim();
         match command {
             "/logout" => {
-                self.remote.api(cx, Method::Delete, "/session", None).await?;
+                let _ = self.remote.api(cx, Method::Delete, "/session", None).await;
                 let _ = self.credential.delete_credential();
                 return Ok(true);
             }
@@ -912,17 +1088,27 @@ async fn run_ui(
     let mut last_tick = Instant::now();
     let mut frame = 0;
     let mut selection = 0usize;
+    let mut dirty = true;
+    let mut last_size = crossterm::terminal::size()?;
 
-    loop {
+    'ui: loop {
         if terminated.load(Ordering::Relaxed) {
             break;
         }
         // Drain all available SSE stream updates before rendering.
+        let mut got_sse = false;
         while let Ok((id, update)) = rx.try_recv() {
             if app.chat["id"] == id {
+                got_sse = true;
+                dirty = true;
                 match update {
                     StreamUpdate::Event(event) => app.event(event),
                     StreamUpdate::Status(msg) => app.status = msg,
+                    StreamUpdate::AuthExpired(msg) => {
+                        app.feed.take();
+                        let _ = app.credential.delete_credential();
+                        app.status = msg;
+                    }
                     StreamUpdate::Fatal(error) => {
                         app.feed.take();
                         app.status = error.to_string();
@@ -930,325 +1116,336 @@ async fn run_ui(
                 }
             }
         }
-
-        let options: Vec<String> = match picker {
-            Some(Picker::Models) => app
-                .models
-                .iter()
-                .map(|m| clean(m["name"].as_str().or(m["id"].as_str()).unwrap_or("?")))
-                .collect(),
-            Some(Picker::Projects) if app.projects.is_empty() => app
-                .folder_options()
-                .iter()
-                .map(|(h, root)| clean(&format!("{} · {}", string(h, "name"), root)))
-                .collect(),
-            Some(Picker::Projects) => app
-                .projects
-                .iter()
-                .map(|p| {
-                    clean(&format!(
-                        "{} · {}/{}",
-                        string(p, "name"),
-                        string(p, "root"),
-                        string(p, "path")
-                    ))
-                })
-                .collect(),
-            Some(Picker::Chats) => std::iter::once(
-                app.msg("Nuova conversazione", "New conversation")
-                    .to_owned(),
-            )
-            .chain(
-                app.project_chats()
-                    .iter()
-                    .map(|c| clean(&string(c, "title"))),
-            )
-            .collect(),
-            None => Vec::new(),
-        };
-        let suggestions: Vec<&str> = if picker.is_some() {
-            options.iter().map(String::as_str).collect()
-        } else {
-            COMMANDS
-                .iter()
-                .copied()
-                .filter(|cmd| {
-                    !hide_menu && app.input.starts_with('/') && cmd.starts_with(&app.input)
-                })
-                .collect()
-        };
-        selection = selection.min(suggestions.len().saturating_sub(1));
-        let working = app.chat["state"] == "running" && app.feed.is_some();
-        if working && last_tick.elapsed() >= Duration::from_millis(150) {
-            frame = (frame + 1) % DOTS.len();
-            last_tick = Instant::now();
-        }
-        let size = crossterm::terminal::size()?;
-        if (terminal.width(), terminal.height()) != size {
-            terminal.set_size(size.0, size.1);
-        }
-        let width = usize::from(size.0.saturating_sub(2)).max(1);
-        let buffer = terminal.take_render_buffer(size.0, size.1);
-        let mut screen = ftui::Frame::from_buffer(buffer, terminal.pool_mut());
-        let picker_label = picker.map(|p| p.label(&app));
-        view::draw(
-            &mut screen,
-            &mut app,
-            caret,
-            &suggestions,
-            selection,
-            working.then_some(DOTS[frame]),
-            picker_label,
-        );
-        let (buffer, cursor) = (screen.buffer, screen.cursor_position);
-        terminal.present_ui_owned(buffer, cursor, cursor.is_some())?;
-        if terminal.pool().len() > usize::from(size.0) * usize::from(size.1) {
-            terminal.gc(None);
+        if !got_sse && app.replaying && app.opened_at.elapsed() >= REPLAY_BELL_GRACE {
+            app.replaying = false;
         }
 
-        // Wait briefly for either terminal input or SSE update without busy-spinning.
-        let ev = match ev_rx.try_recv() {
-            Ok(item) => Some(item?),
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                sleep(wall_now(), Duration::from_millis(25)).await;
-                continue;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-        };
-        let Some(ev) = ev else { continue };
-
-        match ev {
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(3),
-                MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(3),
-                _ => {}
-            },
-            Event::Paste(paste) => {
-                if picker.is_some() {
-                    continue;
+        // Drain queued terminal input events (up to MAX_EVENTS_PER_FRAME) before rendering.
+        let mut processed = 0usize;
+        while processed < MAX_EVENTS_PER_FRAME {
+            let ev = match ev_rx.try_recv() {
+                Ok(item) => item?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'ui,
+            };
+            processed += 1;
+            match ev {
+                Event::Resize(w, h) => {
+                    last_size = (w, h);
+                    dirty = true;
                 }
-                let text =
-                    clean(&paste.replace("\r\n", "\n").replace('\r', "\n")).replace('\t', "    ");
-                app.input.insert_str(caret, &text);
-                caret += text.len();
-                hide_menu = false;
-            }
-            Event::Key(k) => {
-                if k.kind == KeyEventKind::Release {
-                    continue;
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.scroll = app.scroll.saturating_add(3);
+                        dirty = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.scroll = app.scroll.saturating_sub(3);
+                        dirty = true;
+                    }
+                    _ => {}
+                },
+                Event::Paste(paste) => {
+                    if picker.is_some() {
+                        continue;
+                    }
+                    let text = clean(&paste.replace("\r\n", "\n").replace('\r', "\n"))
+                        .replace('\t', "    ");
+                    app.input.insert_str(caret, &text);
+                    caret += text.len();
+                    hide_menu = false;
+                    dirty = true;
                 }
-                match k.code {
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::F(2) | KeyCode::F(3) => match app.refresh(cx).await {
-                        Ok(()) => {
-                            picker = Some(if k.code == KeyCode::F(3) || app.project.is_null() {
-                                Picker::Projects
-                            } else {
-                                Picker::Chats
-                            });
-                            selection = 0;
-                            app.status.clear();
-                        }
-                        Err(error) => app.status = error.to_string(),
-                    },
-                    KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if !app.models.is_empty() {
-                            picker = Some(Picker::Models);
-                            selection = app
-                                .models
-                                .iter()
-                                .position(|m| m["id"] == app.model)
-                                .unwrap_or(0);
-                        }
+                Event::Key(k) => {
+                    if k.kind == KeyEventKind::Release {
+                        continue;
                     }
-                    KeyCode::Esc if picker.is_some() => {
-                        picker = None;
-                        selection = 0;
-                    }
-                    KeyCode::Enter if let Some(menu) = picker => {
-                        if options.is_empty() {
-                            continue;
+                    dirty = true;
+                    let width = usize::from(last_size.0.saturating_sub(2)).max(1);
+                    let options = picker_options(&app, picker);
+                    let suggestions: Vec<&str> = if picker.is_some() {
+                        options.iter().map(String::as_str).collect()
+                    } else {
+                        slash_suggestions(&app.input, hide_menu)
+                    };
+                    selection = selection.min(suggestions.len().saturating_sub(1));
+
+                    match k.code {
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break 'ui;
                         }
-                        match app.choose(cx, menu, selection).await {
+                        KeyCode::F(2) | KeyCode::F(3) => match app.refresh(cx).await {
                             Ok(()) => {
-                                picker = None;
+                                picker =
+                                    Some(if k.code == KeyCode::F(3) || app.project.is_null() {
+                                        Picker::Projects
+                                    } else {
+                                        Picker::Chats
+                                    });
                                 selection = 0;
                                 app.status.clear();
                             }
                             Err(error) => app.status = error.to_string(),
-                        }
-                    }
-                    _ if picker.is_some() && !matches!(k.code, KeyCode::Up | KeyCode::Down) => {}
-                    KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.compact_tools = !app.compact_tools;
-                    }
-                    KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        caret = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
-                    }
-                    KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        caret += app.input[caret..]
-                            .find('\n')
-                            .unwrap_or(app.input.len() - caret);
-                    }
-                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let start = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
-                        app.input.drain(start..caret);
-                        caret = start;
-                        hide_menu = false;
-                    }
-                    KeyCode::Char('k') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let end = caret
-                            + app.input[caret..]
-                                .find('\n')
-                                .unwrap_or(app.input.len() - caret);
-                        app.input.drain(caret..end);
-                        hide_menu = false;
-                    }
-                    KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let trimmed = app.input[..caret].trim_end_matches(' ');
-                        let start = trimmed
-                            .rfind(|c: char| c.is_whitespace())
-                            .map_or(0, |i| i + 1);
-                        app.input.drain(start..caret);
-                        caret = start;
-                        hide_menu = false;
-                    }
-                    KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.input.insert(caret, '\n');
-                        caret += 1;
-                    }
-                    KeyCode::Esc if !suggestions.is_empty() => hide_menu = true,
-                    KeyCode::Esc if !app.chat.is_null() => {
-                        if let Err(e) = app.command(cx, "/stop").await {
-                            app.status = e.to_string();
-                        }
-                    }
-                    KeyCode::Up if k.modifiers.contains(KeyModifiers::ALT) => {
-                        app.scroll = app.scroll.saturating_add(1);
-                    }
-                    KeyCode::Down if k.modifiers.contains(KeyModifiers::ALT) => {
-                        app.scroll = app.scroll.saturating_sub(1);
-                    }
-                    KeyCode::Up if !suggestions.is_empty() => {
-                        selection = selection.saturating_sub(1);
-                    }
-                    KeyCode::Down if !suggestions.is_empty() => {
-                        selection = (selection + 1).min(suggestions.len() - 1);
-                    }
-                    KeyCode::Tab if !suggestions.is_empty() => {
-                        app.input = format!("{} ", suggestions[selection]);
-                        caret = app.input.len();
-                        selection = 0;
-                    }
-                    KeyCode::PageUp => app.scroll = app.scroll.saturating_add(12),
-                    KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(12),
-                    KeyCode::Up | KeyCode::Down
-                        if let Some(next) =
-                            editor::vertical(&app.input, caret, width, k.code == KeyCode::Down) =>
-                    {
-                        caret = next;
-                    }
-                    KeyCode::Up => {
-                        if hist_index > 0 {
-                            if hist_index == draft_history.len() {
-                                parked_draft = app.input.clone();
+                        },
+                        KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.models.is_empty() {
+                                picker = Some(Picker::Models);
+                                selection = app
+                                    .models
+                                    .iter()
+                                    .position(|m| m["id"] == app.model)
+                                    .unwrap_or(0);
                             }
-                            hist_index -= 1;
-                            app.input = draft_history[hist_index].clone();
-                            caret = app.input.len();
                         }
-                    }
-                    KeyCode::Down if hist_index < draft_history.len() => {
-                        hist_index = (hist_index + 1).min(draft_history.len());
-                        app.input = draft_history
-                            .get(hist_index)
-                            .cloned()
-                            .unwrap_or_else(|| parked_draft.clone());
-                        caret = app.input.len();
-                    }
-                    KeyCode::Left => {
-                        caret = app.input[..caret]
-                            .grapheme_indices(true)
-                            .next_back()
-                            .map_or(0, |(pos, _)| pos);
-                    }
-                    KeyCode::Right => {
-                        caret += app.input[caret..]
-                            .graphemes(true)
-                            .next()
-                            .map_or(0, str::len);
-                    }
-                    KeyCode::Home => {
-                        caret = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
-                    }
-                    KeyCode::End if app.scroll > 0 && app.input.is_empty() => app.scroll = 0,
-                    KeyCode::End => {
-                        if caret == app.input.len() && app.scroll > 0 {
-                            app.scroll = 0;
-                        } else {
+                        KeyCode::Esc if picker.is_some() => {
+                            picker = None;
+                            selection = 0;
+                        }
+                        KeyCode::Enter if let Some(menu) = picker => {
+                            if options.is_empty() {
+                                continue;
+                            }
+                            match app.choose(cx, menu, selection).await {
+                                Ok(()) => {
+                                    picker = None;
+                                    selection = 0;
+                                    app.status.clear();
+                                }
+                                Err(error) => app.status = error.to_string(),
+                            }
+                        }
+                        _ if picker.is_some() && !matches!(k.code, KeyCode::Up | KeyCode::Down) => {
+                        }
+                        KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.compact_tools = !app.compact_tools;
+                        }
+                        KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            caret = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
+                        }
+                        KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             caret += app.input[caret..]
                                 .find('\n')
                                 .unwrap_or(app.input.len() - caret);
                         }
-                    }
-                    KeyCode::Delete if caret < app.input.len() => {
-                        let n = app.input[caret..].graphemes(true).next().unwrap().len();
-                        app.input.drain(caret..caret + n);
-                        hide_menu = false;
-                    }
-                    KeyCode::Backspace if caret > 0 => {
-                        let prev = app.input[..caret]
-                            .grapheme_indices(true)
-                            .next_back()
-                            .unwrap()
-                            .0;
-                        app.input.drain(prev..caret);
-                        caret = prev;
-                        hide_menu = false;
-                    }
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        hide_menu = false;
-                        selection = 0;
-                        app.input.insert(caret, c);
-                        caret += c.len_utf8();
-                    }
-                    KeyCode::Enter
-                        if k.modifiers
-                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-                    {
-                        app.input.insert(caret, '\n');
-                        caret += 1;
-                    }
-                    KeyCode::Enter => {
-                        let line = suggestions
-                            .get(selection)
-                            .copied()
-                            .unwrap_or(app.input.trim())
-                            .to_owned();
-                        if line.is_empty() {
-                            continue;
+                        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let start = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
+                            app.input.drain(start..caret);
+                            caret = start;
+                            hide_menu = false;
                         }
-                        app.status.clear();
-                        match app.command(cx, &line).await {
-                            Ok(quit) => {
-                                if quit {
-                                    break;
-                                }
-                                draft_history.push(line);
-                                hist_index = draft_history.len();
-                                app.input.clear();
-                                parked_draft.clear();
-                                app.scroll = 0;
-                                hide_menu = false;
-                                caret = 0;
+                        KeyCode::Char('k') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let end = caret
+                                + app.input[caret..]
+                                    .find('\n')
+                                    .unwrap_or(app.input.len() - caret);
+                            app.input.drain(caret..end);
+                            hide_menu = false;
+                        }
+                        KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            delete_prev_word(&mut app.input, &mut caret);
+                            hide_menu = false;
+                        }
+                        KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.input.insert(caret, '\n');
+                            caret += 1;
+                        }
+                        KeyCode::Esc if !suggestions.is_empty() => hide_menu = true,
+                        KeyCode::Esc if !app.chat.is_null() => {
+                            if let Err(e) = app.command(cx, "/stop").await {
+                                app.status = e.to_string();
                             }
-                            Err(e) => app.status = e.to_string(),
                         }
+                        KeyCode::Up if k.modifiers.contains(KeyModifiers::ALT) => {
+                            app.scroll = app.scroll.saturating_add(1);
+                        }
+                        KeyCode::Down if k.modifiers.contains(KeyModifiers::ALT) => {
+                            app.scroll = app.scroll.saturating_sub(1);
+                        }
+                        KeyCode::Up if !suggestions.is_empty() => {
+                            selection = selection.saturating_sub(1);
+                        }
+                        KeyCode::Down if !suggestions.is_empty() => {
+                            selection = (selection + 1).min(suggestions.len() - 1);
+                        }
+                        KeyCode::Tab if !suggestions.is_empty() => {
+                            app.input = format!("{} ", suggestions[selection]);
+                            caret = app.input.len();
+                            selection = 0;
+                        }
+                        KeyCode::PageUp => app.scroll = app.scroll.saturating_add(12),
+                        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(12),
+                        KeyCode::Up | KeyCode::Down
+                            if let Some(next) = editor::vertical(
+                                &app.input,
+                                caret,
+                                width,
+                                k.code == KeyCode::Down,
+                            ) =>
+                        {
+                            caret = next;
+                        }
+                        KeyCode::Up => {
+                            if hist_index > 0 {
+                                if hist_index == draft_history.len() {
+                                    parked_draft = app.input.clone();
+                                }
+                                hist_index -= 1;
+                                app.input = draft_history[hist_index].clone();
+                                caret = app.input.len();
+                            }
+                        }
+                        KeyCode::Down if hist_index < draft_history.len() => {
+                            hist_index = (hist_index + 1).min(draft_history.len());
+                            app.input = draft_history
+                                .get(hist_index)
+                                .cloned()
+                                .unwrap_or_else(|| parked_draft.clone());
+                            caret = app.input.len();
+                        }
+                        KeyCode::Left => {
+                            caret = app.input[..caret]
+                                .grapheme_indices(true)
+                                .next_back()
+                                .map_or(0, |(pos, _)| pos);
+                        }
+                        KeyCode::Right => {
+                            caret += app.input[caret..]
+                                .graphemes(true)
+                                .next()
+                                .map_or(0, str::len);
+                        }
+                        KeyCode::Home => {
+                            caret = app.input[..caret].rfind('\n').map_or(0, |n| n + 1);
+                        }
+                        KeyCode::End if app.scroll > 0 && app.input.is_empty() => app.scroll = 0,
+                        KeyCode::End => {
+                            if caret == app.input.len() && app.scroll > 0 {
+                                app.scroll = 0;
+                            } else {
+                                caret += app.input[caret..]
+                                    .find('\n')
+                                    .unwrap_or(app.input.len() - caret);
+                            }
+                        }
+                        KeyCode::Delete if caret < app.input.len() => {
+                            let n = app.input[caret..].graphemes(true).next().unwrap().len();
+                            app.input.drain(caret..caret + n);
+                            hide_menu = false;
+                        }
+                        KeyCode::Backspace if caret > 0 => {
+                            let prev = app.input[..caret]
+                                .grapheme_indices(true)
+                                .next_back()
+                                .unwrap()
+                                .0;
+                            app.input.drain(prev..caret);
+                            caret = prev;
+                            hide_menu = false;
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                        {
+                            hide_menu = false;
+                            selection = 0;
+                            app.input.insert(caret, c);
+                            caret += c.len_utf8();
+                        }
+                        KeyCode::Enter
+                            if k.modifiers
+                                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        {
+                            app.input.insert(caret, '\n');
+                            caret += 1;
+                        }
+                        KeyCode::Enter => {
+                            let line = app.input.trim().to_owned();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if needs_tab_completion(&line, &suggestions) {
+                                app.status = app
+                                    .msg(
+                                        "Premi Tab per completare il comando",
+                                        "Press Tab to complete the command",
+                                    )
+                                    .to_owned();
+                                continue;
+                            }
+                            app.status.clear();
+                            match app.command(cx, &line).await {
+                                Ok(quit) => {
+                                    if quit {
+                                        break 'ui;
+                                    }
+                                    draft_history.push(line);
+                                    if draft_history.len() > MAX_DRAFT_HISTORY {
+                                        let excess = draft_history.len() - MAX_DRAFT_HISTORY;
+                                        draft_history.drain(..excess);
+                                    }
+                                    hist_index = draft_history.len();
+                                    app.input.clear();
+                                    parked_draft.clear();
+                                    app.scroll = 0;
+                                    hide_menu = false;
+                                    caret = 0;
+                                }
+                                Err(e) => app.status = e.to_string(),
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-            _ => {}
+        }
+
+        let size = crossterm::terminal::size()?;
+        if size != last_size {
+            last_size = size;
+            dirty = true;
+        }
+        let working = app.working();
+        if working && last_tick.elapsed() >= Duration::from_millis(150) {
+            frame = (frame + 1) % DOTS.len();
+            last_tick = Instant::now();
+            dirty = true;
+        }
+
+        if dirty {
+            let options = picker_options(&app, picker);
+            let suggestions: Vec<&str> = if picker.is_some() {
+                options.iter().map(String::as_str).collect()
+            } else {
+                slash_suggestions(&app.input, hide_menu)
+            };
+            selection = selection.min(suggestions.len().saturating_sub(1));
+            if (terminal.width(), terminal.height()) != size {
+                terminal.set_size(size.0, size.1);
+            }
+            let buffer = terminal.take_render_buffer(size.0, size.1);
+            let mut screen = ftui::Frame::from_buffer(buffer, terminal.pool_mut());
+            let picker_label = picker.map(|p| p.label(&app));
+            view::draw(
+                &mut screen,
+                &mut app,
+                caret,
+                &suggestions,
+                selection,
+                working.then_some(DOTS[frame]),
+                picker_label,
+            );
+            let (buffer, cursor) = (screen.buffer, screen.cursor_position);
+            terminal.present_ui_owned(buffer, cursor, cursor.is_some())?;
+            if terminal.pool().len() > usize::from(size.0) * usize::from(size.1) {
+                terminal.gc(None);
+            }
+            dirty = false;
+        }
+
+        if processed < MAX_EVENTS_PER_FRAME && !got_sse {
+            sleep(wall_now(), Duration::from_millis(25)).await;
         }
     }
     stop_reader.store(true, Ordering::Relaxed);
@@ -1379,7 +1576,7 @@ async fn run_cli(cx: Cx) -> Result<()> {
     let mut session = None;
     if !stdin {
         match credential.get_password() {
-            Ok(saved) => match Remote::restore(ca.as_deref(), &saved) {
+            Ok(saved) => match Remote::restore(ca.as_deref(), &saved, standalone.is_some()) {
                 Ok(remote) => match remote.valid(&cx).await {
                     Ok(true) => session = Some(remote),
                     Ok(false) => {
@@ -1498,6 +1695,9 @@ async fn run_cli(cx: Cx) -> Result<()> {
             goal: String::new(),
             approval: String::new(),
             scroll: 0,
+            last_sequence: 0,
+            replaying: false,
+            opened_at: Instant::now(),
             feed: None,
             tx,
         },
@@ -1527,5 +1727,153 @@ fn main() {
             .border_style(Style::parse("bold red").unwrap_or_default());
         console.print_renderable(&panel);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let saved = serde_json::json!({
+            "url": "https://workspace.example",
+            "cookie": "venticode_session=test"
+        })
+        .to_string();
+        let remote = Remote::restore(None, &saved, false).unwrap();
+        let credential = keyring::Entry::new("venticode-tui-test", "https://workspace.example")
+            .expect("keyring entry");
+        let (tx, _rx) = mpsc::channel(16);
+        App {
+            remote,
+            credential,
+            en: true,
+            projects: vec![],
+            models: vec![],
+            harnesses: vec![],
+            chats: vec![],
+            project: Value::Null,
+            chat: Value::Null,
+            model: String::new(),
+            lines: vec![],
+            compact_tools: true,
+            last_text: String::new(),
+            patches: Vec::new(),
+            input: String::new(),
+            status: String::new(),
+            question: String::new(),
+            choices: vec![],
+            retry: None,
+            plan: String::new(),
+            goal: String::new(),
+            approval: String::new(),
+            scroll: 0,
+            last_sequence: 0,
+            replaying: false,
+            opened_at: Instant::now(),
+            feed: None,
+            tx,
+        }
+    }
+
+    #[test]
+    fn ctrl_w_handles_multibyte_unicode_whitespace_without_panicking() {
+        let mut input = "hello\u{00A0}world".to_owned();
+        let mut caret = input.len();
+        delete_prev_word(&mut input, &mut caret);
+        assert_eq!(input, "hello\u{00A0}");
+        assert_eq!(caret, input.len());
+
+        // Second Ctrl+W trims the trailing U+00A0 and deletes "hello".
+        delete_prev_word(&mut input, &mut caret);
+        assert_eq!(input, "");
+        assert_eq!(caret, 0);
+
+        // Ideographic space U+3000 (3 bytes in UTF-8).
+        let mut input = "foo\u{3000}bar\u{3000}".to_owned();
+        let mut caret = input.len();
+        delete_prev_word(&mut input, &mut caret);
+        assert_eq!(input, "foo\u{3000}");
+        assert_eq!(caret, input.len());
+
+        delete_prev_word(&mut input, &mut caret);
+        assert_eq!(input, "");
+        assert_eq!(caret, 0);
+    }
+
+    #[test]
+    fn sequence_deduplication_ignores_replayed_events_on_reconnect() {
+        let mut app = test_app();
+        app.event(json!({
+            "sequence": 1,
+            "type": "user_message",
+            "content": "hello"
+        }));
+        app.event(json!({
+            "sequence": 2,
+            "type": "text",
+            "message_id": "m1",
+            "delta": "world"
+        }));
+        assert_eq!(app.last_sequence, 2);
+        assert_eq!(app.lines.len(), 2);
+
+        // Reconnect replays seq 1 and 2 — must be ignored (no duplicates).
+        app.event(json!({
+            "sequence": 1,
+            "type": "user_message",
+            "content": "hello"
+        }));
+        app.event(json!({
+            "sequence": 2,
+            "type": "text",
+            "message_id": "m1",
+            "delta": "world"
+        }));
+        assert_eq!(app.last_sequence, 2);
+        assert_eq!(app.lines.len(), 2);
+        assert_eq!(app.lines[1].text, "world");
+
+        // Newer event seq 3 is accepted.
+        app.event(json!({
+            "sequence": 3,
+            "type": "text",
+            "message_id": "m1",
+            "delta": "!"
+        }));
+        assert_eq!(app.last_sequence, 3);
+        assert_eq!(app.lines[1].text, "world!");
+
+        // Closing conversation resets last_sequence to 0.
+        app.close();
+        assert_eq!(app.last_sequence, 0);
+    }
+
+    #[test]
+    fn slash_command_enter_requires_exact_match_or_arguments() {
+        let partial = slash_suggestions("/q", false);
+        assert_eq!(partial, vec!["/quit"]);
+        assert!(needs_tab_completion("/q", &partial));
+
+        let exact = slash_suggestions("/quit", false);
+        assert!(!needs_tab_completion("/quit", &exact));
+
+        let with_args = slash_suggestions("/model 1", false);
+        assert!(!needs_tab_completion("/model 1", &with_args));
+
+        let escaped = slash_suggestions("//q", false);
+        assert!(!needs_tab_completion("//q", &escaped));
+    }
+
+    #[test]
+    fn output_cap_preserves_utf8_boundaries() {
+        let mut buf = String::new();
+        // 'é' is 2 bytes; capping at 5 bytes must cut at 4 bytes without panicking.
+        append_capped_output(&mut buf, "éééé", 5);
+        assert!(buf.starts_with("éé"));
+        assert!(buf.contains("output truncated"));
+        let len_after = buf.len();
+        append_capped_output(&mut buf, "more", 5);
+        assert_eq!(buf.len(), len_after);
     }
 }

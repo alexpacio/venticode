@@ -83,8 +83,14 @@ async fn list(
     Query(q): Query<Filter>,
 ) -> Result<Json<Value>> {
     let m = Member::load(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT document,harness_id,root FROM project_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR harness_id=$3) ORDER BY created_at,id")
-        .bind(m.workspace).bind(m.user).bind(q.harness_id).fetch_all(&app.db).await?;
+    let rows = sqlx::query(
+        "SELECT document,harness_id,root FROM project_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR harness_id=$3) ORDER BY created_at,id LIMIT 500",
+    )
+    .bind(m.workspace)
+    .bind(m.user)
+    .bind(q.harness_id)
+    .fetch_all(&app.db)
+    .await?;
     Ok(Json(
         json!({"items":rows.iter().filter(|r|visible(&m,r)).map(|r|r.get::<Value,_>("document")).collect::<Vec<_>>()}),
     ))
@@ -199,8 +205,14 @@ async fn conversations(
     Query(q): Query<Filter>,
 ) -> Result<Json<Value>> {
     let m = Member::load(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT document,harness_id,root,runtime FROM conversation_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR project_id=$3) ORDER BY updated_at DESC,id")
-        .bind(m.workspace).bind(m.user).bind(q.project_id).fetch_all(&app.db).await?;
+    let rows = sqlx::query(
+        "SELECT document,harness_id,root,runtime FROM conversation_json WHERE workspace=$1 AND owner_id=$2 AND ($3::uuid IS NULL OR project_id=$3) ORDER BY updated_at DESC,id LIMIT 500",
+    )
+    .bind(m.workspace)
+    .bind(m.user)
+    .bind(q.project_id)
+    .fetch_all(&app.db)
+    .await?;
     Ok(Json(
         json!({"items":rows.iter().filter(|r|visible(&m,r)).take(200).map(|r|r.get::<Value,_>("document")).collect::<Vec<_>>()}),
     ))

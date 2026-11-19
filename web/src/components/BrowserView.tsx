@@ -7,6 +7,7 @@ import { t, useLanguage } from "../i18n/index.ts";
 import { useBrowserThreads } from "../queries.ts";
 import { BrowserScreen } from "./BrowserScreen.tsx";
 import type { BrowserFrame } from "./BrowserScreen.tsx";
+import { ErrorBoundary } from "./ErrorBoundary.tsx";
 
 type Tab = { targetId: string; title: string; url: string };
 type Message = { role: string; content: string };
@@ -81,14 +82,34 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
   const [address, setAddress] = useState("");
   const [prompt, setPrompt] = useState("");
   const socket = useRef<WebSocket | null>(null);
+  const closingByUser = useRef(false);
+  const openTimeout = useRef<number | undefined>(undefined);
+  const closeTimeout = useRef<number | undefined>(undefined);
+  const watchdog = useRef<number | undefined>(undefined);
   const controlButton = useRef<HTMLButtonElement>(null);
   const log = useRef<HTMLDivElement>(null);
   const tab = tabs.find((item) => item.targetId === active);
   const tabUrl = tab?.url === "about:blank" ? "" : tab?.url;
 
+  const clearTimers = () => {
+    if (openTimeout.current !== undefined) {
+      window.clearTimeout(openTimeout.current);
+      openTimeout.current = undefined;
+    }
+    if (closeTimeout.current !== undefined) {
+      window.clearTimeout(closeTimeout.current);
+      closeTimeout.current = undefined;
+    }
+    if (watchdog.current !== undefined) {
+      window.clearInterval(watchdog.current);
+      watchdog.current = undefined;
+    }
+  };
+
   useEffect(() => setAddress(tabUrl ?? ""), [active, tabUrl]);
   useEffect(() => { if (log.current) log.current.scrollTop = log.current.scrollHeight; }, [history, pending]);
   useEffect(() => () => {
+    clearTimers();
     const ws = socket.current;
     socket.current = null;
     ws?.close();
@@ -96,6 +117,8 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
 
   function start() {
     if (socket.current) return;
+    clearTimers();
+    closingByUser.current = false;
     setError("");
     setHistory([]);
     setStatus("opening");
@@ -107,9 +130,22 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
     socket.current = ws;
     let ready = false;
     let ended = false;
-    const timeout = window.setTimeout(() => ws.close(), 60_000);
+    let lastActivityAt = Date.now();
+    openTimeout.current = window.setTimeout(() => {
+      openTimeout.current = undefined;
+      if (socket.current === ws) ws.close();
+    }, 60_000);
+    watchdog.current = window.setInterval(() => {
+      if (socket.current !== ws) return;
+      if (ready && Date.now() - lastActivityAt >= 40_000) ws.close();
+    }, 5_000);
+    ws.onopen = () => {
+      if (socket.current !== ws) return;
+      lastActivityAt = Date.now();
+    };
     ws.onmessage = (event) => {
       if (socket.current !== ws) return;
+      lastActivityAt = Date.now();
       if (event.data instanceof ArrayBuffer) {
         const next = decodeFrame(event.data);
         if (next?.tab === activeTab.current) setFrame(next);
@@ -122,9 +158,14 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
         return;
       }
       switch (packet.type) {
+        case "heartbeat":
+          break;
         case "ready":
           ready = true;
-          window.clearTimeout(timeout);
+          if (openTimeout.current !== undefined) {
+            window.clearTimeout(openTimeout.current);
+            openTimeout.current = undefined;
+          }
           setStatus("ready");
           break;
         case "tabs":
@@ -161,10 +202,12 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
       }
     };
     ws.onclose = () => {
-      window.clearTimeout(timeout);
       if (socket.current !== ws) return;
+      clearTimers();
       socket.current = null;
       activeTab.current = null;
+      const userClosed = closingByUser.current;
+      closingByUser.current = false;
       setStatus("closed");
       setActive(null);
       setTabs([]);
@@ -172,13 +215,14 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
       setHuman(false);
       setPending(false);
       setChangingControl(false);
-      if (!ended) setError(ready ? t("Connessione al browser interrotta.") : t("Impossibile avviare il browser remoto."));
+      if (!ended && !userClosed) setError(ready ? t("Connessione al browser interrotta.") : t("Impossibile avviare il browser remoto."));
     };
   }
 
   function send(packet: object) {
-    if (socket.current?.readyState === WebSocket.OPEN) {
-      socket.current.send(JSON.stringify(packet));
+    const ws = socket.current;
+    if (ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 64 * 1024) {
+      ws.send(JSON.stringify(packet));
       return true;
     }
     return false;
@@ -210,7 +254,9 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
       {status === "closed"
         ? <button type="button" className="btn btn-primary" onClick={start}>{t("Avvia Kitesurf")}</button>
         : <button type="button" className="btn btn-danger" disabled={status === "closing"} onClick={() => {
+          closingByUser.current = true;
           if (status === "opening") {
+            clearTimers();
             const ws = socket.current;
             socket.current = null;
             ws?.close();
@@ -219,8 +265,15 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
           }
           setStatus("closing");
           const ws = socket.current;
-          if (!send({ type: "end" })) ws?.close();
-          else window.setTimeout(() => { if (socket.current === ws) ws?.close(); }, 3000);
+          if (!send({ type: "end" })) {
+            ws?.close();
+          } else {
+            if (closeTimeout.current !== undefined) window.clearTimeout(closeTimeout.current);
+            closeTimeout.current = window.setTimeout(() => {
+              closeTimeout.current = undefined;
+              if (socket.current === ws) ws?.close();
+            }, 3000);
+          }
         }}>{t("Termina sessione")}</button>}
     </div>
     {error && <p className="error-line" role="alert">{error}</p>}
@@ -261,15 +314,17 @@ function BrowserSession({ threads }: { threads: { id: string; updated_at: string
             }}>{human ? t("Restituisci il controllo") : t("Prendi il controllo")}</button>
         </div>
         <div className="browser-stage">
-          {status !== "closed" && <BrowserScreen
-            frame={frame}
-            human={canInput}
-            exit={controlButton}
-            onInput={(target, input) => {
-              if (canInput && target === activeTab.current) send({ type: "input", tab: target, input });
-            }}
-            onFailure={() => setError(t("Impossibile visualizzare lo schermo remoto."))}
-          />}
+          {status !== "closed" && <ErrorBoundary inline>
+            <BrowserScreen
+              frame={frame}
+              human={canInput}
+              exit={controlButton}
+              onInput={(target, input) => {
+                if (canInput && target === activeTab.current) send({ type: "input", tab: target, input });
+              }}
+              onFailure={() => setError(t("Impossibile visualizzare lo schermo remoto."))}
+            />
+          </ErrorBoundary>}
           {!frame && <div className="browser-placeholder" role="status">
             {status === "opening" && <LoaderCircle className="spin" aria-hidden="true" />}
             {status === "closed" ? t("Avvia Kitesurf per vedere il browser qui.") :

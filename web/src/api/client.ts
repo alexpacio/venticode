@@ -26,26 +26,69 @@ export class ApiError extends Error {
   }
 }
 
-let unauthorizedListener: (() => void) | undefined;
-export function onUnauthorized(listener: () => void) {
-  unauthorizedListener = listener;
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+export interface ApiOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
-export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
-  const response = await fetch(base + path, {
-    method,
-    credentials: "same-origin",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await response.text();
-  let value: any = null;
-  try { value = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
-  if (!response.ok) {
-    if (response.status === 401 && path !== "/session") unauthorizedListener?.();
-    throw new ApiError(response.status, value?.error?.message || response.statusText || `HTTP ${response.status}`);
+const unauthorizedListeners = new Set<() => void>();
+export function onUnauthorized(listener: () => void): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+function buildSignal(callerSignal?: AbortSignal, timeoutMs = DEFAULT_TIMEOUT_MS): { signal: AbortSignal; cleanup: () => void } {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" && typeof AbortSignal.any === "function") {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    return {
+      signal: callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal,
+      cleanup: () => {},
+    };
   }
-  return value as T;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")), timeoutMs);
+  const onAbort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort(callerSignal.reason);
+    else callerSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onAbort);
+    },
+  };
 }
 
-export const list = <T>(path: string) => api<{ items: T[] }>(path).then((value) => value.items);
+export async function api<T>(path: string, method = "GET", body?: unknown, options?: ApiOptions): Promise<T> {
+  const { signal, cleanup } = buildSignal(options?.signal, options?.timeoutMs);
+  try {
+    const response = await fetch(base + path, {
+      method,
+      credentials: "same-origin",
+      signal,
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await response.text();
+    let value: any = null;
+    try { value = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
+    if (!response.ok) {
+      if (response.status === 401 && path !== "/session") {
+        for (const listener of unauthorizedListeners) listener();
+      }
+      throw new ApiError(response.status, value?.error?.message || response.statusText || `HTTP ${response.status}`);
+    }
+    return value as T;
+  } finally {
+    cleanup();
+  }
+}
+
+export const list = <T>(path: string, options?: ApiOptions) =>
+  api<{ items: T[] }>(path, "GET", undefined, options).then((value) => value.items);

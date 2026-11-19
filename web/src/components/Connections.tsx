@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, list } from "../api/client.ts";
@@ -13,11 +13,19 @@ const providers = { slack: "Slack", telegram: "Telegram", gitlab: "GitLab" };
 
 function CopyButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => {
+    if (timer.current !== undefined) window.clearTimeout(timer.current);
+  }, []);
   return (
     <button type="button" className="btn" style={{ minHeight: 28, fontSize: 12 }} onClick={() => {
       void navigator.clipboard?.writeText(value).then(() => {
+        if (timer.current !== undefined) window.clearTimeout(timer.current);
         setCopied(true);
-        window.setTimeout(() => setCopied(false), 1800);
+        timer.current = window.setTimeout(() => {
+          timer.current = undefined;
+          setCopied(false);
+        }, 1800);
       }).catch(() => {});
     }}>{copied ? t("Copiato") : t("Copia")}</button>
   );
@@ -26,7 +34,11 @@ function CopyButton({ value }: { value: string }) {
 export function Connections({ menu, admin }: { menu: ReactNode; admin: boolean }) {
   const client = useQueryClient();
   const [params] = useSearchParams();
-  const connections = useQuery({ queryKey: ["connections"], refetchInterval: 15000, queryFn: () => list<Connection>("/connections") });
+  const connections = useQuery({
+    queryKey: ["connections"],
+    refetchInterval: 15000,
+    queryFn: ({ signal }) => list<Connection>("/connections", { signal }),
+  });
   const [editing, setEditing] = useState<Connection | "new" | null>(null);
   const refresh = async () => {
     await Promise.all(["connections", "bots"].map(key => client.invalidateQueries({ queryKey: [key] })));
@@ -41,7 +53,7 @@ export function Connections({ menu, admin }: { menu: ReactNode; admin: boolean }
       {connections.data?.length === 0 && <p>{t("Nessuna connessione configurata.")}</p>}
       {connections.data?.map(c => <ConnectionCard key={c.id} connection={c} admin={admin} refresh={refresh} edit={() => setEditing(c)} />)}
       {admin && !editing && <div><button className="btn" onClick={() => setEditing("new")}>{t("Aggiungi connessione")}</button></div>}
-      {admin && editing && <SetupForm key={editing === "new" ? editing : editing.id} connection={editing === "new" ? null : editing} done={refresh} cancel={() => setEditing(null)} />}
+      {admin && editing && <SetupForm key={editing === "new" ? "setup-new" : `setup-${editing.id}`} connection={editing === "new" ? null : editing} done={refresh} cancel={() => setEditing(null)} />}
     </div>
   </main>;
 }

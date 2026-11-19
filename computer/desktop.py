@@ -4,6 +4,7 @@ import base64
 import fcntl
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -15,53 +16,134 @@ LOG = logging.getLogger("venticode-desktop")
 WIDTH, HEIGHT = 1280, 800
 RUNTIME = "/run/venticode-desktop"
 SOCKET = RUNTIME + "/bridge.sock"
-ORIGINS = set(json.loads(os.getenv("VENTICODE_BROWSER_ORIGINS", "[]")))
+STDERR_LIMIT = 4096
 KEYS = {
     "Enter": "Return", "Backspace": "BackSpace", "Escape": "Escape",
     "ArrowLeft": "Left", "ArrowRight": "Right", "ArrowUp": "Up", "ArrowDown": "Down",
     "Tab": "Tab", "Delete": "Delete", "Home": "Home", "End": "End",
     "PageUp": "Prior", "PageDown": "Next", "Space": "space",
 }
-SNAPSHOT = """JSON.stringify({url:location.href,title:document.title,
-text:(document.body?.innerText??'').slice(0,10000),
-links:Array.from(document.querySelectorAll('a[href]')).slice(0,50).map(a=>({label:a.innerText.slice(0,140),url:a.href}))})"""
+SNAPSHOT = """(() => ({
+title: String(document.title ?? ''),
+text: String(document.body?.innerText ?? '').slice(0, 10000),
+links: Array.from(document.querySelectorAll('a[href]')).slice(0, 50).map(a => ({
+label: String(a.innerText ?? '').slice(0, 140),
+url: String(a.href ?? ''),
+})),
+}))()"""
 
 
 class RequestError(Exception):
     pass
 
 
+def normalize_origin(raw):
+    if not isinstance(raw, str) or len(raw) > 4096 or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower() if parsed.hostname else None
+    if scheme not in ("http", "https") or not host or parsed.username is not None or parsed.password is not None:
+        return None
+    if ":" in host:
+        host = f"[{host}]"
+    default = 80 if scheme == "http" else 443
+    return f"{scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def load_origins(values):
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    origins = set()
+    for value in values:
+        origin = normalize_origin(value)
+        if origin is not None:
+            origins.add(origin)
+    return origins
+
+
+ORIGINS = load_origins(json.loads(os.getenv("VENTICODE_BROWSER_ORIGINS", "[]")))
+
+
+async def _read_bounded(stream, limit):
+    chunks = []
+    size = 0
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        if size < limit:
+            take = chunk[:limit - size]
+            chunks.append(take)
+            size += len(take)
+    return b"".join(chunks)
+
+
 async def command(*args, data=None):
     proc = await asyncio.create_subprocess_exec(
         *args, stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
+
+    async def feed_stdin():
+        if data is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(data)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                proc.stdin.close()
+
     try:
-        output, _ = await asyncio.wait_for(proc.communicate(data), 7)
+        async with asyncio.timeout(7):
+            _, output, stderr = await asyncio.gather(
+                feed_stdin(),
+                proc.stdout.read(),
+                _read_bounded(proc.stderr, STDERR_LIMIT),
+            )
+            await proc.wait()
     finally:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
     if proc.returncode:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        LOG.warning(
+            "command %s exited with %s%s",
+            args[0] if args else "<empty>",
+            proc.returncode,
+            f": {detail}" if detail else "",
+        )
         raise RequestError("Desktop command failed")
     return output
 
 
 def allowed(url):
-    if not isinstance(url, str) or len(url) > 4096 or any(ch.isspace() or ord(ch) < 32 for ch in url):
+    origin = normalize_origin(url)
+    if origin is None:
         return False
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return False
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None:
-        return False
+    parsed = urlsplit(url)
+    port = parsed.port
     if parsed.hostname in ("127.0.0.1", "localhost") and parsed.scheme == "http" and port and port >= 1024:
         return True
-    default = 80 if parsed.scheme == "http" else 443
-    origin = f"{parsed.scheme}://{parsed.hostname}" + (f":{port}" if port and port != default else "")
     return origin in ORIGINS
+
+
+def _finite_float(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RequestError(f"Invalid desktop {name}")
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise RequestError(f"Invalid desktop {name}") from error
+    if not math.isfinite(number):
+        raise RequestError(f"Invalid desktop {name}")
+    return number
 
 
 class Browser:
@@ -106,28 +188,42 @@ class Browser:
         protocol = asyncio.StreamReaderProtocol(self.reader)
         await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, self.read)
 
+    def _evict_session(self, session_id):
+        for target_id, sid in list(self.sessions.items()):
+            if sid == session_id:
+                self.sessions.pop(target_id, None)
+
     async def call(self, method, params=None, session=None, timeout_sec=6):
         self.sequence += 1
         request = {"id": self.sequence, "method": method, "params": params or {}}
         if session:
             request["sessionId"] = session
         payload = json.dumps(request).encode() + b"\0"
-        await asyncio.to_thread(self.write.write, payload)
         async with asyncio.timeout(timeout_sec):
+            await asyncio.to_thread(self.write.write, payload)
             while True:
                 try:
                     raw = await self.reader.readuntil(b"\0")
                 except asyncio.LimitOverrunError as err:
-                    # Drain the oversized message up to the NUL terminator so future CDP calls stay in sync.
+                    # Drain the oversized message up to the NUL terminator without consuming
+                    # bytes belonging to the next CDP frame.
                     await self.reader.readexactly(err.consumed)
                     while True:
-                        chunk = await self.reader.read(65536)
-                        if not chunk or b"\0" in chunk:
+                        try:
+                            await self.reader.readuntil(b"\0")
                             break
+                        except asyncio.LimitOverrunError as drain_err:
+                            await self.reader.readexactly(drain_err.consumed)
                     raise RequestError("Browser response exceeded size limit") from err
                 reply = json.loads(raw[:-1])
+                if reply.get("method") == "Target.detachedFromTarget":
+                    detached = reply.get("params", {}).get("sessionId")
+                    if detached:
+                        self._evict_session(detached)
                 if reply.get("id") == request["id"]:
                     if "error" in reply:
+                        if session is not None:
+                            self._evict_session(session)
                         raise RequestError("Helium rejected a browser operation")
                     return reply["result"]
 
@@ -136,6 +232,21 @@ class Browser:
             reply = await self.call("Target.attachToTarget", {"targetId": target, "flatten": True})
             self.sessions[target] = reply["sessionId"]
         return self.sessions[target]
+
+    async def call_target(self, target, method, params=None, timeout_sec=6):
+        session = await self.session(target)
+        try:
+            return await self.call(method, params, session, timeout_sec=timeout_sec)
+        except (RequestError, TimeoutError):
+            self.sessions.pop(target, None)
+            raise
+
+    async def _target_url(self, target):
+        info = await self.call("Target.getTargetInfo", {"targetId": target})
+        url = info.get("targetInfo", {}).get("url")
+        if not isinstance(url, str):
+            raise RequestError("Unable to determine active page URL")
+        return url
 
     async def tabs(self):
         reply = await self.call("Target.getTargets")
@@ -146,12 +257,12 @@ class Browser:
         for page in pages:
             target = page["targetId"]
             try:
-                state = await self.call("Runtime.evaluate", {
+                state = await self.call_target(target, "Runtime.evaluate", {
                     "expression": "document.visibilityState", "returnByValue": True,
-                }, await self.session(target))
-            except RequestError:
+                }, timeout_sec=1.5)
+            except (RequestError, TimeoutError):
                 continue
-            if state["result"].get("value") == "visible":
+            if state.get("result", {}).get("value") == "visible":
                 self.active = target
                 break
         if self.active not in live:
@@ -172,7 +283,7 @@ class Browser:
         await self.tabs()
         if self.active is None:
             await self.new_tab()
-        result = await self.call("Page.navigate", {"url": url}, await self.session(self.active))
+        result = await self.call_target(self.active, "Page.navigate", {"url": url})
         if result.get("errorText"):
             raise RequestError("Helium navigation failed")
         return {"navigation": "started"}
@@ -181,12 +292,31 @@ class Browser:
         await self.tabs()
         if self.active is None:
             raise RequestError("No active browser tab")
-        result = await self.call("Runtime.evaluate", {"expression": SNAPSHOT, "returnByValue": True},
-                                 await self.session(self.active))
-        page = json.loads(result["result"]["value"])
-        if page["url"] != "about:blank" and not allowed(page["url"]):
+        target = self.active
+        before_url = await self._target_url(target)
+        if before_url != "about:blank" and not allowed(before_url):
             raise RequestError("The active page is outside the allowed browser origins")
-        return page
+        result = await self.call_target(target, "Runtime.evaluate", {
+            "expression": SNAPSHOT,
+            "returnByValue": True,
+        })
+        after_url = await self._target_url(target)
+        if after_url != "about:blank" and not allowed(after_url):
+            raise RequestError("The active page is outside the allowed browser origins")
+        value = result.get("result", {}).get("value")
+        if not isinstance(value, dict):
+            raise RequestError("Unable to snapshot active page")
+        title = value.get("title")
+        text = value.get("text")
+        raw_links = value.get("links")
+        if not isinstance(title, str) or not isinstance(text, str) or not isinstance(raw_links, list):
+            raise RequestError("Unable to snapshot active page")
+        links = [
+            {"label": item["label"][:140], "url": item["url"]}
+            for item in raw_links[:50]
+            if isinstance(item, dict) and isinstance(item.get("label"), str) and isinstance(item.get("url"), str)
+        ]
+        return {"url": after_url, "title": title, "text": text[:10000], "links": links}
 
     async def new_tab(self):
         if len((await self.tabs())["tabs"]) >= 6:
@@ -223,14 +353,22 @@ class Browser:
 class Desktop:
     def __init__(self):
         self.buttons = set()
+        self.frame_lock = asyncio.Lock()
         self.input_lock = asyncio.Lock()
         self.browser_lock = asyncio.Lock()
         self.browser = Browser()
 
     async def release(self):
+        failed = None
         for button in list(self.buttons):
-            await command("xdotool", "mouseup", str(button))
-            self.buttons.discard(button)
+            try:
+                await command("xdotool", "mouseup", str(button))
+            except (RequestError, TimeoutError, OSError) as error:
+                failed = error
+            else:
+                self.buttons.discard(button)
+        if failed is not None:
+            raise failed
         return True
 
     async def input(self, args):
@@ -248,26 +386,28 @@ class Desktop:
                 await self.release()
             return True
         if kind in ("click", "move", "pointer", "scroll"):
-            x, y = int(args["x"]), int(args["y"])
+            x = int(_finite_float(args["x"], "coordinate"))
+            y = int(_finite_float(args["y"], "coordinate"))
             if not 0 <= x < WIDTH or not 0 <= y < HEIGHT:
                 raise RequestError("Pointer is outside the display")
             argv = ["xdotool", "mousemove", str(x), str(y)]
             if kind == "scroll":
-                delta = float(args["delta"])
-                steps = min(10, max(1, int(abs(delta) / 50)))
+                delta = _finite_float(args["delta"], "scroll delta")
+                steps = min(10, max(1, int(min(500.0, abs(delta)) / 50)))
                 argv += ["click", "--repeat", str(steps), "5" if delta > 0 else "4"]
             if kind == "click":
                 argv += ["click", "1"]
             if kind == "pointer":
                 button = args.get("button")
-                if button not in (1, 2, 3) or type(args.get("down")) is not bool:
+                if type(button) is not int or button not in (1, 2, 3) or type(args.get("down")) is not bool:
                     raise RequestError("Invalid mouse button")
+                argv += ["mousedown" if args["down"] else "mouseup", str(button)]
+            await command(*argv)
+            if kind == "pointer":
                 if args["down"]:
                     self.buttons.add(button)
                 else:
                     self.buttons.discard(button)
-                argv += ["mousedown" if args["down"] else "mouseup", str(button)]
-            await command(*argv)
         elif kind == "text":
             text = args["text"]
             if not isinstance(text, str) or not 1 <= len(text.encode()) <= 4096:
@@ -290,9 +430,10 @@ class Desktop:
             request = json.loads(await asyncio.wait_for(reader.readline(), 3))
             op, args = request["operation"], request["arguments"]
             if op == "desktop_frame":
-                frame = await command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "x11grab",
-                                      "-video_size", f"{WIDTH}x{HEIGHT}", "-i", ":0", "-frames:v", "1",
-                                      "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
+                async with self.frame_lock:
+                    frame = await command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "x11grab",
+                                          "-video_size", f"{WIDTH}x{HEIGHT}", "-i", ":0", "-frames:v", "1",
+                                          "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
                 if not frame or len(frame) > 1024 * 1024:
                     raise RequestError("Invalid desktop frame")
                 value = {"width": WIDTH, "height": HEIGHT, "jpeg": base64.b64encode(frame).decode()}
@@ -308,15 +449,22 @@ class Desktop:
             reply = {"value": value}
         except RequestError as error:
             reply = {"error": str(error)}
-        except (TypeError, ValueError, KeyError, AttributeError, OSError, TimeoutError, EOFError, asyncio.LimitOverrunError) as error:
+        except (TypeError, ValueError, OverflowError, KeyError, AttributeError, OSError, TimeoutError, EOFError, asyncio.LimitOverrunError) as error:
             LOG.warning("operation %s failed: %s: %s", op, type(error).__name__, error)
             reply = {"error": "Desktop or browser operation unavailable"}
         try:
             writer.write(json.dumps(reply).encode() + b"\n")
-            await writer.drain()
+            async with asyncio.timeout(3):
+                await writer.drain()
+        except (OSError, TimeoutError) as error:
+            LOG.warning("failed to write reply for %s: %s: %s", op, type(error).__name__, error)
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                async with asyncio.timeout(1):
+                    await writer.wait_closed()
+            except (OSError, TimeoutError):
+                pass
 
 
 async def main():
@@ -342,20 +490,28 @@ async def main():
     desktop.browser.start()
     await desktop.browser.connect()
     await desktop.browser.call("Browser.getVersion", timeout_sec=20)
-    if os.path.exists(SOCKET):
+    try:
         os.unlink(SOCKET)
+    except FileNotFoundError:
+        pass
     server = await asyncio.start_unix_server(desktop.handle, SOCKET, limit=64 * 1024)
     LOG.info("desktop bridge ready on %s", SOCKET)
-    async with server:
-        tasks = [
-            asyncio.create_task(x11.wait()),
-            asyncio.create_task(xfce.wait()),
-            asyncio.create_task(desktop.browser.wait_exit()),
-        ]
-        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-    raise RuntimeError("Desktop session exited")
+    try:
+        async with server:
+            tasks = [
+                asyncio.create_task(x11.wait()),
+                asyncio.create_task(xfce.wait()),
+                asyncio.create_task(desktop.browser.wait_exit()),
+            ]
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+        raise RuntimeError("Desktop session exited")
+    finally:
+        try:
+            os.unlink(SOCKET)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

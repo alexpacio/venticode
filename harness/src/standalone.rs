@@ -123,13 +123,23 @@ async fn connect(
     let (mut sink, mut source) = socket.split();
     let mut labels = roots.keys().collect::<Vec<_>>();
     labels.sort_unstable();
-    sink.send(Message::Text(json!({"type":"inventory", "roots":labels,
-        "host_info":{"os":env::consts::OS,"arch":env::consts::ARCH,"version":env!("CARGO_PKG_VERSION")}
-    }).to_string().into())).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(Message::Text(
+            json!({"type":"inventory", "roots":labels,
+                "host_info":{"os":env::consts::OS,"arch":env::consts::ARCH,"version":env!("CARGO_PKG_VERSION")}
+            })
+            .to_string()
+            .into(),
+        )),
+    )
+    .await
+    .context("Inventory send timed out")??;
     tracing::info!(roots = labels.len(), "connected to Venticode service");
     let runtime = runtime::Runtime::new()?;
     let (reply, mut frames) = mpsc::channel(16);
-    let mut jobs = JoinSet::new();
+    let mut jobs: JoinSet<Uuid> = JoinSet::new();
+    let mut input_jobs: JoinSet<()> = JoinSet::new();
     let mut active: HashMap<Uuid, (tokio::task::AbortHandle, Uuid)> = HashMap::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut heard = tokio::time::Instant::now();
@@ -137,17 +147,24 @@ async fn connect(
         tokio::select! {
             _ = heartbeat.tick() => {
                 ensure!(heard.elapsed() < Duration::from_secs(20), "Server heartbeat timed out");
-                tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Ping(Default::default()))).await??;
+                runtime.evict_idle(Duration::from_secs(600));
+                tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Ping(Default::default())))
+                    .await
+                    .context("Ping send timed out")??;
             }
             Some(frame) = frames.recv() => {
-                tokio::time::timeout(Duration::from_secs(10), sink.send(frame)).await??;
+                tokio::time::timeout(Duration::from_secs(10), sink.send(frame))
+                    .await
+                    .context("Frame send timed out")??;
             }
             Some(job) = jobs.join_next(), if !jobs.is_empty() => {
                 if let Ok(id) = job {
-                    if let Some((_, consent)) = active.remove(&id) {
-                        runtime.release(consent);
-                    }
-                    runtime.release(id);
+                    active.remove(&id);
+                }
+            }
+            Some(res) = input_jobs.join_next(), if !input_jobs.is_empty() => {
+                if let Err(err) = res {
+                    tracing::warn!(error = %err, "input task panicked");
                 }
             }
             frame = source.next() => {
@@ -156,7 +173,12 @@ async fn connect(
                 let text = match frame? {
                     Message::Text(text) => text,
                     Message::Close(_) => break,
-                    Message::Ping(_) => { sink.flush().await?; continue; }
+                    Message::Ping(_) => {
+                        tokio::time::timeout(Duration::from_secs(5), sink.flush())
+                            .await
+                            .context("Pong flush timed out")??;
+                        continue;
+                    }
                     _ => continue,
                 };
                 let Ok(mut frame) = serde_json::from_str::<Value>(&text) else {
@@ -189,18 +211,48 @@ async fn connect(
                         active.insert(id, (handle, consent));
                     }
                     Some("execute") if !active.contains_key(&id) => {
-                        let _ = runtime::output(&reply, id, json!({"type":"error","error":"Harness concurrency limit reached"})).await;
-                        let _ = reply.send(Message::Text(json!({"type":"complete","id":id,"success":false}).to_string().into())).await;
+                        let err_msg = json!({
+                            "type": "output",
+                            "id": id,
+                            "result": {"type": "error", "error": "Harness concurrency limit reached"}
+                        });
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            sink.send(Message::Text(err_msg.to_string().into())),
+                        )
+                        .await
+                        .context("Rejection error send timed out")??;
+                        let complete_msg = json!({"type": "complete", "id": id, "success": false});
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            sink.send(Message::Text(complete_msg.to_string().into())),
+                        )
+                        .await
+                        .context("Rejection complete send timed out")??;
                     }
-                    Some("input") if jobs.len() < 64 => {
+                    Some("input") if input_jobs.len() < 64 => {
                         let runtime = runtime.clone();
                         let reply = reply.clone();
                         let roots = roots.clone();
                         let payload = frame["payload"].take();
-                        jobs.spawn(async move {
-                            let _ = runtime.execute(id, payload, &roots, protocol::Mode::Sandboxed, std::path::Path::new("."), &reply).await;
-                            id
+                        input_jobs.spawn(async move {
+                            if let Err(error) = runtime
+                                .execute(
+                                    id,
+                                    payload,
+                                    &roots,
+                                    protocol::Mode::Sandboxed,
+                                    std::path::Path::new("."),
+                                    &reply,
+                                )
+                                .await
+                            {
+                                tracing::warn!(job_id = %id, error = %error, "input execution failed");
+                            }
                         });
+                    }
+                    Some("input") => {
+                        tracing::warn!(job_id = %id, "dropping input frame: input concurrency limit reached");
                     }
                     Some("cancel") => {
                         if let Some((handle, consent)) = active.remove(&id) {

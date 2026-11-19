@@ -8,8 +8,17 @@ export function Composer({ onSend, onStop, running, disabled, controls, placehol
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [awaitingRun, setAwaitingRun] = useState(false);
   const [error, setError] = useState("");
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const awaitTimer = useRef<number | undefined>(undefined);
+
+  const clearAwaitTimer = () => {
+    if (awaitTimer.current !== undefined) {
+      window.clearTimeout(awaitTimer.current);
+      awaitTimer.current = undefined;
+    }
+  };
 
   useLayoutEffect(() => {
     const el = textarea.current;
@@ -17,6 +26,15 @@ export function Composer({ onSend, onStop, running, disabled, controls, placehol
     el.style.height = "auto";
     el.style.height = `${Math.min(240, Math.max(48, el.scrollHeight))}px`;
   }, [text]);
+
+  useEffect(() => {
+    if (running) {
+      clearAwaitTimer();
+      setAwaitingRun(false);
+    }
+  }, [running]);
+
+  useEffect(() => () => clearAwaitTimer(), []);
 
   useEffect(() => {
     if (!running || !onStop) return;
@@ -29,12 +47,27 @@ export function Composer({ onSend, onStop, running, disabled, controls, placehol
     return () => window.removeEventListener("keydown", onKey);
   }, [running, onStop]);
 
+  const submitting = busy || awaitingRun;
+
   const send = async () => {
     const value = text.trim();
-    if (!value || busy || running || disabled) return;
+    if (!value || submitting || running || disabled) return;
     setBusy(true);
     setError("");
-    try { await onSend(value); setText(""); } catch (failure) { setError((failure as Error).message); } finally { setBusy(false); }
+    try {
+      await onSend(value);
+      setText("");
+      clearAwaitTimer();
+      setAwaitingRun(true);
+      awaitTimer.current = window.setTimeout(() => {
+        awaitTimer.current = undefined;
+        setAwaitingRun(false);
+      }, 5_000);
+    } catch (failure) {
+      setError((failure as Error).message);
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <div className="composer-wrap">
@@ -52,8 +85,8 @@ export function Composer({ onSend, onStop, running, disabled, controls, placehol
           {running ? (
             <button type="button" className="send stop" title={t("Interrompi")} aria-label={t("Interrompi")} onClick={onStop}><Square size={14} fill="currentColor" aria-hidden="true" /></button>
           ) : (
-            <button className="send" title={t("Invia")} aria-label={t("Invia")} disabled={!text.trim() || busy || Boolean(disabled)}>
-              {busy ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowUp size={18} aria-hidden="true" />}
+            <button className="send" title={t("Invia")} aria-label={t("Invia")} disabled={!text.trim() || submitting || Boolean(disabled)}>
+              {submitting ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowUp size={18} aria-hidden="true" />}
             </button>
           )}
         </div>

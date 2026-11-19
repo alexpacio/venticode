@@ -4,7 +4,11 @@ use axum::{
     response::{Html, Redirect},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::VecDeque, sync::Mutex, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+    time::Instant,
+};
 use subtle::ConstantTimeEq;
 
 pub(super) struct Standalone {
@@ -16,7 +20,7 @@ pub(super) struct Standalone {
     pub workspace: Uuid,
     pub user: Uuid,
     login_hash: [u8; 32],
-    failed_logins: Mutex<VecDeque<Instant>>,
+    failed_logins: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl Standalone {
@@ -96,9 +100,43 @@ impl Standalone {
         Ok(())
     }
 
-    fn record_failed_login(&self) -> bool {
-        let mut attempts = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
+    fn client_bucket(h: &HeaderMap) -> String {
+        if let Some(xff) = h.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+            && let Some(first) = xff
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return first.chars().take(64).collect();
+        }
+        if let Some(ip) = h
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.chars().take(64).collect();
+        }
+        "default".into()
+    }
+
+    fn record_failed_login(&self, h: &HeaderMap) -> bool {
+        let key = Self::client_bucket(h);
+        let mut map = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = Instant::now() - Duration::from_secs(60);
+        if map.len() >= 1024 {
+            map.retain(|_, q| {
+                while q.front().is_some_and(|t| *t < cutoff) {
+                    q.pop_front();
+                }
+                !q.is_empty()
+            });
+            if map.len() >= 1024 {
+                map.clear();
+            }
+        }
+        let attempts = map.entry(key).or_default();
         while attempts.front().is_some_and(|t| *t < cutoff) {
             attempts.pop_front();
         }
@@ -109,9 +147,13 @@ impl Standalone {
         false
     }
 
-    fn login_rate_limited(&self) -> bool {
-        let mut attempts = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
+    fn login_rate_limited(&self, h: &HeaderMap) -> bool {
+        let key = Self::client_bucket(h);
+        let mut map = self.failed_logins.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = Instant::now() - Duration::from_secs(60);
+        let Some(attempts) = map.get_mut(&key) else {
+            return false;
+        };
         while attempts.front().is_some_and(|t| *t < cutoff) {
             attempts.pop_front();
         }
@@ -143,7 +185,7 @@ impl Standalone {
     async fn active_session(&self, app: &App, h: &HeaderMap) -> Result<(String, bool)> {
         let hash = self.session_hash(h)?;
         let (delegated, needs_refresh): (bool, bool) = sqlx::query_as(
-            "SELECT bot_grant IS NOT NULL, bot_grant IS NULL AND expires_at < now()+interval '6 hours' FROM standalone_sessions WHERE token_hash=$1 AND workspace=$2 AND owner_id=$3 AND expires_at>now()",
+            "SELECT bot_grant IS NOT NULL, bot_grant IS NULL AND expires_at < now()+interval '6 hours' FROM standalone_sessions WHERE token_hash=$1 AND workspace=$2 AND owner_id=$3 AND expires_at>now() AND absolute_expires_at>now()",
         )
         .bind(&hash)
         .bind(self.workspace)
@@ -153,7 +195,7 @@ impl Standalone {
         .ok_or_else(unauthorized)?;
         if needs_refresh {
             let _ = sqlx::query(
-                "UPDATE standalone_sessions SET expires_at=now()+interval '12 hours' WHERE token_hash=$1 AND bot_grant IS NULL",
+                "UPDATE standalone_sessions SET expires_at=LEAST(now()+interval '12 hours', absolute_expires_at) WHERE token_hash=$1 AND bot_grant IS NULL",
             )
             .bind(&hash)
             .execute(&app.db)
@@ -298,12 +340,12 @@ fn login_page(h: &HeaderMap, failed: bool) -> Html<String> {
         )
     };
     let notice = if failed {
-        format!("<p role=alert>{error}</p>")
+        format!(r#"<p class="error" role="alert">{error}</p>"#)
     } else {
         String::new()
     };
     Html(format!(
-        r#"<!doctype html><html lang="{lang}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>body{{font:1rem system-ui;color:#172135;background:#f4f6fa;display:grid;place-items:center;min-height:90vh}}main{{width:min(24rem,85vw)}}form{{display:grid;gap:.75rem}}input,button{{font:inherit;padding:.7rem}}button{{background:#1b4dae;color:white;border:0;border-radius:.4rem}}p{{color:#9e231f}}</style><main><h1>{title}</h1>{notice}<form method="post" action="/venticode/login"><label for="token">{token}</label><input id="token" name="token" type="password" autocomplete="current-password" maxlength="1024" required><button>{button}</button></form></main></html>"#
+        r#"<!doctype html><html lang="{lang}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>:root{{color-scheme:light;--bg:#f5f4f0;--surface:#ffffff;--ink:#111318;--muted:#5d6066;--line:#d5d6d3;--accent:#f5a83f;--accent-ink:#16181b;--bad:#ac3039;--bad-soft:#fcebed}}@media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--bg:#0e0f11;--surface:#16181b;--ink:#f2f0eb;--muted:#b7b5ae;--line:#32373d;--bad:#ff8c95;--bad-soft:#321f23}}}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,"Segoe UI",system-ui,sans-serif}}main{{width:min(24rem,100%);background:var(--surface);border:1px solid var(--line);padding:24px;display:flex;flex-direction:column;gap:16px}}.mark{{width:32px;height:32px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font:600 13px ui-monospace,Consolas,monospace}}h1{{margin:0;font-size:20px;font-weight:600;letter-spacing:-.01em}}form{{display:grid;gap:12px}}label{{font-size:13px;color:var(--muted)}}input{{font:inherit;padding:10px 12px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:0;width:100%}}input:focus-visible,button:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}button{{font:600 14px/1 inherit;min-height:42px;padding:0 16px;background:var(--accent);color:var(--accent-ink);border:0;border-radius:0;cursor:pointer}}button:hover{{filter:brightness(1.06)}}.error{{margin:0;padding:10px 12px;font-size:13px;color:var(--bad);background:var(--bad-soft);border:1px solid var(--bad)}}</style><main><div class="mark" aria-hidden="true">&gt;_</div><h1>{title}</h1>{notice}<form method="post" action="/venticode/login"><label for="token">{token}</label><input id="token" name="token" type="password" autocomplete="current-password" maxlength="1024" required autofocus><button type="submit">{button}</button></form></main></html>"#
     ))
 }
 
@@ -319,7 +361,7 @@ pub(super) async fn login(
 ) -> Result<Response> {
     let local = app.standalone.as_ref().ok_or_else(missing)?;
     local.validate_host(&h, true)?;
-    if local.login_rate_limited() {
+    if local.login_rate_limited(&h) {
         tracing::warn!("standalone login rate limit reached");
         return Err(Error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -333,7 +375,7 @@ pub(super) async fn login(
                 .ct_eq(Sha256::digest(body.token.as_bytes()).as_slice()),
         )
     {
-        local.record_failed_login();
+        local.record_failed_login(&h);
         tracing::warn!("standalone login rejected: invalid access token");
         return Ok((StatusCode::UNAUTHORIZED, login_page(&h, true)).into_response());
     }
