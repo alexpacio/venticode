@@ -24,8 +24,10 @@ bridge controls its DevTools pipe through a private local socket.
 
 The workload chart takes immutable registry digests. Use the Venticode
 service and connector images from the same release as the chart. Obtain the
-Kitesurf image from the Ventic distribution's `deploy/kitesurf/Dockerfile`
-or its matching published artifact.
+Kitesurf image from `deploy/kitesurf/Dockerfile` (build it from the
+repository root with `docker build -f deploy/kitesurf/Dockerfile .`; it pins
+the upstream Kitesurf revision and compiles it with Bazel) or its matching
+published artifact.
 
 ## Qualify a worker pool
 

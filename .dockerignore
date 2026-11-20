@@ -10,6 +10,10 @@
 !harness/src/**
 !update/
 !update/update.rs
+!deploy/kitesurf/
+!deploy/kitesurf/package.json
+!deploy/kitesurf/package-lock.json
+!deploy/kitesurf/serve.mjs
 !harness/terminal/
 !harness/terminal/Cargo.toml
 !harness/terminal/src/

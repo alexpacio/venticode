@@ -1,0 +1,8 @@
+{
+  "name": "venticode-kitesurf-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "miniflare": "5.20260911.1-alpha"
+  }
+}
