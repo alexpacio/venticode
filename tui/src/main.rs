@@ -8,6 +8,8 @@ mod nav;
 mod platform;
 mod screens;
 mod store;
+#[path = "../../update/update.rs"]
+mod update;
 mod view;
 
 use anyhow::{Context, Result, anyhow};
@@ -199,6 +201,7 @@ fn print_help() {
         ),
         ("--ticket-stdin", "Read the one-time code from stdin"),
         ("--ca <PEM>", "Additional PEM root CA certificate"),
+        ("--no-update", "Do not check for a newer release"),
         ("--version, -V", "Print version information"),
         ("--help, -h", "Show this help"),
     ] {
@@ -220,6 +223,60 @@ fn next_flag_value(
     }
 }
 
+async fn fetch(cx: &Cx, url: String, timeout: Duration) -> Result<Vec<u8>> {
+    let res = asupersync::http::h1::HttpClient::builder()
+        .no_cookie_store()
+        .build()
+        .request_with_timeout(
+            cx,
+            asupersync::http::h1::Method::Get,
+            &url,
+            Vec::new(),
+            Vec::new(),
+            timeout,
+        )
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    if res.status != 200 {
+        return Err(anyhow!("{url}: HTTP {}", res.status));
+    }
+    Ok(res.body)
+}
+
+/// Install a newer release over this binary and relaunch it; failures never block the app.
+async fn self_update(cx: &Cx, console: &Console, en: bool) {
+    let current = env!("CARGO_PKG_VERSION");
+    match update::check("venticode-tui", current, |url, t| fetch(cx, url, t)).await {
+        Ok(Some(done)) => {
+            console.print(&format!(
+                "[green]{}[/]",
+                if en {
+                    format!(
+                        "Updated venticode-tui {current} -> {}, restarting.",
+                        done.version
+                    )
+                } else {
+                    format!(
+                        "Aggiornato venticode-tui {current} -> {}, riavvio.",
+                        done.version
+                    )
+                }
+            ));
+            let err = update::restart(&done);
+            console.print(&format!("[yellow]Restart failed: {err}[/]"));
+        }
+        Ok(None) => {}
+        Err(err) => console.print(&format!(
+            "[dim]{}[/]",
+            if en {
+                format!("Update check skipped: {err:#}")
+            } else {
+                format!("Controllo aggiornamenti non riuscito: {err:#}")
+            }
+        )),
+    }
+}
+
 async fn run_cli(cx: Cx) -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut portal = None;
@@ -230,6 +287,7 @@ async fn run_cli(cx: Cx) -> Result<()> {
     let mut manual = false;
     let mut ca = None;
     let mut en = false;
+    let mut updates = true;
     while let Some(arg) = args.next() {
         let (flag, inline) = arg
             .split_once('=')
@@ -255,6 +313,7 @@ async fn run_cli(cx: Cx) -> Result<()> {
                 )?));
             }
             "--en" => en = true,
+            "--no-update" => updates = false,
             "--version" | "-V" => {
                 println!("venticode-tui {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -272,6 +331,9 @@ async fn run_cli(cx: Cx) -> Result<()> {
         ));
     }
     let console = Console::new();
+    if updates {
+        self_update(&cx, &console, en).await;
+    }
     let portal = match portal.or_else(|| standalone.clone()) {
         Some(value) if standalone.is_some() => value,
         Some(value) => origin(&value)?,

@@ -24,8 +24,9 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE ./
 ARG CARGO_BUILD_JOBS=2
 COPY server server
 COPY harness harness
+COPY update update
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/build/target,sharing=locked \
-    find server harness -type f -exec touch '{}' + && cargo build --workspace --locked --release -j "$CARGO_BUILD_JOBS" && cp target/release/venticode /venticode && cp target/release/venticode-harness /venticode-harness
+    find server harness update -type f -exec touch '{}' + && cargo build --workspace --locked --release -j "$CARGO_BUILD_JOBS" && cp target/release/venticode /venticode && cp target/release/venticode-harness /venticode-harness
 
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=service /venticode /venticode

@@ -8,6 +8,8 @@
 !harness/Cargo.toml
 !harness/src/
 !harness/src/**
+!update/
+!update/update.rs
 !harness/terminal/
 !harness/terminal/Cargo.toml
 !harness/terminal/src/

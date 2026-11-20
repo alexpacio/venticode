@@ -13,6 +13,8 @@ mod url_read;
 #[cfg(target_os = "linux")]
 mod managed;
 mod standalone;
+#[path = "../../update/update.rs"]
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -22,6 +22,9 @@ zune-jpeg = "0.5"
 unicode-segmentation = "1"
 ftui = { version = "=0.9.0", default-features = false, features = ["runtime", "crossterm"] }
 ftui-extras = { version = "=0.9.0", default-features = false, features = ["markdown"] }
+minisign-verify = "0.3.0"
+sha2 = "0.10"
+semver = "1"
 
 [profile.release]
 strip = true

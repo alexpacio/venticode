@@ -51,3 +51,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 ventiharness-terminal = { path = "terminal" }
 which = "8"
 zeroize = "1"
+minisign-verify = "0.3.0"

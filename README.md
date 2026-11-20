@@ -32,6 +32,8 @@ deploying them. A maintainer's merge is optional.
 | `web/` | Page that hosts the WebAssembly terminal; `web/src/api/schema.ts` is generated |
 | `server/` | Rust HTTP service, PostgreSQL schema and encrypted S3 event storage |
 | `harness/` | `venticode-harness`, the native remote runner for project tools, terminals, sub-agents and MCP |
+| `update/update.rs` | Self-update code shared by `venticode-tui` and `venticode-harness` |
+| `deploy/update/` | `publish.sh` uploads a signed release manifest and the `install.sh` / `install.ps1` one-line installers to S3 |
 | `connector/` | Apache Camel loopback transport for Slack, Telegram and GitLab |
 | `dev/mock.ts` | Synthetic in-memory API used for development and tests |
 
@@ -92,6 +94,38 @@ origin and the webhook URL shown in the connection. The connector uses
 `https://gitlab.com` by default. Set `GITLAB_ORIGIN` on the connector for a
 self-managed GitLab instance. Bot replies and tool approvals continue through
 the workspace review flow.
+
+## Self-update
+
+The native `venticode-tui` and `venticode-harness run` check a signed manifest
+on S3 and replace themselves when it lists a newer version. The browser
+terminal and the managed Kubernetes harness never update this way.
+
+1. Create a key once: `minisign -G`. Keep the secret key out of the repository.
+2. Publish: `PUBLIC_URL=https://bucket.s3.eu-west-1.amazonaws.com/venticode MINISIGN_KEY=minisign.key MINISIGN_PUB=minisign.pub deploy/update/publish.sh packages s3://bucket/venticode`,
+   where `packages/<platform>/` holds the four platforms' binaries.
+   The bucket (or a CDN in front of it) must serve the objects over HTTPS without credentials.
+   The script also uploads `install.sh` and `install.ps1`, stamped with the manifest URL and public key.
+3. Users install with one line, and the installer writes an `update.json` next to the binaries so they find the manifest later:
+   - Linux and macOS: `curl -fsSL $PUBLIC_URL/install.sh | sh` (add `-s -- tui` or `-s -- harness` for one binary; installs to `~/.local/bin`, or `VENTICODE_INSTALL_DIR`).
+   - Windows: `irm $PUBLIC_URL/install.ps1 | iex` (installs to `%LOCALAPPDATA%\Programs\venticode` and adds it to the user PATH).
+
+   The installers check the manifest signature when `minisign` is installed; otherwise they rely on HTTPS plus the manifest's sha256 for that first install. Installed binaries always check the signature on later updates.
+
+Where a binary finds the manifest, first match wins: `VENTICODE_UPDATE_URL` and
+`VENTICODE_UPDATE_PUBKEY`, then `update.json` beside the executable, then values
+baked in at build time with the same variable names.
+
+The manifest is `{"version", "artifacts": {platform: {binary: {"url", "sha256"}}}}`
+with a detached `manifest.json.minisig`. A binary installs an update only if the
+signature verifies against its public key, the version is newer than its own and
+the sha256 matches. Without a URL and key, updating is off. Set
+`VENTICODE_NO_UPDATE=1` (or pass `--no-update` to the TUI) to skip the check.
+
+The TUI checks at launch and relaunches itself with the same arguments. The
+harness checks at launch and, at most hourly, between connections to the
+service, so a connection that stays up never triggers an update. The binary's
+directory must be writable by the user running it.
 
 ## Kubernetes computers
 

@@ -31,6 +31,29 @@ async fn shutdown_signal() {
     }
 }
 
+async fn fetch(url: String, timeout: Duration) -> Result<Vec<u8>> {
+    let res = reqwest_mcp::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(res.bytes().await?.to_vec())
+}
+
+/// Install a newer release over this binary and relaunch it; failures never stop the harness.
+async fn self_update() {
+    match crate::update::check("venticode-harness", env!("CARGO_PKG_VERSION"), fetch).await {
+        Ok(Some(done)) => {
+            tracing::info!(version = %done.version, "venticode-harness updated, restarting");
+            tracing::error!(error = %crate::update::restart(&done), "restart failed");
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error = %format!("{error:#}"), "update check skipped"),
+    }
+}
+
 pub async fn run() -> Result<()> {
     let origin = env::var("VENTICODE_SERVER_URL").context("Set VENTICODE_SERVER_URL")?;
     let mut url = url::Url::parse(&origin)?;
@@ -79,7 +102,16 @@ pub async fn run() -> Result<()> {
         grants.len()
     ));
     let mut attempt = 0u32;
+    let mut checked: Option<tokio::time::Instant> = None;
     loop {
+        // Between connections no job is running, so this is a safe moment to restart.
+        if checked.is_none_or(|at| at.elapsed() > Duration::from_secs(3600)) {
+            checked = Some(tokio::time::Instant::now());
+            tokio::select! {
+                _ = shutdown_signal() => return Ok(()),
+                _ = self_update() => {}
+            }
+        }
         let started = tokio::time::Instant::now();
         tokio::select! {
             _ = shutdown_signal() => {
