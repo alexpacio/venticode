@@ -557,21 +557,93 @@ async fn work(
     }
 }
 
-fn system_message(mode: &str, use_tools: bool, bot: Option<&Value>) -> Value {
+/// One-line summaries for the tool list, in pi_agent_rust's wording.
+const TOOL_SUMMARIES: &[(&str, &str)] = &[
+    ("read", "Read file contents"),
+    ("bash", "Execute shell commands (ls, grep, find, etc.)"),
+    (
+        "edit",
+        "Make surgical edits to files (find exact text and replace)",
+    ),
+    ("write", "Create or overwrite files"),
+    (
+        "grep",
+        "Search file contents for patterns (respects .gitignore)",
+    ),
+    ("ls", "List directory contents"),
+    (
+        "project_tool",
+        "Run other project operations (find files, mkdir, rename, remove, terminals, agents, MCP)",
+    ),
+    (
+        "update_tasks",
+        "Replace the task list shown in this conversation",
+    ),
+];
+
+fn tool_names(defs: &Value) -> Vec<&str> {
+    defs.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect()
+}
+
+/// System prompt laid out like pi_agent_rust's default: identity, available
+/// tools, guidelines that depend on which tools are enabled, then the date.
+fn system_message(mode: &str, tools: &[&str], bot: Option<&Value>) -> Value {
     let mut prompt = String::from(include_str!("conversation-prompt.txt").trim_end());
-    let guidance = match (use_tools, mode) {
-        (false, _) => {
-            "This model has no tools. Work from the conversation. If you need project contents or test output, ask the user for the specific missing input."
+    let has = |name: &str| tools.contains(&name);
+    if tools.is_empty() {
+        prompt.push_str("\n\nThis model has no tools. Work from the conversation. If you need project contents or test output, ask the user for the specific missing input.");
+    } else {
+        let list: Vec<String> = TOOL_SUMMARIES
+            .iter()
+            .filter(|(name, _)| has(name))
+            .map(|(name, summary)| format!("- {name}: {summary}"))
+            .collect();
+        let list = if list.is_empty() {
+            "(none)".to_owned()
+        } else {
+            list.join("\n")
+        };
+        prompt.push_str(&format!("\n\nAvailable tools:\n{list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."));
+        let mut guidelines = Vec::new();
+        if has("bash") && !has("grep") && !has("ls") {
+            guidelines.push("Use bash for file operations like ls, rg, find");
+        } else if has("bash") {
+            guidelines.push(
+                "Prefer grep/ls tools over bash for file exploration (faster, respects .gitignore)",
+            );
         }
-        (true, "plan") => {
+        if has("read") && has("edit") {
+            guidelines.push("Use read to examine files before editing. You must use this tool instead of cat or sed.");
+        }
+        if has("edit") {
+            guidelines.push("Use edit for precise changes (old text must match exactly)");
+        }
+        if has("write") {
+            guidelines.push("Use write only for new files or complete rewrites");
+        }
+        if has("edit") || has("write") {
+            guidelines.push("When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did");
+        }
+        guidelines.push(if mode == "plan" {
             "Plan mode is active. Use the available evidence to propose concrete steps and verification. Leave project changes for an implementation turn."
-        }
-        (true, _) => {
-            "Use the declared tools when the request needs project work. Inspect the relevant files first, preserve existing changes, and verify the requested behavior with a focused check when available."
-        }
-    };
-    prompt.push_str("\n\n");
-    prompt.push_str(guidance);
+        } else {
+            "Inspect the relevant files first, preserve existing changes, and verify the requested behavior with a focused check when available"
+        });
+        guidelines.push("Be concise in your responses");
+        guidelines.push("Show file paths clearly when working with files");
+        prompt.push_str("\n\nGuidelines:\n");
+        prompt.push_str(
+            &guidelines
+                .iter()
+                .map(|g| format!("- {g}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
     if let Some(extra) = bot
         .and_then(|b| b["instructions"].as_str())
         .map(str::trim)
@@ -580,6 +652,11 @@ fn system_message(mode: &str, use_tools: bool, bot: Option<&Value>) -> Value {
         prompt.push_str("\n\nInstructions configured for this bot connection:\n");
         prompt.push_str(extra);
     }
+    // Date only, as in pi: a clock time would change the prompt every turn.
+    prompt.push_str(&format!(
+        "\nCurrent date: {}",
+        chrono::Utc::now().format("%Y-%m-%d")
+    ));
     json!({"role":"system","content":prompt})
 }
 
@@ -725,7 +802,16 @@ async fn generate_turns(
         let mut calls = std::collections::BTreeMap::<u64, (String, String, String)>::new();
         let mut answer = String::new();
         let bot = crate::mentions::bot_context(app, id).await?;
-        messages[0] = system_message(mode, use_tools, bot.as_ref());
+        let mut tool_defs = Value::Null;
+        if use_tools {
+            tool_defs = tools::definitions(mode, bot.as_ref(), app.standalone.is_some());
+            tools::runtime_definitions(&mut tool_defs, mode, bot.as_ref(), vision, model_access);
+            if bot.is_none() {
+                tools::file_functions(&mut tool_defs, mode);
+                crate::agent::actions(&mut tool_defs, mode, goal);
+            }
+        }
+        messages[0] = system_message(mode, &tool_names(&tool_defs), bot.as_ref());
         if goal && bot.is_none() && use_tools && mode != "plan" {
             let instruction = messages[0]["content"].as_str().unwrap_or_default();
             messages[0]["content"] = json!(format!(
@@ -741,18 +827,7 @@ async fn generate_turns(
             request["reasoning_effort"] = json!(effort);
         }
         if use_tools {
-            request["tools"] = tools::definitions(mode, bot.as_ref(), app.standalone.is_some());
-            tools::runtime_definitions(
-                &mut request["tools"],
-                mode,
-                bot.as_ref(),
-                vision,
-                model_access,
-            );
-            if bot.is_none() {
-                tools::file_functions(&mut request["tools"], mode);
-                crate::agent::actions(&mut request["tools"], mode, goal);
-            }
+            request["tools"] = tool_defs;
             request["parallel_tool_calls"] = json!(bot.is_none());
         }
         let mut stream = inference::infer(app, h, &request).await?;
@@ -1105,5 +1180,34 @@ mod tests {
         assert!(batches[0].0 && batches[0].1.len() == 2);
         assert!(!batches[1].0 && batches[1].1.len() == 1);
         assert!(batches[2].0 && batches[2].1.len() == 2);
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_lists_enabled_tools_with_matching_guidelines() {
+        let prompt = system_message("ask", &["read", "edit", "bash", "grep"], None);
+        let text = prompt["content"].as_str().unwrap();
+        assert!(text.contains("Available tools:\n- read: Read file contents\n- bash:"));
+        assert!(text.contains("- Use read to examine files before editing."));
+        assert!(text.contains("- Prefer grep/ls tools over bash"));
+        assert!(!text.contains("Use write only"));
+        assert!(text.contains("Current date: "));
+        let bare = system_message("ask", &[], None);
+        assert!(
+            bare["content"]
+                .as_str()
+                .unwrap()
+                .contains("This model has no tools")
+        );
+        assert!(
+            !bare["content"]
+                .as_str()
+                .unwrap()
+                .contains("Available tools")
+        );
     }
 }

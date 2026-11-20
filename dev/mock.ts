@@ -312,6 +312,25 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       project.created_at = now();
       return ok(project, 201);
     }
+    if ((m = p.match(/^\/projects\/([^/]+)\/imports$/)) && (method === "GET" || method === "POST")) {
+      const project = projects.find((x) => x.id === m![1]);
+      if (!project) return fail(404, "Progetto non trovato / Project not found");
+      // Synthetic sessions only: the mock never reads real Claude Code or Codex logs.
+      const sessions = [
+        { id: "claude:mock-session", source: "Claude Code", title: "Sistema il test che fallisce", modified_ms: Date.now() - 3600000 },
+        { id: "codex:mock-rollout", source: "Codex", title: "Run the test suite", modified_ms: Date.now() - 86400000 },
+      ];
+      if (method === "GET") return ok({ items: sessions });
+      const session = sessions.find((s) => s.id === body.id);
+      if (!session) return fail(422, "Sessione non trovata / Session not found");
+      const conversation = addConversation(project, `${session.source} · ${session.title}`, 0);
+      push(conversation.id, { type: "user_message", message_id: "import-1", content: session.title });
+      push(conversation.id, { type: "tool_call", call_id: "import-t1", operation: "Bash", arguments: { command: "make test" }, target: "make test" });
+      push(conversation.id, { type: "tool_output", call_id: "import-t1", data: "1 failed\n" });
+      push(conversation.id, { type: "tool_result", call_id: "import-t1", status: "error", summary: "Failed in the imported session" });
+      push(conversation.id, { type: "text", message_id: "import-2", delta: "One test fails." });
+      return ok(conversation, 201);
+    }
     if ((m = p.match(/^\/projects\/([^/]+)$/)) && method === "DELETE") {
       const index = projects.findIndex((x) => x.id === m![1]);
       if (index < 0) return fail(404, "Progetto non trovato / Project not found");

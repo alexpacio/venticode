@@ -9,10 +9,10 @@ help:
 	  'make generate   regenerate web/src/api/schema.ts from api/openapi.yaml' \
 	  'make dev        run the synthetic mock API and the web app with HMR' \
 	  'make build      production build of the web app into web/dist' \
-	  'make test       mock, transcript and translation tests' \
+	  'make test       mock, palette and font tests' \
 	  'make check      generate, type check, tests and build' \
 	  'make demo-tui-web  serve the WebAssembly terminal and browser demos on loopback' \
-	  'make check-tui  format, lint and test the Rust terminal client' \
+	  'make check-tui  format, lint and test the terminal client and its WebAssembly build' \
 	  'make build-tui-windows  build the Windows x64 binary with the MSVC toolchain'
 
 setup:
@@ -36,7 +36,7 @@ build:
 	npm --prefix web run build
 
 test:
-	node --test dev/mock.test.ts web/src/transcript.test.ts web/src/i18n/catalog.test.ts
+	node --test dev/mock.test.ts web/src/palette.test.ts web/src/font.test.ts
 
 check:
 	@before=$$(sha256sum web/src/api/schema.ts); $(MAKE) --no-print-directory generate >/dev/null; \
@@ -61,6 +61,8 @@ check-tui:
 	cd tui && cargo fmt --check
 	cd tui && cargo clippy --release --locked --all-targets -- -D warnings
 	cd tui && cargo test --release --locked
+	cd tui/browser && cargo fmt --check
+	cd tui/browser && cargo clippy --target wasm32-unknown-unknown --release --locked -- -D warnings
 
 build-tui-windows:
 	cd tui && cargo build --release --locked --target x86_64-pc-windows-msvc

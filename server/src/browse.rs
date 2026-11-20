@@ -47,7 +47,12 @@ pub(super) async fn list(
 /// computer, standalone or control-plane runner) and return the `list_files`
 /// result value. Mirrors `computer::rpc` but keeps the caller's headers so the
 /// control-plane path can authorize the request. Cancels the request on failure.
-async fn browse(app: &App, h: &HeaderMap, execute: &Value, request_id: Uuid) -> Result<Value> {
+pub(super) async fn browse(
+    app: &App,
+    h: &HeaderMap,
+    execute: &Value,
+    request_id: Uuid,
+) -> Result<Value> {
     crate::tools::relay(app, h, execute.clone()).await?;
     let outcome = tokio::time::timeout(BROWSE_TIMEOUT, async {
         let mut after = 0i64;
@@ -66,7 +71,7 @@ async fn browse(app: &App, h: &HeaderMap, execute: &Value, request_id: Uuid) -> 
                             StatusCode::UNPROCESSABLE_ENTITY,
                             frame["result"]["error"]
                                 .as_str()
-                                .unwrap_or("Directory listing failed")
+                                .unwrap_or("Harness request failed")
                                 .to_owned(),
                         ));
                     }

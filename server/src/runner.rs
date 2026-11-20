@@ -166,6 +166,7 @@ impl Runner {
                 let path = body["project_path"].as_str().ok_or_else(bad)?;
                 if !crate::projects::relative(path)
                     || !(crate::tools::is_project_operation(operation)
+                        || crate::tools::is_import_operation(operation)
                         || body["managed"] == true && crate::computer::is_operation(operation))
                 {
                     return Err(bad());

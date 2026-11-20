@@ -4,6 +4,7 @@ pub(super) fn routes() -> Router<App> {
     Router::new()
         .route("/projects", get(list).post(create))
         .route("/projects/{id}", delete(remove))
+        .route("/projects/{id}/imports", get(foreign_sessions).post(import))
         .route("/conversations", get(conversations).post(start))
         .route(
             "/conversations/{id}",
@@ -183,7 +184,11 @@ async fn start(
     Json(body): Json<NewConversation>,
 ) -> Result<impl IntoResponse> {
     let m = Member::load(&app, &h, true).await?;
-    validate(body.title.as_deref(), body.permission_mode.as_deref(), body.effort.as_deref())?;
+    validate(
+        body.title.as_deref(),
+        body.permission_mode.as_deref(),
+        body.effort.as_deref(),
+    )?;
     let model = model(&app, &h, body.model.as_deref()).await?;
     let mut tx = app.db.begin().await?;
     let row=sqlx::query("SELECT harness_id,root FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3 FOR SHARE")
@@ -250,10 +255,18 @@ async fn update(
 ) -> Result<Json<Value>> {
     let m = Member::load(&app, &h, true).await?;
     owned(&app, &m, id).await?;
-    if body.title.is_none() && body.permission_mode.is_none() && body.model.is_none() && body.effort.is_none() {
+    if body.title.is_none()
+        && body.permission_mode.is_none()
+        && body.model.is_none()
+        && body.effort.is_none()
+    {
         return Err(bad());
     }
-    validate(body.title.as_deref(), body.permission_mode.as_deref(), body.effort.as_deref())?;
+    validate(
+        body.title.as_deref(),
+        body.permission_mode.as_deref(),
+        body.effort.as_deref(),
+    )?;
     if let Some(name) = &body.model {
         model(&app, &h, Some(name)).await?;
     }
@@ -309,4 +322,163 @@ mod tests {
             assert!(!relative(p));
         }
     }
+}
+
+const MAX_IMPORTED_EVENTS: usize = 20_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Import {
+    id: String,
+}
+
+/// Run an import operation on the project's harness, scoped to the project folder.
+async fn foreign(
+    app: &App,
+    h: &HeaderMap,
+    m: &Member,
+    project: Uuid,
+    operation: &str,
+    arguments: Value,
+) -> Result<Value> {
+    let row = sqlx::query(
+        "SELECT harness_id,root,path FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3",
+    )
+    .bind(m.workspace)
+    .bind(m.user)
+    .bind(project)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or_else(missing)?;
+    let harness: Uuid = row
+        .get::<Option<Uuid>, _>("harness_id")
+        .ok_or_else(missing)?;
+    let root: String = row.get("root");
+    m.harness(harness, &root)?;
+    let request_id = Uuid::new_v4();
+    let execute = json!({
+        "action": "execute", "request_id": request_id, "project_id": project,
+        "harness_id": harness, "root": root, "project_path": row.get::<String, _>("path"),
+        "operation": operation, "arguments": arguments,
+    });
+    crate::browse::browse(app, h, &execute, request_id).await
+}
+
+/// `GET /projects/{id}/imports` — Claude Code and Codex sessions recorded for this project.
+async fn foreign_sessions(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let m = Member::load(&app, &h, false).await?;
+    let value = foreign(&app, &h, &m, id, "foreign_sessions", json!({})).await?;
+    let items: Vec<Value> = value["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            Some(json!({
+                "id": i["id"].as_str().filter(|s| s.len() <= 512)?,
+                "source": i["source"].as_str()?,
+                "title": i["title"].as_str().unwrap_or_default().chars().take(200).collect::<String>(),
+                "modified_ms": i["modified_ms"].as_u64().unwrap_or(0),
+            }))
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// The harness is outside the trust boundary: keep only known event shapes and fields.
+fn imported_event(e: &Value) -> Option<Value> {
+    let s = |k: &str| e[k].as_str();
+    let kind = s("type")?;
+    Some(match kind {
+        "user_message" => {
+            json!({"type":kind,"message_id":s("message_id")?,"content":s("content")?})
+        }
+        "text" | "reasoning" => {
+            json!({"type":kind,"message_id":s("message_id")?,"delta":s("delta")?})
+        }
+        "tool_call" => json!({"type":kind,"call_id":s("call_id")?,"operation":s("operation")?,
+            "arguments":Value::Object(e["arguments"].as_object()?.clone()),"target":s("target").unwrap_or_default()}),
+        "tool_output" => json!({"type":kind,"call_id":s("call_id")?,"data":s("data")?}),
+        "tool_result" => json!({"type":kind,"call_id":s("call_id")?,
+            "status":s("status").filter(|v| matches!(*v, "ok" | "error"))?,"summary":s("summary").unwrap_or_default()}),
+        _ => return None,
+    })
+}
+
+/// `POST /projects/{id}/imports` — import one listed session as a new conversation.
+async fn import(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(project): Path<Uuid>,
+    Json(body): Json<Import>,
+) -> Result<impl IntoResponse> {
+    let m = Member::load(&app, &h, true).await?;
+    if body.id.is_empty() || body.id.len() > 512 {
+        return Err(bad());
+    }
+    let value = foreign(
+        &app,
+        &h,
+        &m,
+        project,
+        "foreign_session_import",
+        json!({"id": body.id}),
+    )
+    .await?;
+    let events: Vec<Value> = value["events"]
+        .as_array()
+        .ok_or_else(unavailable)?
+        .iter()
+        .take(MAX_IMPORTED_EVENTS)
+        .filter_map(imported_event)
+        .collect();
+    if events.is_empty() {
+        return Err(bad());
+    }
+    let source = value["source"].as_str().unwrap_or("Import");
+    let first = value["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let title: String = format!(
+        "{source} · {}",
+        first.unwrap_or("sessione importata / imported session")
+    )
+    .chars()
+    .take(200)
+    .collect();
+    let model = model(&app, &h, None).await?;
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO conversations(id,project_id,title,model,effort,permission_mode) VALUES($1,$2,$3,$4,'medium','ask')")
+        .bind(id).bind(project).bind(&title).bind(model).execute(&app.db).await?;
+    let mut objects = Vec::with_capacity(events.len() + 1);
+    use futures_util::StreamExt;
+    let mut staged =
+        futures_util::stream::iter(events.into_iter().map(|e| crate::runs::stage(&app, id, e)))
+            .buffered(16);
+    while let Some(object) = staged.next().await {
+        objects.push(object?);
+    }
+    drop(staged);
+    if value["truncated"] == true {
+        objects.push(crate::runs::stage(&app, id, json!({"type":"text","message_id":"import-truncated",
+            "delta":"[Importazione troncata: la sessione è troppo grande / Import truncated: the session is too large]"})).await?);
+    }
+    let mut tx = app.db.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    for object in objects {
+        crate::runs::append(&mut tx, id, object).await?;
+    }
+    let item: Value = sqlx::query_scalar("SELECT document FROM conversation_json WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(item)))
 }

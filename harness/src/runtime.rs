@@ -378,6 +378,20 @@ impl Runtime {
                 let cwd = tokio::task::spawn_blocking(move || files_dir.directory(&path)).await??;
                 return self.terminal(id, &request, cwd, tx).await;
             }
+            "foreign_sessions" | "foreign_session_import" => {
+                let files = files.clone();
+                let id = args["id"].as_str().unwrap_or_default().to_owned();
+                let list = request.operation == "foreign_sessions";
+                tokio::task::spawn_blocking(move || {
+                    let cwd = files.directory(".")?;
+                    if list {
+                        Ok(crate::foreign::list(&cwd))
+                    } else {
+                        crate::foreign::import(&cwd, &id)
+                    }
+                })
+                .await??
+            }
             "agent_list" => {
                 tokio::task::spawn_blocking(|| {
                     json!({

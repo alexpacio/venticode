@@ -4,8 +4,7 @@ COPY tui/rust-toolchain.toml ./
 RUN rustup show active-toolchain && rustup target add wasm32-unknown-unknown && cargo install wasm-bindgen-cli --version 0.2.129 --locked
 COPY tui/browser/Cargo.toml tui/browser/Cargo.lock browser/
 COPY tui/browser/src browser/src
-COPY tui/browser/screen browser/screen
-COPY tui/src/editor.rs tui/src/view.rs src/
+COPY tui/src/app.rs tui/src/editor.rs tui/src/nav.rs tui/src/screens.rs tui/src/view.rs src/
 COPY web/build-terminal.sh /build/web/
 RUN --mount=type=cache,target=/usr/local/cargo/registry sh /build/web/build-terminal.sh
 

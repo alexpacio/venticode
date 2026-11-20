@@ -54,7 +54,6 @@ pub fn position(rows: &[Row], caret: usize) -> (usize, usize) {
     (index, display_width(&row.text[..caret - row.start]))
 }
 
-#[cfg(any(not(target_arch = "wasm32"), test))]
 pub fn vertical(text: &str, caret: usize, width: usize, down: bool) -> Option<usize> {
     let rows = rows(text, width);
     let (index, col) = position(&rows, caret);

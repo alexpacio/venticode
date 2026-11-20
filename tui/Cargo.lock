@@ -3445,6 +3445,8 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -3,10 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
     <title>Venticode</title>
+    <link rel="icon" href="/src/design/assets/ventic-icon.svg" type="image/svg+xml" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <main class="terminal" aria-label="Venticode">
+      <div id="screen" class="screen" role="application" aria-roledescription="terminal"></div>
+      <span class="cell-ruler" aria-hidden="true">M</span>
+      <div class="cursor" hidden></div>
+      <img class="remote" alt="" hidden />
+      <textarea class="keys" aria-label="Venticode" autocapitalize="off" autocomplete="off" spellcheck="false"></textarea>
+      <p class="boot" role="status">Venticode…</p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

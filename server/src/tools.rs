@@ -29,6 +29,12 @@ const TOOL_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(900);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
 const PREVIEW_MAX_CHARS: usize = 1024;
 
+/// Session import reads Claude Code/Codex logs for the project folder. Only the
+/// import endpoints dispatch these; `policy` rejects them, so the model cannot.
+pub(super) fn is_import_operation(op: &str) -> bool {
+    matches!(op, "foreign_sessions" | "foreign_session_import")
+}
+
 pub(super) fn is_project_operation(op: &str) -> bool {
     READ.contains(&op) || EDIT.contains(&op) || ACTION.contains(&op) || LOCAL_MCP.contains(&op)
 }
@@ -217,37 +223,37 @@ const FILE_FUNCTIONS: &[(&str, &str, &str, &[&str])] = &[
     (
         "read",
         "read_file",
-        "Read a UTF-8 project file before editing it. Optional start_line and end_line select a 1-based line range.",
+        "Read the contents of a file. For large files, use start_line and end_line (1-based) to read a range.",
         &["path"],
     ),
     (
         "write",
         "write_file",
-        "Create a project file with the supplied contents.",
+        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. The parent folder must already exist.",
         &["path", "content"],
     ),
     (
         "edit",
         "edit_file",
-        "Replace one unique exact piece of text. Read the original file first. Optional expected_sha256 guards against concurrent changes.",
+        "Edit a file by replacing exact text. The oldText must match exactly (including whitespace) and be unique in the file. Use this for precise, surgical edits. Optional expected_sha256 guards against concurrent changes.",
         &["path", "oldText", "newText"],
     ),
     (
         "ls",
         "list_files",
-        "List entries under a project-relative directory. Omit path for the project root.",
+        "List directory contents. Paths are relative to the project folder; omit path for the project root.",
         &[],
     ),
     (
         "grep",
         "search_files",
-        "Find occurrences of query in project files. Set regex to true for regular expressions.",
+        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Set regex to true for regular expressions.",
         &["query"],
     ),
     (
         "bash",
         "execute",
-        "Execute a command with the project host's native shell and return its actual output and exit status.",
+        "Execute a command in the project folder with the host's native shell. Returns stdout, stderr and the exit status.",
         &["command"],
     ),
 ];

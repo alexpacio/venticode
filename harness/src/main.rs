@@ -1,5 +1,6 @@
 mod agents;
 mod config;
+mod foreign;
 mod mcp;
 mod oauth;
 mod protocol;

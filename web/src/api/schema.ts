@@ -255,6 +255,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/projects/{id}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List Claude Code and Codex sessions recorded for the project folder
+         * @description The project's harness reads the Claude Code (~/.claude/projects) and Codex (~/.codex/sessions) logs on its host and returns only sessions whose working directory is this project's folder, newest first.
+         */
+        get: operations["listForeignSessions"];
+        put?: never;
+        /**
+         * Import a listed session as a new conversation
+         * @description Converts the session into transcript events. Completed tool exchanges stay tool calls; calls without a recorded result are closed as failed history and are never executed.
+         */
+        post: operations["importForeignSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/conversations": {
         parameters: {
             query?: never;
@@ -642,6 +668,13 @@ export interface components {
             directory: boolean;
             symlink: boolean;
             bytes: number;
+        };
+        ForeignSession: {
+            id: string;
+            /** @enum {string} */
+            source: "Claude Code" | "Codex";
+            title: string;
+            modified_ms: number;
         };
         DirectoryListing: {
             items: components["schemas"]["DirectoryEntry"][];
@@ -1379,6 +1412,66 @@ export interface operations {
             200: components["responses"]["Deleted"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    listForeignSessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Importable sessions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["ForeignSession"][];
+                    };
+                };
+            };
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    importForeignSession: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    id: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Conversation created from the imported session */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Conversation"];
+                };
+            };
+            400: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     listConversations: {

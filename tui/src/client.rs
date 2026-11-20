@@ -16,14 +16,27 @@ pub enum StreamUpdate {
     Event(Value),
     Status(String),
     AuthExpired(String),
-    Fatal(anyhow::Error),
+    Fatal(String),
+}
+
+pub enum SocketEvent {
+    Text(String),
+    Binary(Vec<u8>),
+    Closed,
+}
+
+/// Everything background tasks report to the UI loop.
+pub enum Update {
+    Stream(String, StreamUpdate),
+    Socket(u64, SocketEvent),
 }
 
 #[derive(Clone)]
 pub struct Remote {
     client: HttpClient,
     pub workspace: String,
-    cookie: String,
+    pub(crate) cookie: String,
+    pub(crate) ca: Option<std::path::PathBuf>,
 }
 
 pub fn origin(input: &str) -> Result<String> {
@@ -157,6 +170,7 @@ impl Remote {
             client,
             workspace,
             cookie,
+            ca: ca.map(std::path::Path::to_path_buf),
         })
     }
 
@@ -215,7 +229,7 @@ impl Remote {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Sign-in request failed: {e}"))?;
-        Self::authenticated(client, workspace, res.status, &res.headers)
+        Self::authenticated(client, workspace, res.status, &res.headers, ca)
     }
 
     pub async fn connect(
@@ -246,7 +260,7 @@ impl Remote {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Bootstrap request failed: {e}"))?;
-        Self::authenticated(client, workspace, res.status, &res.headers)
+        Self::authenticated(client, workspace, res.status, &res.headers, ca)
     }
 
     fn authenticated(
@@ -254,6 +268,7 @@ impl Remote {
         workspace: String,
         status: u16,
         headers: &[(String, String)],
+        ca: Option<&std::path::Path>,
     ) -> Result<Self> {
         ensure!(status == 303, "Sign-in failed ({status})");
         let raw = headers
@@ -267,6 +282,7 @@ impl Remote {
             client,
             workspace,
             cookie: raw,
+            ca: ca.map(std::path::Path::to_path_buf),
         })
     }
 
@@ -337,7 +353,7 @@ impl Remote {
         id: String,
         start_cursor: i64,
         en: bool,
-        tx: Sender<(String, StreamUpdate)>,
+        tx: Sender<Update>,
     ) {
         let mut cursor: i64 = start_cursor;
         let mut backoff_secs: u64 = 1;
@@ -352,12 +368,20 @@ impl Remote {
                 FollowOutcome::Cancelled => break,
                 FollowOutcome::AuthExpired(msg) => {
                     let _ = tx
-                        .send(&cx, (id.clone(), StreamUpdate::AuthExpired(msg)))
+                        .send(
+                            &cx,
+                            Update::Stream(id.clone(), StreamUpdate::AuthExpired(msg)),
+                        )
                         .await;
                     break;
                 }
                 FollowOutcome::Fatal(error) => {
-                    let _ = tx.send(&cx, (id.clone(), StreamUpdate::Fatal(error))).await;
+                    let _ = tx
+                        .send(
+                            &cx,
+                            Update::Stream(id.clone(), StreamUpdate::Fatal(error.to_string())),
+                        )
+                        .await;
                     break;
                 }
                 FollowOutcome::Reconnect(reason) => {
@@ -371,7 +395,9 @@ impl Remote {
                     } else {
                         format!("Stream interrotto ({reason}); riconnessione tra {secs}s…")
                     };
-                    let _ = tx.send(&cx, (id.clone(), StreamUpdate::Status(msg))).await;
+                    let _ = tx
+                        .send(&cx, Update::Stream(id.clone(), StreamUpdate::Status(msg)))
+                        .await;
                     sleep(wall_now(), delay).await;
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
@@ -385,7 +411,7 @@ impl Remote {
         id: &str,
         cursor: &mut i64,
         en: bool,
-        tx: &Sender<(String, StreamUpdate)>,
+        tx: &Sender<Update>,
         backoff_secs: &mut u64,
     ) -> FollowOutcome {
         let mut headers = self.auth_headers();
@@ -431,7 +457,10 @@ impl Remote {
         }
         *backoff_secs = 1;
         let _ = tx
-            .send(cx, (id.to_owned(), StreamUpdate::Status(String::new())))
+            .send(
+                cx,
+                Update::Stream(id.to_owned(), StreamUpdate::Status(String::new())),
+            )
             .await;
 
         let mut parser = SseParser::default();
@@ -471,7 +500,7 @@ impl Remote {
                     "Frame stream troppo grande ignorato".to_owned()
                 };
                 let _ = tx
-                    .send(cx, (id.to_owned(), StreamUpdate::Status(msg)))
+                    .send(cx, Update::Stream(id.to_owned(), StreamUpdate::Status(msg)))
                     .await;
             }
             for ev in parsed.events {
@@ -494,7 +523,7 @@ impl Remote {
                             format!("Evento stream non valido ignorato ({err})")
                         };
                         let _ = tx
-                            .send(cx, (id.to_owned(), StreamUpdate::Status(msg)))
+                            .send(cx, Update::Stream(id.to_owned(), StreamUpdate::Status(msg)))
                             .await;
                         continue;
                     }
@@ -506,7 +535,7 @@ impl Remote {
                         "Evento stream senza sequenza ignorato".to_owned()
                     };
                     let _ = tx
-                        .send(cx, (id.to_owned(), StreamUpdate::Status(msg)))
+                        .send(cx, Update::Stream(id.to_owned(), StreamUpdate::Status(msg)))
                         .await;
                     continue;
                 };
@@ -515,7 +544,7 @@ impl Remote {
                 }
                 *cursor = seq;
                 if tx
-                    .send(cx, (id.to_owned(), StreamUpdate::Event(v)))
+                    .send(cx, Update::Stream(id.to_owned(), StreamUpdate::Event(v)))
                     .await
                     .is_err()
                 {

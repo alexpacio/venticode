@@ -342,6 +342,60 @@ paths:
         '200': { $ref: '#/components/responses/Deleted' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+  /projects/{id}/imports:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: listForeignSessions
+      tags: [inventory]
+      summary: List Claude Code and Codex sessions recorded for the project folder
+      description: >
+        The project's harness reads the Claude Code (~/.claude/projects) and
+        Codex (~/.codex/sessions) logs on its host and returns only sessions
+        whose working directory is this project's folder, newest first.
+      responses:
+        '200':
+          description: Importable sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ForeignSession' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: importForeignSession
+      tags: [inventory]
+      summary: Import a listed session as a new conversation
+      description: >
+        Converts the session into transcript events. Completed tool exchanges
+        stay tool calls; calls without a recorded result are closed as failed
+        history and are never executed.
+      parameters:
+        - $ref: '#/components/parameters/Origin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id]
+              properties:
+                id: { type: string, minLength: 1, maxLength: 512 }
+      responses:
+        '201':
+          description: Conversation created from the imported session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
   /conversations:
     get:
       operationId: listConversations
@@ -897,6 +951,15 @@ components:
         directory: { type: boolean }
         symlink: { type: boolean }
         bytes: { type: integer }
+    ForeignSession:
+      type: object
+      additionalProperties: false
+      required: [id, source, title, modified_ms]
+      properties:
+        id: { type: string, maxLength: 512 }
+        source: { type: string, enum: [Claude Code, Codex] }
+        title: { type: string, maxLength: 200 }
+        modified_ms: { type: integer, minimum: 0 }
     DirectoryListing:
       type: object
       additionalProperties: false

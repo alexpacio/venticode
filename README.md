@@ -1,9 +1,10 @@
 # Venticode
 
 Venticode is a coding and bot agent that runs independently or as part of the
-Ventic distribution. It works
-like Claude Code in the browser: machines running venticode-harness appear in an
-inventory on the left, each with project folders and their conversations. The
+Ventic distribution. It looks and works like Claude Code, in the terminal and
+in the browser: one terminal UI, built natively and as WebAssembly. Machines
+running venticode-harness appear in a tree on the left, each with project
+folders and their conversations. The
 agent runs files, commands, terminals, sub-agents and MCP tools on the harness,
 asking for permission per tool call. The same agent can answer `@ventic`
 mentions in Slack, Telegram and GitLab, holding any write for review.
@@ -26,7 +27,9 @@ deploying them. A maintainer's merge is optional.
 | Path | Contents |
 |---|---|
 | `api/openapi.yaml` | Browser API contract (source of truth) |
-| `web/` | Ventic workspace shell and WebAssembly terminal; `web/src/api/schema.ts` is generated |
+| `tui/` | `venticode-tui`: the terminal UI core (`tui/src`) and its console client |
+| `tui/browser/` | WebAssembly build of the same core for the browser |
+| `web/` | Page that hosts the WebAssembly terminal; `web/src/api/schema.ts` is generated |
 | `server/` | Rust HTTP service, PostgreSQL schema and encrypted S3 event storage |
 | `harness/` | `venticode-harness`, the native remote runner for project tools, terminals, sub-agents and MCP |
 | `connector/` | Apache Camel loopback transport for Slack, Telegram and GitLab |
@@ -106,7 +109,7 @@ make setup   # install web dependencies
 make dev     # mock API on :4189, app with HMR on http://127.0.0.1:4175
 ```
 
-Open http://127.0.0.1:4175 and choose **Accesso di sviluppo**. The mock seeds
+Open http://127.0.0.1:4175 and press `d` for the development sign-in. The mock seeds
 three harnesses (one offline), project folders, a finished conversation and an
 `@ventic` bot with one reply held for review. Every run is scripted: it lists
 and reads files, asks to edit (in "Ask before edits" mode), asks to run
@@ -118,58 +121,99 @@ Other targets: `make generate` (types from the contract), `make test`,
 
 ## Terminal client
 
+The same terminal UI runs in a console and in the browser. Its core
+(`tui/src/app.rs`, `nav.rs`, `screens.rs`, `view.rs`) holds every screen and
+API call. Only the transport differs: in the console, asupersync HTTP, SSE and
+WebSockets; in the browser, fetch, EventSource and WebSocket.
+
 From `tui/`, run `cargo run --release --locked` and enter the HTTPS URL of
 your Ventic portal. Add `-- --en` for English. Rustup selects the nightly
-pinned in that directory for the FrankenTUI runtime. Prompts, tools and
-streamed responses use the authenticated remote Venticode workspace.
+pinned in that directory for the FrankenTUI runtime.
 
-At startup, select a project with the arrow keys if prompted. The first
-message creates a conversation. F2 lists conversations in the selected
-project, and F3 switches projects. If there are no projects, selecting a
-granted harness folder creates the first one.
+The layout follows Claude Code. Each conversation opens with a welcome box.
+Replies show behind `●`, tools as `Bash(cargo test)` with `⎿` results and
+diffs, and the prompt sits in a rounded box. Permission requests are numbered
+prompts: 1 allow, 2 allow for the project, 3 or Esc deny. Questions and
+finished plans are numbered prompts too. Shift+Tab cycles the permission mode
+(ask, accept edits, plan). `/` opens the command menu, `?` lists shortcuts,
+and Esc interrupts a run.
+
+The left pane is a tree with these items:
+
+- Remote browser, remote desktop and bot connections.
+- Projects with their conversations, and conversations without a project.
+- Harnesses with their granted folders and files.
+- Bots with their mentions.
+
+The right pane shows details of the highlighted item. Otherwise it shows the
+session: context use, todos, changed files, and the harness with its MCP
+servers. Tab moves focus from the prompt to the tree and then to the screen.
+F2 jumps to the current project, F3 to the harnesses, and F4 shows or hides
+the panes. In the tree, use the arrow keys (or h/j/k/l) to move, Enter to
+open, `/` to search conversations, and these keys:
+
+- `n`: start a conversation in a project, or create a project on a folder.
+- `a` on a harness: add a project with a root, subfolder and name.
+- `d`: delete a project or conversation (asks first).
+- `o` on a harness: open the portal's harness page.
+- `e`: pause or resume a bot.
+- `a` or `x` on a mention: approve or discard a reply held for review.
+- `r`: reload.
+
+The right pane appears at 130 columns or more. Below 90 columns the tree
+uses the full screen while it has focus.
+
+Opening a bot shows its mentions and, for administrators, its settings:
+state, environment, triggers, tool policies (←→ to change), instructions and
+reply limit. **Bot connections** lists Slack, Telegram and GitLab bindings.
+From there you can link or unlink your account, replace credentials,
+disconnect, or add a connection.
 
 ### Browser frontend
 
-The workspace homepage, project pages and conversation links use the same
-FrankenTUI WebAssembly renderer as the loopback preview. Workspace navigation
-and accessible browser controls use Ventic design-system 1.3.1 tokens and
-self-hosted fonts from ventic-frontend revision
-`ad0bb2d94c70cfa5e37bbdc5853aaaa2450427f3`. The terminal retains its own palette.
-The browser follows the Venticode handoff and transcript protocol in
-ventic-common and uses this repository's OpenAPI contract.
+The browser shows the WebAssembly build of the terminal UI directly. The page
+(`web/index.html`, `web/src/main.ts`) only paints the cells and forwards keys,
+paste, mouse and resize events. Sign-in, deep links (`/c/<id>`, `/p/<id>`,
+`/bots/<id>`, `/connections`, `/browser`, `/computer`) and sign-out are
+handled by the same core. The grid self-hosts JetBrains Mono plus a small Noto
+symbol fallback (regenerate it with `web/scripts/build-symbols-font.py`). The
+palette mirrors the `Ansi256` constants in `tui/src/view.rs`.
+`web/src/palette.test.ts` and `web/src/font.test.ts` pin both.
 
-For local frontend builds, run `make setup`. From `tui/browser/`, run
+For local frontend builds, run `make setup`. Then run
 `rustup target add wasm32-unknown-unknown` and
 `cargo install wasm-bindgen-cli --version 0.2.129 --locked`.
 The web build generates the bindings and bundles the WebAssembly module.
 The Docker build prepares its own compiler and bindings generator.
 
-Run `make demo-tui-web` to serve the compiled workspace UI with the
-loopback-only synthetic API. Open `http://127.0.0.1:4287/__dev/login`
-for a demo session. Stopping the server discards demo conversations.
+Run `make demo-tui-web` to serve the compiled app with the loopback-only
+synthetic API, open `http://127.0.0.1:4287` and press Enter to sign in.
+Stopping the server discards demo conversations.
 
-### Remote browser
+### Remote browser and desktop
 
 In a Ventic workspace with the Kitesurf pilot enabled, open **Remote browser**
-in the Venticode sidebar and select **Start Kitesurf**. The egui WebAssembly
-viewer projects live pixels from Kitesurf's active tab as Motion JPEG over
-the workspace WebSocket. Select **Take
-control** to click, scroll, type, paste, open a URL, or switch tabs. Select
-**Give control back** to resume a paused assistant task. The **End session**
-button closes the browser. Selecting a saved conversation opens a fresh
-browser with its previous messages.
+in the tree and press Enter to start Kitesurf. Before starting, ←→ picks a
+saved conversation. The active tab streams as Motion JPEG over the workspace
+WebSocket. In the browser the real frames are drawn over the terminal cells.
+In a console they are drawn as colored half blocks. Type in the prompt to ask
+the browser assistant; its replies appear in the right pane. Tab to the
+screen, then:
 
-From the desktop terminal client, enter `/browser` to launch the same
-workspace page in your system browser. The terminal also prints the URL for
-headless use. If the web session has expired, the Ventic portal signs you in
-and opens the viewer. The browser worker and WebSocket are both self-hosted.
+- `c`: take control.
+- `o`: open a URL.
+- `n`: open a new tab.
+- `1`–`9`: switch tabs.
+- `x`: end the session.
 
-To try this locally, run `make demo-tui-web` and open
-`http://127.0.0.1:4287/__dev/login?browser=1`. Start the session and ask
-`What is the status of release 2.18.4?`. Take control, click the **Release
-note** field, type a note and save it. Switch to the **Metrics** tab and give
-control back. The demo uses scripted assistant replies and an interactive
-synthetic screen with no external network calls from the mock.
+With control, keys and clicks go to the remote screen; Ctrl+] or F12 hands
+control back. **Remote desktop** works the same way for the Ubuntu computer
+runtime.
+
+To try the remote browser locally, run `make demo-tui-web`, open
+`http://127.0.0.1:4287/browser` and press Enter. Ask
+`What is the status of release 2.18.4?`, then take control and switch tabs.
+The demo uses scripted replies and a synthetic screen.
 
 ## API summary
 
