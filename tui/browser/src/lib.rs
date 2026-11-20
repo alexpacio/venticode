@@ -23,6 +23,11 @@ struct App {
     question: String,
     plan: String,
     scroll: u16,
+    // Mouse-selection fields (unused in the browser build; required by view::draw).
+    body_top: u16,
+    body_height: u16,
+    body_texts: Vec<String>,
+    sel: Option<(u16, u16)>,
 }
 impl App {
     fn msg<'a>(&self, it: &'a str, en: &'a str) -> &'a str {

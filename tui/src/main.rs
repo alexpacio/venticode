@@ -13,7 +13,7 @@ use asupersync::time::{sleep, wall_now};
 use client::{Remote, StreamUpdate, origin};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use rich_rust::prelude::*;
@@ -30,6 +30,10 @@ const MAX_PATCHES: usize = 200;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_EVENTS_PER_FRAME: usize = 32;
 const REPLAY_BELL_GRACE: Duration = Duration::from_millis(500);
+/// Pasted payloads longer than this are collapsed to a `[Pasted N chars]`
+/// placeholder so the editor stays readable.  The full text is still sent
+/// with the message.
+const PASTE_COLLAPSE_THRESHOLD: usize = 2048;
 
 const COMMANDS: &[&str] = &[
     "/help",
@@ -43,6 +47,7 @@ const COMMANDS: &[&str] = &[
     "/rename",
     "/diff",
     "/copy",
+    "/paste",
     "/reconnect",
     "/plan",
     "/goal",
@@ -102,6 +107,39 @@ fn entries(items: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn read_clipboard() -> Option<String> {
+    arboard::Clipboard::new()
+        .and_then(|mut clip| clip.get_text())
+        .ok()
+}
+
+/// Replace `[Pasted N chars]` placeholders in `input` with their full payloads.
+/// Markers are `(byte_offset, payload_index)` pairs in the order they appear.
+/// Offsets are adjusted as we go because expansion changes string length.
+fn expand_pasted(input: &str, markers: &[(usize, usize)], payloads: &[String]) -> String {
+    if markers.is_empty() || payloads.is_empty() {
+        return input.to_owned();
+    }
+    let mut result = String::with_capacity(input.len());
+    let mut last = 0usize;
+    for &(offset, idx) in markers {
+        if offset < last || offset > input.len() || idx >= payloads.len() {
+            continue;
+        }
+        result.push_str(&input[last..offset]);
+        result.push_str(&payloads[idx]);
+        // Skip the placeholder text itself (up to the closing bracket).
+        let after = &input[offset..];
+        if let Some(end) = after.find(']') {
+            last = offset + end + 1;
+        } else {
+            last = offset;
+        }
+    }
+    result.push_str(&input[last..]);
+    result
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -313,6 +351,15 @@ struct App {
     browse: Option<Browse>,
     /// One-shot: run_ui opens the browse picker after a /folder command.
     open_browse: bool,
+    /// Screen layout of the transcript body, set during draw and read by the
+    /// mouse event handler to map clicks to transcript rows.
+    body_top: u16,
+    body_height: u16,
+    /// Plain text of each visible transcript row (post-render, for copy).
+    body_texts: Vec<String>,
+    /// Active text selection as (start_row, end_row) in body-relative coords,
+    /// inclusive.  Set by mouse drag, consumed on mouse-up to copy.
+    sel: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1043,8 +1090,8 @@ impl App {
                 ));
             }
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder (sfoglia) · /folder N radice percorso · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti/sfoglia · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
-                "/projects · /use N · /harnesses · /folder (browse) · /folder N root path · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects/browse · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
+                "/projects · /use N · /harnesses · /folder (sfoglia) · /folder N radice percorso · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /paste · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti/sfoglia · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Ctrl+V incolla · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
+                "/projects · /use N · /harnesses · /folder (browse) · /folder N root path · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /paste · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects/browse · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Ctrl+V paste · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
             )),
             "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model"
                 if argument.is_empty() =>
@@ -1308,6 +1355,12 @@ async fn run_ui(
     let mut caret = 0;
     let mut parked_draft = String::new();
     let mut hide_menu = false;
+    // Collapsed paste payloads: the full text of each `[Pasted N chars]`
+    // placeholder currently in the editor, in placeholder order.
+    let mut pasted_payloads: Vec<String> = Vec::new();
+    // Byte offset + payload index for each placeholder in `app.input`, so
+    // `expand_pasted` can substitute the full text back at send time.
+    let mut paste_markers: Vec<(usize, usize)> = Vec::new();
     use ftui::widgets::spinner::DOTS;
     let mut last_tick = Instant::now();
     let mut frame = 0;
@@ -1368,11 +1421,59 @@ async fn run_ui(
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::ScrollUp => {
                         app.scroll = app.scroll.saturating_add(3);
+                        app.sel = None;
                         dirty = true;
                     }
                     MouseEventKind::ScrollDown => {
                         app.scroll = app.scroll.saturating_sub(3);
+                        app.sel = None;
                         dirty = true;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        // Begin a selection if the click lands in the transcript
+                        // body (not the header, status, menu or editor rows).
+                        let row = m.row.saturating_sub(app.body_top);
+                        if m.row >= app.body_top
+                            && row < app.body_height
+                            && !app.body_texts.is_empty()
+                        {
+                            app.sel = Some((row, row));
+                            dirty = true;
+                        } else {
+                            app.sel = None;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some((start, _)) = app.sel {
+                            let row = m
+                                .row
+                                .saturating_sub(app.body_top)
+                                .min(app.body_height.saturating_sub(1));
+                            app.sel = Some((start, row));
+                            dirty = true;
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some((start, end)) = app.sel {
+                            let (lo, hi) = if start <= end {
+                                (start as usize, end as usize)
+                            } else {
+                                (end as usize, start as usize)
+                            };
+                            let text = app
+                                .body_texts
+                                .get(lo..=hi)
+                                .map(|rows| rows.join("\n"))
+                                .unwrap_or_default();
+                            if !text.trim().is_empty() {
+                                copy_to_clipboard(&text);
+                                app.note(
+                                    app.msg("Testo copiato negli appunti", "Copied to clipboard"),
+                                );
+                            }
+                            app.sel = None;
+                            dirty = true;
+                        }
                     }
                     _ => {}
                 },
@@ -1382,8 +1483,22 @@ async fn run_ui(
                     }
                     let text = clean(&paste.replace("\r\n", "\n").replace('\r', "\n"))
                         .replace('\t', "    ");
-                    app.input.insert_str(caret, &text);
-                    caret += text.len();
+                    // Long pastes collapse to a `[Pasted N chars]` placeholder in
+                    // the editor.  The full text is stored in `pasted_payloads` and
+                    // substituted back when the message is sent.
+                    if text.chars().count() > PASTE_COLLAPSE_THRESHOLD {
+                        let n = text.chars().count();
+                        pasted_payloads.push(text);
+                        let idx = pasted_payloads.len() - 1;
+                        let placeholder = format!("[Pasted {n} chars]");
+                        app.input.insert_str(caret, &placeholder);
+                        caret += placeholder.len();
+                        // Stash the index so `expand_pasted` can find it at send time.
+                        paste_markers.push((caret - placeholder.len(), idx));
+                    } else {
+                        app.input.insert_str(caret, &text);
+                        caret += text.len();
+                    }
                     hide_menu = false;
                     dirty = true;
                 }
@@ -1404,6 +1519,30 @@ async fn run_ui(
                     match k.code {
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             break 'ui;
+                        }
+                        KeyCode::Char('v') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Some terminals send Ctrl+V as a key event rather than
+                            // a bracketed paste.  Read the system clipboard directly.
+                            if picker.is_none() {
+                                if let Some(text) = read_clipboard() {
+                                    let text = clean(&text.replace("\r\n", "\n").replace('\r', "\n"))
+                                        .replace('\t', "    ");
+                                    if text.chars().count() > PASTE_COLLAPSE_THRESHOLD {
+                                        let n = text.chars().count();
+                                        pasted_payloads.push(text);
+                                        let idx = pasted_payloads.len() - 1;
+                                        let placeholder = format!("[Pasted {n} chars]");
+                                        app.input.insert_str(caret, &placeholder);
+                                        caret += placeholder.len();
+                                        paste_markers.push((caret - placeholder.len(), idx));
+                                    } else {
+                                        app.input.insert_str(caret, &text);
+                                        caret += text.len();
+                                    }
+                                    hide_menu = false;
+                                    app.note(app.msg("Testo incollato dagli appunti", "Pasted from clipboard"));
+                                }
+                            }
                         }
                         KeyCode::F(2) | KeyCode::F(3) => match app.refresh(cx).await {
                             Ok(()) => {
@@ -1635,7 +1774,60 @@ async fn run_ui(
                                     .to_owned();
                                 continue;
                             }
+                            // `/paste` reads the system clipboard and inserts its
+                            // content into the editor (same collapse rule as
+                            // terminal bracketed paste).  It never sends a message.
+                            if line == "/paste" {
+                                app.status.clear();
+                                app.input.clear();
+                                caret = 0;
+                                paste_markers.clear();
+                                pasted_payloads.clear();
+                                match read_clipboard() {
+                                    Some(text) => {
+                                        let text = clean(&text.replace("\r\n", "\n").replace('\r', "\n"))
+                                            .replace('\t', "    ");
+                                        if text.chars().count() > PASTE_COLLAPSE_THRESHOLD {
+                                            let n = text.chars().count();
+                                            pasted_payloads.push(text);
+                                            let idx = pasted_payloads.len() - 1;
+                                            let placeholder = format!("[Pasted {n} chars]");
+                                            app.input.insert_str(caret, &placeholder);
+                                            caret += placeholder.len();
+                                            paste_markers.push((caret - placeholder.len(), idx));
+                                        } else {
+                                            app.input.insert_str(caret, &text);
+                                            caret += text.len();
+                                        }
+                                        app.note(
+                                            app.msg("Testo incollato dagli appunti", "Pasted from clipboard"),
+                                        );
+                                    }
+                                    None => {
+                                        app.status = app
+                                            .msg(
+                                                "Impossibile leggere gli appunti",
+                                                "Could not read clipboard",
+                                            )
+                                            .to_owned();
+                                    }
+                                }
+                                hide_menu = false;
+                                continue;
+                            }
                             app.status.clear();
+                            // Expand any collapsed `[Pasted N chars]` placeholders
+                            // back to their full text before sending.  We only
+                            // expand when the line is being sent as a message (not
+                            // a slash command), and we clear the buffers after.
+                            let line = if !paste_markers.is_empty() && !line.starts_with('/') {
+                                let expanded = expand_pasted(&app.input, &paste_markers, &pasted_payloads);
+                                paste_markers.clear();
+                                pasted_payloads.clear();
+                                expanded
+                            } else {
+                                line
+                            };
                             match app.command(cx, &line).await {
                                 Ok(quit) => {
                                     if quit {
@@ -1652,6 +1844,8 @@ async fn run_ui(
                                     app.scroll = 0;
                                     hide_menu = false;
                                     caret = 0;
+                                    paste_markers.clear();
+                                    pasted_payloads.clear();
                                 }
                                 Err(e) => app.status = e.to_string(),
                             }
@@ -1969,6 +2163,10 @@ async fn run_cli(cx: Cx) -> Result<()> {
             tx,
             browse: None,
             open_browse: false,
+            body_top: 0,
+            body_height: 0,
+            body_texts: Vec::new(),
+            sel: None,
         },
         rx,
         start,
@@ -2045,6 +2243,10 @@ mod tests {
             tx,
             browse: None,
             open_browse: false,
+            body_top: 0,
+            body_height: 0,
+            body_texts: Vec::new(),
+            sel: None,
         }
     }
 
@@ -2147,5 +2349,42 @@ mod tests {
         let len_after = buf.len();
         append_capped_output(&mut buf, "more", 5);
         assert_eq!(buf.len(), len_after);
+    }
+
+    #[test]
+    fn expand_pasted_substitutes_full_text_for_placeholders() {
+        let payloads = vec!["line1\nline2\nline3".to_owned()];
+        let input = "Check this: [Pasted 17 chars]".to_owned();
+        // The marker offset points at the '[' of the placeholder.
+        let offset = input.find("[Pasted").unwrap();
+        let markers = vec![(offset, 0usize)];
+        let expanded = expand_pasted(&input, &markers, &payloads);
+        assert_eq!(expanded, "Check this: line1\nline2\nline3");
+    }
+
+    #[test]
+    fn expand_pasted_handles_multiple_placeholders() {
+        let payloads = vec!["AAA".to_owned(), "BBBB".to_owned()];
+        let input = "[Pasted 3 chars] and [Pasted 4 chars]".to_owned();
+        let first = input.find("[Pasted").unwrap();
+        let second = input[first + 1..].find("[Pasted").unwrap() + first + 1;
+        let markers = vec![(first, 0usize), (second, 1usize)];
+        let expanded = expand_pasted(&input, &markers, &payloads);
+        assert_eq!(expanded, "AAA and BBBB");
+    }
+
+    #[test]
+    fn expand_pasted_is_noop_without_markers() {
+        let input = "just regular text".to_owned();
+        assert_eq!(expand_pasted(&input, &[], &[]), input);
+    }
+
+    #[test]
+    fn expand_pasted_tolerates_out_of_range_markers() {
+        let payloads = vec!["X".to_owned()];
+        // Offset beyond input length and index out of range are both skipped.
+        let markers = vec![(9999, 0usize), (0, 5usize)];
+        let input = "hello".to_owned();
+        assert_eq!(expand_pasted(&input, &markers, &payloads), "hello");
     }
 }

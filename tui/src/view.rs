@@ -226,7 +226,24 @@ pub fn draw(
     let skip = app.scroll as usize;
     history.truncate(skip + body.height as usize);
     let visible = history.drain(skip..).rev().collect::<Vec<_>>();
+    // Record the body layout and visible-line plain text so the mouse handler
+    // can map clicks to transcript rows and extract the selected text.
+    app.body_top = body.y;
+    app.body_height = body.height;
+    app.body_texts = visible.iter().map(Line::to_plain_text).collect();
     paint(f, body, visible);
+    // Overlay a highlight on the rows covered by the active selection.
+    if let Some((start, end)) = app.sel {
+        let (start, end) = (start as usize, end as usize);
+        let texts: Vec<String> = app.body_texts.clone();
+        for row in start..=end {
+            if let Some(text) = texts.get(row) {
+                let y = body.y + row as u16;
+                let style = Style::new().bg(Color::DarkGray);
+                paint(f, Rect::new(body.x, y, body.width, 1), [Line::styled(text, style)]);
+            }
+        }
+    }
     paint(
         f,
         banner,
