@@ -7,6 +7,7 @@ export type Harness = Schemas["Harness"];
 export type Project = Schemas["Project"];
 export type Conversation = Schemas["Conversation"];
 export type PermissionMode = Schemas["PermissionMode"];
+export type Effort = Schemas["Effort"];
 export type TranscriptEvent = Schemas["Event"];
 export type ApprovalDecision = Schemas["ApprovalDecision"];
 export type Bot = Schemas["Bot"];

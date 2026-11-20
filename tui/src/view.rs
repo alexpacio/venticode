@@ -77,6 +77,7 @@ fn paint<'a>(frame: &mut Frame, area: Rect, lines: impl IntoIterator<Item = Line
 pub enum Role {
     User,
     Assistant,
+    Thinking,
     Tool,
     Output,
     Notice,
@@ -99,6 +100,7 @@ fn transcript<'a>(
         Role::Assistant => {
             return cached_markdown(idx, &msg.text, width);
         }
+        Role::Thinking => ("~ ", Style::new().fg(Color::DarkGray)),
         Role::User => ("› ", Style::new().fg(Color::Cyan)),
         Role::Tool => ("→ ", Style::new().fg(Color::Yellow)),
         Role::Output => ("│ ", Style::new().fg(Color::Gray)),
@@ -108,7 +110,7 @@ fn transcript<'a>(
     let mut lines = Vec::new();
     let preview = matches!(msg.role, Role::Output) && compact;
     let body_width = width.saturating_sub(2).max(1);
-    let word_wrap = matches!(msg.role, Role::User | Role::Notice | Role::Error);
+    let word_wrap = matches!(msg.role, Role::User | Role::Notice | Role::Error | Role::Thinking);
     for content in msg.text.split('\n') {
         if word_wrap {
             let wrapped = if content.is_empty() {

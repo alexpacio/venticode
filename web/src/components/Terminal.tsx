@@ -114,6 +114,8 @@ export function Terminal({
           });
       } else if (block.kind === "error")
         items.push({ role: "Error", text: block.message });
+      else if (block.kind === "reasoning")
+        items.push({ role: "Thinking", text: block.content });
       else
         items.push({
           role: block.kind === "user" ? "User" : "Assistant",

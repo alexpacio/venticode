@@ -18,6 +18,7 @@ export interface ToolBlock {
 export type Block =
   | { kind: "user"; id: string; content: string }
   | { kind: "text"; id: string; content: string }
+  | { kind: "reasoning"; id: string; content: string }
   | { kind: "error"; id: string; message: string }
   | ToolBlock;
 
@@ -87,6 +88,14 @@ export function applyEvent(state: TranscriptState, event: TranscriptEvent): Tran
       const msgId = event.message_id || `seq-${event.sequence}`;
       if (last?.kind === "text" && last.id.startsWith(msgId + ":")) last.content += event.delta || "";
       else state.blocks.push({ kind: "text", id: `${msgId}:${event.sequence}`, content: event.delta || "" });
+      break;
+    }
+    case "reasoning": {
+      // Reasoning/thinking deltas accumulate into a reasoning block per message.
+      const msgId = event.message_id || `seq-${event.sequence}`;
+      const rid = `reasoning-${msgId}`;
+      if (last?.kind === "reasoning" && last.id === rid) last.content += event.delta || "";
+      else state.blocks.push({ kind: "reasoning", id: rid, content: event.delta || "" });
       break;
     }
     case "tool_call": {

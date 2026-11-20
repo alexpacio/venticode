@@ -624,6 +624,8 @@ export interface components {
             tools?: boolean;
             /** @description Image input is available for this model and member */
             vision?: boolean;
+            /** @description Reasoning effort levels supported by this model; empty = not supported */
+            efforts?: components["schemas"]["Effort"][];
         };
         /** @enum {string} */
         BotRuntime: "project" | "kitesurf" | "computer";
@@ -700,6 +702,12 @@ export interface components {
          * @enum {string}
          */
         PermissionMode: "ask" | "auto_edit" | "plan";
+        /**
+         * @description Reasoning/thinking effort passed to the model. none = no extra thinking; low/medium/high = increasing thinking budget
+         * @default medium
+         * @enum {string}
+         */
+        Effort: "none" | "low" | "medium" | "high";
         /** @enum {string} */
         ConversationState: "idle" | "running" | "waiting" | "failed";
         Conversation: {
@@ -718,6 +726,7 @@ export interface components {
             runtime?: components["schemas"]["BotRuntime"];
             title: string;
             model: string;
+            effort: components["schemas"]["Effort"];
             permission_mode: components["schemas"]["PermissionMode"];
             state: components["schemas"]["ConversationState"];
             revision: number;
@@ -731,12 +740,14 @@ export interface components {
             project_id: string;
             title?: string;
             model?: string;
+            effort?: components["schemas"]["Effort"];
             permission_mode?: components["schemas"]["PermissionMode"];
         };
         ConversationUpdate: {
             revision: number;
             title?: string;
             model?: string;
+            effort?: components["schemas"]["Effort"];
             permission_mode?: components["schemas"]["PermissionMode"];
         };
         /** @enum {string} */
@@ -759,7 +770,7 @@ export interface components {
         Event: {
             sequence: number;
             /** @enum {string} */
-            type: "user_message" | "text" | "tool_call" | "tool_output" | "tool_result" | "approval" | "todo" | "run" | "error" | "question" | "plan" | "goal_completed" | "goal_cancelled";
+            type: "user_message" | "text" | "reasoning" | "tool_call" | "tool_output" | "tool_result" | "approval" | "todo" | "run" | "error" | "question" | "plan" | "goal_completed" | "goal_cancelled";
             /** Format: date-time */
             created_at: string;
             /**
@@ -774,7 +785,7 @@ export interface components {
             /** Format: uuid */
             reference_id?: string;
             options?: string[];
-            /** @description text: appended to the assistant message with the same message_id */
+            /** @description text/reasoning: appended to the message with the same message_id */
             delta?: string;
             /**
              * Format: uuid

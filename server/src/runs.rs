@@ -587,6 +587,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
     let member = Member::load(app, h, false).await?;
     let conversation = projects::owned(app, &member, id).await?;
     let mode = conversation.get::<&str, _>("permission_mode");
+    let effort = conversation.get::<&str, _>("effort");
     let catalog = app.control_json(h, "models").await?;
     let selected = catalog["items"]
         .as_array()
@@ -618,6 +619,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         run,
         &model,
         mode,
+        effort,
         use_tools,
         vision,
         model_access,
@@ -667,6 +669,7 @@ async fn generate_turns(
     run: Uuid,
     model: &str,
     mode: &str,
+    effort: &str,
     use_tools: bool,
     vision: bool,
     model_access: bool,
@@ -734,6 +737,9 @@ async fn generate_turns(
             tracing::info!(conversation_id = %id, run_id = %run, round, "compacted conversation context to stay within budget");
         }
         let mut request = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+        if effort != "none" && !effort.is_empty() {
+            request["reasoning_effort"] = json!(effort);
+        }
         if use_tools {
             request["tools"] = tools::definitions(mode, bot.as_ref(), app.standalone.is_some());
             tools::runtime_definitions(
@@ -868,6 +874,18 @@ async fn generate_turns(
                         last_flush = tokio::time::Instant::now();
                     }
                 }
+            }
+            if let Some(reasoning) = v["choices"][0]["delta"]["reasoning_content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                record(
+                    app,
+                    id,
+                    run,
+                    json!({"type":"reasoning","run_id":run,"message_id":msg,"delta":reasoning}),
+                )
+                .await?;
             }
         }
         if !pending_delta.is_empty() {

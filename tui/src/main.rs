@@ -37,6 +37,7 @@ const COMMANDS: &[&str] = &[
     "/new",
     "/resume",
     "/model",
+    "/effort",
     "/permissions",
     "/status",
     "/rename",
@@ -290,6 +291,7 @@ struct App {
     project: Value,
     chat: Value,
     model: String,
+    effort: String,
     lines: Vec<view::Message>,
     compact_tools: bool,
     last_text: String,
@@ -694,6 +696,7 @@ impl App {
             .unwrap_or(Value::Null);
         self.chat = c;
         self.model = string(&self.chat, "model");
+        self.effort = string(&self.chat, "effort");
         self.question = string(&self.chat, "question_id");
         self.plan = string(&self.chat, "plan_id");
         self.goal = string(&self.chat, "goal_id");
@@ -745,6 +748,23 @@ impl App {
                         text: String::new(),
                     });
                     self.last_text = id;
+                }
+                self.lines
+                    .last_mut()
+                    .unwrap()
+                    .text
+                    .push_str(&clean(&val("delta")));
+            }
+            Some("reasoning") => {
+                if !self
+                    .lines
+                    .last()
+                    .is_some_and(|line| matches!(line.role, view::Role::Thinking))
+                {
+                    self.lines.push(view::Message {
+                        role: view::Role::Thinking,
+                        text: String::new(),
+                    });
                 }
                 self.lines
                     .last_mut()
@@ -995,6 +1015,7 @@ impl App {
                     self.remote.workspace.clone(),
                     string(&self.project, "name"),
                     self.model.clone(),
+                    self.effort.clone(),
                     string(&self.chat, "permission_mode"),
                     string(&self.chat, "state"),
                     if self.chat.is_null() {
@@ -1022,8 +1043,8 @@ impl App {
                 ));
             }
             "/help" => self.note(self.msg(
-                "/projects · /use N · /harnesses · /folder (sfoglia) · /folder N radice percorso · /chats · /open N · /models · /model N · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti/sfoglia · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
-                "/projects · /use N · /harnesses · /folder (browse) · /folder N root path · /chats · /open N · /models · /model N · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects/browse · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
+                "/projects · /use N · /harnesses · /folder (sfoglia) · /folder N radice percorso · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new titolo\n/plan richiesta · /build · /goal obiettivo · /cancel-goal · /answer testo · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 conversazioni · F3 progetti/sfoglia · Tab completa · Shift/Alt+Invio o Ctrl+J a capo · Ctrl+A/E/U/K/W modifica · Ctrl+L modello · Ctrl+O strumenti · Rotella/PgSu/PgGiù/Alt+↑↓ scorri · Fine segue · // testo con / · Esc interrompe · Ctrl+C esci",
+                "/projects · /use N · /harnesses · /folder (browse) · /folder N root path · /chats · /open N · /models · /model N · /effort none|low|medium|high · /new title\n/plan request · /build · /goal objective · /cancel-goal · /answer text · /allow · /deny · /stop · /resume [N] · /status · /permissions · /diff · /copy · /reconnect · /rename · /browser · /logout · /exit\nF2 chats · F3 projects/browse · Tab complete · Shift/Alt+Enter or Ctrl+J newline · Ctrl+A/E/U/K/W edit · Ctrl+L model · Ctrl+O tools · Wheel/PgUp/PgDn/Alt+↑↓ scroll · End follow · // literal slash · Esc interrupt · Ctrl+C quit",
             )),
             "/projects" | "/harnesses" | "/models" | "/chats" | "/resume" | "/model"
                 if argument.is_empty() =>
@@ -1097,6 +1118,16 @@ impl App {
                     self.patch_chat(cx, json!({"model": model})).await?;
                 }
                 self.model = model;
+            }
+            "/effort" => {
+                ensure!(
+                    ["none", "low", "medium", "high"].contains(&argument),
+                    "/effort none|low|medium|high"
+                );
+                if !self.chat.is_null() {
+                    self.patch_chat(cx, json!({"effort": argument})).await?;
+                }
+                self.effort = argument.to_owned();
             }
             "/new" => self.new_chat(cx, argument).await?,
             "/stop" => {
@@ -1917,6 +1948,7 @@ async fn run_cli(cx: Cx) -> Result<()> {
             project: Value::Null,
             chat: Value::Null,
             model: String::new(),
+            effort: String::from("medium"),
             lines: vec![],
             compact_tools: true,
             last_text: String::new(),
@@ -1992,6 +2024,7 @@ mod tests {
             project: Value::Null,
             chat: Value::Null,
             model: String::new(),
+            effort: String::from("medium"),
             lines: vec![],
             compact_tools: true,
             last_text: String::new(),

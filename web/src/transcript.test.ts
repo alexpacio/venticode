@@ -145,3 +145,25 @@ test("tool output is capped at MAX_TOOL_OUTPUT_CHARS with truncation marker", ()
 test("diffLines classifies unified diff lines", () => {
   assert.deepEqual(diffLines("@@ -1 +1 @@\n-a\n+b\n c").map((line) => line.kind), ["hunk", "del", "add", "ctx"]);
 });
+
+test("reasoning deltas accumulate into a thinking block before text", () => {
+  const events = [
+    e({ type: "run", state: "running" }),
+    e({ type: "reasoning", message_id: "m1", delta: "Let me think " }),
+    e({ type: "reasoning", message_id: "m1", delta: "about this." }),
+    e({ type: "text", message_id: "m1", delta: "Here is the answer." }),
+    e({ type: "run", state: "idle" }),
+  ];
+  const view = fold(events);
+  const reasoning = view.blocks.find((b) => b.kind === "reasoning") as any;
+  assert.ok(reasoning, "reasoning block exists");
+  assert.equal(reasoning.content, "Let me think about this.");
+  const text = view.blocks.find((b) => b.kind === "text") as any;
+  assert.ok(text, "text block exists");
+  assert.equal(text.content, "Here is the answer.");
+
+  // Incremental applyEvent matches fold.
+  const state = createTranscriptState();
+  for (const ev of events) applyEvent(state, ev);
+  assert.deepEqual(toTranscript(state).blocks, view.blocks);
+});

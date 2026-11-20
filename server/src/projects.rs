@@ -139,6 +139,7 @@ async fn remove(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> R
 struct NewConversation {
     project_id: Uuid,
     model: Option<String>,
+    effort: Option<String>,
     title: Option<String>,
     permission_mode: Option<String>,
 }
@@ -147,6 +148,7 @@ struct NewConversation {
 struct Edit {
     revision: i64,
     model: Option<String>,
+    effort: Option<String>,
     title: Option<String>,
     permission_mode: Option<String>,
 }
@@ -166,9 +168,10 @@ async fn model(app: &App, h: &HeaderMap, requested: Option<&str>) -> Result<Stri
         .map(str::to_owned)
         .ok_or_else(bad)
 }
-fn validate(title: Option<&str>, mode: Option<&str>) -> Result<()> {
+fn validate(title: Option<&str>, mode: Option<&str>, effort: Option<&str>) -> Result<()> {
     if title.is_some_and(|s| s.trim().is_empty() || s.chars().count() > 200)
         || mode.is_some_and(|s| !matches!(s, "ask" | "auto_edit" | "plan"))
+        || effort.is_some_and(|s| !matches!(s, "none" | "low" | "medium" | "high"))
     {
         return Err(bad());
     }
@@ -180,7 +183,7 @@ async fn start(
     Json(body): Json<NewConversation>,
 ) -> Result<impl IntoResponse> {
     let m = Member::load(&app, &h, true).await?;
-    validate(body.title.as_deref(), body.permission_mode.as_deref())?;
+    validate(body.title.as_deref(), body.permission_mode.as_deref(), body.effort.as_deref())?;
     let model = model(&app, &h, body.model.as_deref()).await?;
     let mut tx = app.db.begin().await?;
     let row=sqlx::query("SELECT harness_id,root FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3 FOR SHARE")
@@ -189,9 +192,10 @@ async fn start(
         return Err(missing());
     }
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO conversations(id,project_id,title,model,permission_mode) VALUES($1,$2,$3,$4,$5)")
+    sqlx::query("INSERT INTO conversations(id,project_id,title,model,effort,permission_mode) VALUES($1,$2,$3,$4,$5,$6)")
         .bind(id).bind(body.project_id).bind(body.title.as_deref().unwrap_or("Nuova conversazione").trim())
-        .bind(model).bind(body.permission_mode.as_deref().unwrap_or("ask")).execute(&mut *tx).await?;
+        .bind(model).bind(body.effort.as_deref().unwrap_or("medium"))
+        .bind(body.permission_mode.as_deref().unwrap_or("ask")).execute(&mut *tx).await?;
     let item: Value = sqlx::query_scalar("SELECT document FROM conversation_json WHERE id=$1")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -246,16 +250,16 @@ async fn update(
 ) -> Result<Json<Value>> {
     let m = Member::load(&app, &h, true).await?;
     owned(&app, &m, id).await?;
-    if body.title.is_none() && body.permission_mode.is_none() && body.model.is_none() {
+    if body.title.is_none() && body.permission_mode.is_none() && body.model.is_none() && body.effort.is_none() {
         return Err(bad());
     }
-    validate(body.title.as_deref(), body.permission_mode.as_deref())?;
+    validate(body.title.as_deref(), body.permission_mode.as_deref(), body.effort.as_deref())?;
     if let Some(name) = &body.model {
         model(&app, &h, Some(name)).await?;
     }
     let mut tx = app.db.begin().await?;
-    let result=sqlx::query("UPDATE conversations SET title=COALESCE($3,title),model=COALESCE($4,model),plan_id=CASE WHEN $5 IS NOT NULL AND $5!=permission_mode THEN NULL ELSE plan_id END,permission_mode=COALESCE($5,permission_mode),revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$2 AND active_run IS NULL")
-        .bind(id).bind(body.revision).bind(body.title.as_deref().map(str::trim)).bind(body.model).bind(body.permission_mode).execute(&mut *tx).await?;
+    let result=sqlx::query("UPDATE conversations SET title=COALESCE($3,title),model=COALESCE($4,model),effort=COALESCE($5,effort),plan_id=CASE WHEN $6 IS NOT NULL AND $6!=permission_mode THEN NULL ELSE plan_id END,permission_mode=COALESCE($6,permission_mode),revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$2 AND active_run IS NULL")
+        .bind(id).bind(body.revision).bind(body.title.as_deref().map(str::trim)).bind(body.model).bind(body.effort.as_deref()).bind(body.permission_mode).execute(&mut *tx).await?;
     if result.rows_affected() != 1 {
         return Err(conflict());
     }

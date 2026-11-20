@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle, Pencil, Trash2 } from "lucide-react";
 import { api, ApiError } from "../api/client.ts";
-import type { Conversation, Harness, PermissionMode } from "../api/client.ts";
+import type { Conversation, Effort, Harness, PermissionMode } from "../api/client.ts";
 import { useConversation, useHarnesses, useModels, useProjects, useTranscript } from "../queries.ts";
 import type { Transcript } from "../transcript.ts";
 import { t } from "../i18n/index.ts";
@@ -18,7 +18,7 @@ export const modes = (): Array<[PermissionMode, string]> => [["ask", t("Chiedi p
 
 type UpdateResult = { ok: boolean; error?: string };
 type UpdateFn = (
-  change: Partial<Pick<Conversation, "model" | "permission_mode" | "title">>,
+  change: Partial<Pick<Conversation, "model" | "effort" | "permission_mode" | "title">>,
   options?: { reportError?: boolean },
 ) => Promise<UpdateResult>;
 
@@ -88,7 +88,7 @@ export function ConversationView({ menu, panelToggle }: { menu: ReactNode; panel
           else await send(text);
         }} onStop={() => void stop()} running={running}
           disabled={harness && !harness.online && !harness.managed ? t("{0} è offline: avvia venticode-harness per continuare.", harness.name) : undefined}
-          controls={<ModeSelect conversation={c} update={update} />} />
+          controls={<><ModeSelect conversation={c} update={update} /><EffortSelect conversation={c} update={update} disabled={running} /></>} />
       </main>
       <SessionPanel transcript={transcript} harness={harness} projectLabel={projectLabel} />
     </>
@@ -134,6 +134,7 @@ function Header({ conversation, harness, projectLabel, menu, panelToggle, runnin
           {modelList.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
         </select>
       </label>
+      <EffortSelect conversation={conversation} update={update} disabled={running} />
       <button className="icon-btn" title={t("Rinomina conversazione")} aria-label={t("Rinomina conversazione")} disabled={running} onClick={() => setRenaming(true)}><Pencil size={16} aria-hidden="true" /></button>
       <button className="icon-btn" title={t("Elimina conversazione")} aria-label={t("Elimina conversazione")} disabled={running || deleting} onClick={() => void remove()}><Trash2 size={16} aria-hidden="true" /></button>
       {panelToggle}
@@ -184,6 +185,24 @@ function ModeSelect({ conversation, update }: { conversation: Conversation; upda
     <label className="select-inline">{t("Modalità")}
       <select value={conversation.permission_mode} onChange={(e) => void update({ permission_mode: e.target.value as PermissionMode })}>
         {modes().map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+      </select>
+    </label>
+  );
+}
+
+const efforts = (): Array<[Effort, string]> => [
+  ["none", t("Nessuno")],
+  ["low", t("Basso")],
+  ["medium", t("Medio")],
+  ["high", t("Alto")],
+];
+
+function EffortSelect({ conversation, update, disabled }: { conversation: Conversation; update: UpdateFn; disabled?: boolean }) {
+  const current = conversation.effort || "medium";
+  return (
+    <label className="select-inline">{t("Sforzo")}
+      <select value={current} disabled={disabled} onChange={(e) => void update({ effort: e.target.value as Effort })}>
+        {efforts().map(([value, label]) => <option key={value} value={value}>{label}</option>)}
       </select>
     </label>
   );

@@ -31,9 +31,9 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   const sessionCookie = (cookie = "") => cookie.match(/(?:^|;\s*)venticode_session=([a-f0-9]{64})/)?.[1] || "";
   const tickets = new Map<string, number>();
   const models = [
-    { id: "opus-5.5", name: "Opus 5.5", default: true },
-    { id: "sonnet-5.5", name: "Sonnet 5.5" },
-    { id: "haiku-5.5", name: "Haiku 5.5" },
+    { id: "opus-5.5", name: "Opus 5.5", default: true, efforts: ["none", "low", "medium", "high"] },
+    { id: "sonnet-5.5", name: "Sonnet 5.5", efforts: ["none", "low", "medium", "high"] },
+    { id: "haiku-5.5", name: "Haiku 5.5", efforts: ["none", "low", "medium", "high"] },
   ];
   const harnesses: Json[] = [
     { id: "7f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f", name: "dev-workstation", roots: ["ventic", "ventic-frontend", "notes"], online: true, mode: "sandboxed", owned: true, revision: 3,
@@ -66,7 +66,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     return project;
   };
   const addConversation = (project: Json, title: string, minutes: number) => {
-    const conversation = { id: randomUUID(), project_id: project.id, harness_id: project.harness_id, title, model: "opus-5.5", permission_mode: "ask", state: "idle", revision: 1, created_at: ago(minutes + 30), updated_at: ago(minutes) };
+    const conversation = { id: randomUUID(), project_id: project.id, harness_id: project.harness_id, title, model: "opus-5.5", effort: "medium", permission_mode: "ask", state: "idle", revision: 1, created_at: ago(minutes + 30), updated_at: ago(minutes) };
     conversations.push(conversation);
     events.set(conversation.id, []);
     return conversation;
@@ -125,6 +125,7 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     push(id, { type: "user_message", message_id: m1, content: "Aggiungi una migrazione che limiti gli accessi harness per progetto, poi esegui i test di venticode-harness." });
     push(id, { type: "run", run_id: run, state: "running" });
     push(id, { type: "todo", todos: [{ content: "Leggere il modello di accesso", status: "completed" }, { content: "Aggiungere la migrazione", status: "completed" }, { content: "Eseguire i test", status: "completed" }] });
+    push(id, { type: "reasoning", message_id: m2, delta: "The user wants a migration to restrict harness access per project. I should read the existing model first, then add the migration and run tests." });
     push(id, { type: "text", message_id: m2, delta: "Controllo come sono modellati oggi gli accessi, poi aggiungo la migrazione." });
     push(id, { type: "tool_call", call_id: read, operation: "read_file", target: "services/control/src/harness.rs", arguments: { path: "services/control/src/harness.rs" } });
     push(id, { type: "tool_result", call_id: read, status: "ok", summary: "412 righe" });
@@ -173,6 +174,9 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
   }
 
   async function run(conversation: Json, runId: string, content: string, signal: AbortSignal) {
+    const think = async (messageId: string, text: string) => {
+      for (const chunk of text.match(/[\s\S]{1,14}/g) || []) { push(conversation.id, { type: "reasoning", message_id: messageId, delta: chunk }); await sleep(20 * speed, signal); }
+    };
     const say = async (messageId: string, text: string) => {
       for (const chunk of text.match(/[\s\S]{1,14}/g) || []) { push(conversation.id, { type: "text", message_id: messageId, delta: chunk }); await sleep(30 * speed, signal); }
     };
@@ -323,10 +327,10 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
     if (p === "/conversations" && method === "POST") {
       const project = projects.find((x) => x.id === body.project_id);
       if (!project) return fail(404, "Progetto non trovato / Project not found");
-      if ((body.model !== undefined && !models.some((x) => x.id === body.model)) || (body.permission_mode !== undefined && !["ask", "auto_edit", "plan"].includes(body.permission_mode)) || (body.title !== undefined && (typeof body.title !== "string" || body.title.length > 200)))
+      if ((body.model !== undefined && !models.some((x) => x.id === body.model)) || (body.permission_mode !== undefined && !["ask", "auto_edit", "plan"].includes(body.permission_mode)) || (body.effort !== undefined && !["none", "low", "medium", "high"].includes(body.effort)) || (body.title !== undefined && (typeof body.title !== "string" || body.title.length > 200)))
         return fail(400, "Richiesta non valida / Invalid request");
       const conversation = addConversation(project, body.title?.trim() || "Nuova conversazione", 0);
-      Object.assign(conversation, { created_at: now(), updated_at: now(), model: body.model || "opus-5.5", permission_mode: body.permission_mode || "ask" });
+      Object.assign(conversation, { created_at: now(), updated_at: now(), model: body.model || "opus-5.5", effort: body.effort || "medium", permission_mode: body.permission_mode || "ask" });
       return ok(conversation, 201);
     }
     if ((m = p.match(/^\/conversations\/([^/]+)\/goal\/([^/]+)$/)) && method==="DELETE") {
@@ -343,13 +347,14 @@ export function createMock({ origin, portalOrigin, speed = 1 }: MockOptions) {
       if (!action && method === "GET") return ok(conversation);
       if (!action && method === "PATCH") {
         const keys = Object.keys(body.json);
-        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "permission_mode"].includes(k)) ||
+        if (!Number.isInteger(body.revision) || keys.length < 2 || keys.some((k) => !["revision", "title", "model", "effort", "permission_mode"].includes(k)) ||
             (body.title !== undefined && (typeof body.title !== "string" || !body.title.trim() || body.title.length > 200)) ||
             (body.model !== undefined && !models.some((x) => x.id === body.model)) ||
+            (body.effort !== undefined && !["none", "low", "medium", "high"].includes(body.effort)) ||
             (body.permission_mode !== undefined && !["ask", "auto_edit", "plan"].includes(body.permission_mode)))
           return fail(400, "Richiesta non valida / Invalid request");
         if (body.revision !== conversation.revision) return fail(409, "Conversazione modificata / Conversation changed");
-        for (const k of ["title", "model", "permission_mode"]) if (body[k] !== undefined) conversation[k] = k === "title" ? body[k].trim() : body[k];
+        for (const k of ["title", "model", "effort", "permission_mode"]) if (body[k] !== undefined) conversation[k] = k === "title" ? body[k].trim() : body[k];
         conversation.revision++;
         conversation.updated_at = now();
         return ok(conversation);

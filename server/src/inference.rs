@@ -83,7 +83,7 @@ impl Provider {
     }
 
     pub fn models(&self) -> Value {
-        json!({"items":[{"id":self.model,"name":self.model,"default":true,"tools":self.tools,"vision":self.vision}]})
+        json!({"items":[{"id":self.model,"name":self.model,"default":true,"tools":self.tools,"vision":self.vision,"efforts":["none","low","medium","high"]}]})
     }
 }
 
@@ -185,6 +185,7 @@ pub(super) async fn infer(app: &App, h: &HeaderMap, request: &Value) -> Result<E
                         if strip_openai_extras && let Some(obj) = body.as_object_mut() {
                             obj.remove("parallel_tool_calls");
                             obj.remove("stream_options");
+                            obj.remove("reasoning_effort");
                         }
                         body
                     }
@@ -216,9 +217,11 @@ pub(super) async fn infer(app: &App, h: &HeaderMap, request: &Value) -> Result<E
             {
                 let body = read_capped_text(res, MAX_ERROR_BODY_BYTES).await;
                 let lower = body.to_ascii_lowercase();
-                if lower.contains("stream_options") || lower.contains("parallel_tool_calls") {
+                if lower.contains("stream_options") || lower.contains("parallel_tool_calls")
+                    || lower.contains("reasoning_effort") || lower.contains("reasoning")
+                {
                     tracing::info!(
-                        "OpenAI-compatible endpoint rejected stream_options/parallel_tool_calls; retrying without them"
+                        "OpenAI-compatible endpoint rejected stream_options/parallel_tool_calls/reasoning_effort; retrying without them"
                     );
                     strip_openai_extras = true;
                     continue;
@@ -461,10 +464,18 @@ impl AnthropicStream {
                 }
                 json!({"choices":[{"delta":{"content":text}}]})
             }
+            Some("content_block_start") if event["content_block"]["type"] == "thinking" => {
+                let text = &event["content_block"]["thinking"];
+                if text.as_str().is_none_or(str::is_empty) {
+                    return Ok(None);
+                }
+                json!({"choices":[{"delta":{"reasoning_content":text}}]})
+            }
             Some("content_block_delta") => {
                 let delta = &event["delta"];
                 match delta["type"].as_str() {
                     Some("text_delta") => json!({"choices":[{"delta":{"content":delta["text"]}}]}),
+                    Some("thinking_delta") => json!({"choices":[{"delta":{"reasoning_content":delta["thinking"]}}]}),
                     Some("input_json_delta") => {
                         let (number, fragments, _) =
                             self.open_tools.get_mut(&index()?).ok_or_else(unavailable)?;

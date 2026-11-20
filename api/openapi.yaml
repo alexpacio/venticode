@@ -875,6 +875,7 @@ components:
         default: { type: boolean }
         tools: { type: boolean, description: Tool calling is available for this model and member }
         vision: { type: boolean, description: Image input is available for this model and member }
+        efforts: { type: array, description: Reasoning effort levels supported by this model; empty = not supported, items: { $ref: '#/components/schemas/Effort' } }
     BotRuntime:
       type: string
       enum: [project, kitesurf, computer]
@@ -969,13 +970,18 @@ components:
       type: string
       enum: [ask, auto_edit, plan]
       description: ask = every write and command asks; auto_edit = file edits run, commands ask; plan = read-only tools only
+    Effort:
+      type: string
+      enum: [none, low, medium, high]
+      default: medium
+      description: Reasoning/thinking effort passed to the model. none = no extra thinking; low/medium/high = increasing thinking budget
     ConversationState:
       type: string
       enum: [idle, running, waiting, failed]
     Conversation:
       type: object
       additionalProperties: false
-      required: [id, project_id, harness_id, title, model, permission_mode, state, revision, created_at, updated_at]
+      required: [id, project_id, harness_id, title, model, effort, permission_mode, state, revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         goal_id: { type: [string, "null"], format: uuid }
@@ -986,6 +992,7 @@ components:
         runtime: { $ref: '#/components/schemas/BotRuntime' }
         title: { type: string }
         model: { type: string }
+        effort: { $ref: '#/components/schemas/Effort' }
         permission_mode: { $ref: '#/components/schemas/PermissionMode' }
         state: { $ref: '#/components/schemas/ConversationState' }
         revision: { type: integer }
@@ -999,6 +1006,7 @@ components:
         project_id: { type: string, format: uuid }
         title: { type: string, maxLength: 200 }
         model: { type: string }
+        effort: { $ref: '#/components/schemas/Effort' }
         permission_mode: { $ref: '#/components/schemas/PermissionMode' }
     ConversationUpdate:
       type: object
@@ -1009,6 +1017,7 @@ components:
         revision: { type: integer }
         title: { type: string, minLength: 1, maxLength: 200 }
         model: { type: string }
+        effort: { $ref: '#/components/schemas/Effort' }
         permission_mode: { $ref: '#/components/schemas/PermissionMode' }
     ApprovalDecision:
       type: string
@@ -1038,14 +1047,14 @@ components:
       required: [sequence, type, created_at]
       properties:
         sequence: { type: integer, minimum: 1 }
-        type: { type: string, enum: [user_message, text, tool_call, tool_output, tool_result, approval, todo, run, error, question, plan, goal_completed, goal_cancelled] }
+        type: { type: string, enum: [user_message, text, reasoning, tool_call, tool_output, tool_result, approval, todo, run, error, question, plan, goal_completed, goal_cancelled] }
         created_at: { type: string, format: date-time }
         message_id: { type: string, format: uuid, description: 'user_message, text' }
         content: { type: string, description: 'user_message: full text' }
         intent: { type: string, enum: [message, goal, plan, answer, implement_plan] }
         reference_id: { type: string, format: uuid }
         options: { type: array, items: { type: string } }
-        delta: { type: string, description: 'text: appended to the assistant message with the same message_id' }
+        delta: { type: string, description: 'text/reasoning: appended to the message with the same message_id' }
         call_id: { type: string, format: uuid, description: 'tool_call, tool_output, tool_result, approval' }
         operation: { $ref: '#/components/schemas/HarnessOperation' }
         target: { type: string, description: 'tool_call: path, command or MCP tool shown to the user' }

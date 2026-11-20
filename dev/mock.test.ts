@@ -146,3 +146,19 @@ test("a read-only plan and an unanswered goal preserve pending work", async () =
     assert.equal(cancelled.question_id, null);
   } finally { server.closeAllConnections(); server.close(); }
 });
+
+test("effort round-trips through create and update", async () => {
+  const { server, call } = await start();
+  try {
+    await call("/__dev/login");
+    const base = "/api/v1/venticode/conversations";
+    const project = (await call("/api/v1/venticode/projects")).value.items[0];
+    const chat = (await call(base, "POST", { project_id: project.id, effort: "high" })).value;
+    assert.equal(chat.effort, "high");
+    const path = base + "/" + chat.id;
+    const updated = (await call(path, "PATCH", { revision: chat.revision, effort: "low" })).value;
+    assert.equal(updated.effort, "low");
+    assert.equal((await call(path, "PATCH", { revision: chat.revision, effort: "invalid" })).status, 400);
+    assert.equal((await call(base, "POST", { project_id: project.id, effort: "invalid" })).status, 400);
+  } finally { server.closeAllConnections(); server.close(); }
+});
