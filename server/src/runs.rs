@@ -572,6 +572,10 @@ const TOOL_SUMMARIES: &[(&str, &str)] = &[
     ),
     ("ls", "List directory contents"),
     (
+        "fetch",
+        "Fetch a web page or file from an http(s) URL as markdown",
+    ),
+    (
         "project_tool",
         "Run other project operations (find files, mkdir, rename, remove, terminals, agents, MCP)",
     ),
@@ -591,7 +595,12 @@ fn tool_names(defs: &Value) -> Vec<&str> {
 
 /// System prompt laid out like pi_agent_rust's default: identity, available
 /// tools, guidelines that depend on which tools are enabled, then the date.
-fn system_message(mode: &str, tools: &[&str], bot: Option<&Value>) -> Value {
+fn system_message(
+    mode: &str,
+    tools: &[&str],
+    bot: Option<&Value>,
+    project_context: Option<&str>,
+) -> Value {
     let mut prompt = String::from(include_str!("conversation-prompt.txt").trim_end());
     let has = |name: &str| tools.contains(&name);
     if tools.is_empty() {
@@ -644,6 +653,9 @@ fn system_message(mode: &str, tools: &[&str], bot: Option<&Value>) -> Value {
                 .join("\n"),
         );
     }
+    if let Some(context) = project_context {
+        prompt.push_str(context);
+    }
     if let Some(extra) = bot
         .and_then(|b| b["instructions"].as_str())
         .map(str::trim)
@@ -688,6 +700,11 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         .as_ref()
         .is_some_and(|r| r.inventory()["items"][0]["host_info"]["model_access"] == true);
     let computer_id = computer_runner.as_ref().map(|r| r.id());
+    let project_context = if use_tools && conversation.get::<&str, _>("runtime") != "kitesurf" {
+        crate::context::load(app, h, &member, &conversation).await
+    } else {
+        None
+    };
     let _preview_cleanup = computer_runner.map(|runner| computer::PreviewCleanup { runner, run });
     let result = generate_turns(
         app,
@@ -701,6 +718,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         vision,
         model_access,
         conversation.get::<Value, _>("document")["goal_id"].is_string(),
+        project_context.as_deref(),
         &mut kitesurf,
     )
     .await;
@@ -751,6 +769,7 @@ async fn generate_turns(
     vision: bool,
     model_access: bool,
     goal: bool,
+    project_context: Option<&str>,
     kitesurf: &mut Option<browser::Browser>,
 ) -> Result<()> {
     let mut history = crate::history::History::default();
@@ -773,6 +792,9 @@ async fn generate_turns(
     let context_budget = crate::history::context_budget_tokens();
     let mut last_call_sig: Option<String> = None;
     let mut repeat_call_count: u32 = 0;
+    let mut vault = crate::secrets::Vault::default();
+    // (messages sent, provider-reported prompt tokens) of the last request, to calibrate compaction.
+    let mut last_prompt: Option<(usize, u64)> = None;
     // Reserve the first message for the current connection instructions on each model call.
     messages.insert(0, Value::Null);
     for round in 0..MAX_TOOL_ROUNDS {
@@ -811,7 +833,7 @@ async fn generate_turns(
                 crate::agent::actions(&mut tool_defs, mode, goal);
             }
         }
-        messages[0] = system_message(mode, &tool_names(&tool_defs), bot.as_ref());
+        messages[0] = system_message(mode, &tool_names(&tool_defs), bot.as_ref(), project_context);
         if goal && bot.is_none() && use_tools && mode != "plan" {
             let instruction = messages[0]["content"].as_str().unwrap_or_default();
             messages[0]["content"] = json!(format!(
@@ -819,10 +841,21 @@ async fn generate_turns(
             ));
         }
         // Compact older tool outputs/turns if the conversation exceeds the context window budget.
-        if crate::history::compact_messages(&mut messages, context_budget) {
-            tracing::info!(conversation_id = %id, run_id = %run, round, "compacted conversation context to stay within budget");
+        let budget = crate::history::calibrated_budget(context_budget, &messages, last_prompt);
+        if let Some(dropped) = crate::history::compact_messages(&mut messages, budget) {
+            last_prompt = None;
+            if !dropped.is_empty()
+                && let Some(summary) =
+                    crate::history::summarize(app, h, model, &dropped, &mut vault).await
+            {
+                messages[1]["content"] =
+                    json!(crate::history::compaction_notice(&dropped, Some(&summary)));
+            }
+            tracing::info!(conversation_id = %id, run_id = %run, round, dropped = dropped.len(), "compacted conversation context to stay within budget");
         }
+        let sent_messages = messages.len();
         let mut request = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+        vault.obfuscate(app, &mut request["messages"]);
         if effort != "none" && !effort.is_empty() {
             request["reasoning_effort"] = json!(effort);
         }
@@ -869,6 +902,7 @@ async fn generate_turns(
                 v["usage"]["prompt_tokens"].as_u64(),
                 v["usage"]["completion_tokens"].as_u64(),
             ) {
+                last_prompt = Some((sent_messages, input));
                 cumulative_tokens = cumulative_tokens
                     .saturating_add(input)
                     .saturating_add(output);
@@ -1111,7 +1145,8 @@ async fn generate_turns(
 
         let mut parsed_calls = Vec::with_capacity(calls.len());
         for (_, (key, name, args)) in calls {
-            let parsed = serde_json::from_str::<Value>(&args).map_err(|_| bad())?;
+            let mut parsed = serde_json::from_str::<Value>(&args).map_err(|_| bad())?;
+            vault.restore(&mut parsed);
             parsed_calls.push((key, name, parsed));
         }
 
@@ -1189,14 +1224,25 @@ mod prompt_tests {
 
     #[test]
     fn system_prompt_lists_enabled_tools_with_matching_guidelines() {
-        let prompt = system_message("ask", &["read", "edit", "bash", "grep"], None);
+        let prompt = system_message(
+            "ask",
+            &["read", "edit", "bash", "grep"],
+            None,
+            Some("\n\n# Project Context\n\n## AGENTS.md\n\nRule"),
+        );
+        assert!(
+            prompt["content"]
+                .as_str()
+                .unwrap()
+                .contains("## AGENTS.md\n\nRule\nCurrent date")
+        );
         let text = prompt["content"].as_str().unwrap();
         assert!(text.contains("Available tools:\n- read: Read file contents\n- bash:"));
         assert!(text.contains("- Use read to examine files before editing."));
         assert!(text.contains("- Prefer grep/ls tools over bash"));
         assert!(!text.contains("Use write only"));
         assert!(text.contains("Current date: "));
-        let bare = system_message("ask", &[], None);
+        let bare = system_message("ask", &[], None, None);
         assert!(
             bare["content"]
                 .as_str()

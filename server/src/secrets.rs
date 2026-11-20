@@ -96,6 +96,11 @@ pub(super) fn redact(input: &str) -> Cow<'_, str> {
 }
 
 fn redact_always(input: &str) -> Cow<'_, str> {
+    replace_spans(input, |_, label| format!("[REDACTED:{label}]"))
+}
+
+/// Merged, sorted secret spans `(start, end, label)` from every rule.
+fn spans(input: &str) -> Vec<(usize, usize, &'static str)> {
     let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
     for rule in rules() {
         match rule.group {
@@ -113,9 +118,6 @@ fn redact_always(input: &str) -> Cow<'_, str> {
             }
         }
     }
-    if spans.is_empty() {
-        return Cow::Borrowed(input);
-    }
     spans.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
     let mut merged: Vec<(usize, usize, &'static str)> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -129,17 +131,94 @@ fn redact_always(input: &str) -> Cow<'_, str> {
         }
         merged.push(span);
     }
+    merged
+}
+
+fn replace_spans<'a>(
+    input: &'a str,
+    mut with: impl FnMut(&str, &'static str) -> String,
+) -> Cow<'a, str> {
+    let merged = spans(input);
+    if merged.is_empty() {
+        return Cow::Borrowed(input);
+    }
     let mut out = String::with_capacity(input.len());
     let mut pos = 0;
     for (start, end, label) in merged {
         out.push_str(&input[pos..start]);
-        out.push_str("[REDACTED:");
-        out.push_str(label);
-        out.push(']');
+        out.push_str(&with(&input[start..end], label));
         pos = end;
     }
     out.push_str(&input[pos..]);
     Cow::Owned(out)
+}
+
+/// Secrets vault (ported from pi_agent_rust/src/secrets.rs, `obfuscate` mode):
+/// credential-shaped values become stable placeholders before a provider call
+/// and are restored in tool arguments before execution. Placeholders derive
+/// from the server's HMAC fingerprint key, so a secret maps to the same
+/// placeholder in every run and leaks nothing about its value. Text the model
+/// streams to the user keeps the placeholder.
+#[derive(Default)]
+pub(super) struct Vault(std::collections::BTreeMap<String, String>);
+
+impl Vault {
+    /// Replace secrets in every string of `value` (message content and tool-call arguments).
+    pub(super) fn obfuscate(&mut self, app: &crate::App, value: &mut serde_json::Value) {
+        if enabled() {
+            self.obfuscate_with(value, &|secret| app.storage.fingerprint(secret));
+        }
+    }
+
+    fn obfuscate_with(&mut self, value: &mut serde_json::Value, key: &dyn Fn(&str) -> String) {
+        use serde_json::Value;
+        match value {
+            Value::String(text) => {
+                if let Cow::Owned(out) = replace_spans(text, |secret, label| {
+                    let placeholder = format!("[SECRET:{label}:{}]", &key(secret)[..12]);
+                    self.0.insert(placeholder.clone(), secret.to_owned());
+                    placeholder
+                }) {
+                    *text = out;
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| self.obfuscate_with(v, key)),
+            Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    // Tool-call arguments are JSON text: obfuscate the decoded strings so a
+                    // restored secret (e.g. a PEM with newlines) is not left JSON-escaped.
+                    if k == "arguments"
+                        && let Some(mut parsed) = v
+                            .as_str()
+                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    {
+                        self.obfuscate_with(&mut parsed, key);
+                        *v = Value::String(parsed.to_string());
+                    } else {
+                        self.obfuscate_with(v, key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Put the original values back into every string of `value`.
+    pub(super) fn restore(&self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::String(text) if text.contains("[SECRET:") => {
+                for (placeholder, secret) in &self.0 {
+                    if text.contains(placeholder.as_str()) {
+                        *text = text.replace(placeholder.as_str(), secret);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| self.restore(v)),
+            Value::Object(map) => map.values_mut().for_each(|v| self.restore(v)),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +259,50 @@ mod tests {
         let out = redact_always(clean);
         assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out, clean);
+    }
+
+    #[test]
+    fn vault_obfuscates_stably_and_restores_tool_arguments() {
+        let key = |s: &str| format!("{:0>64x}", s.len() * 7919);
+        let mut vault = Vault::default();
+        let mut messages = serde_json::json!([
+            {"role":"user","content":"deploy with sk-ant-api03-abcdefghijklmnopqrstuvwx please"},
+            {"role":"assistant","tool_calls":[{"function":{"arguments":"{\"k\":\"sk-ant-api03-abcdefghijklmnopqrstuvwx\",\"pem\":\"-----BEGIN RSA PRIVATE KEY-----\\nMIIE\\n-----END RSA PRIVATE KEY-----\"}"}}]}
+        ]);
+        vault.obfuscate_with(&mut messages, &key);
+        let text = messages.to_string();
+        assert!(!text.contains("abcdefghijklmnop"));
+        let placeholder = messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .nth(2)
+            .unwrap()
+            .to_owned();
+        assert!(placeholder.starts_with("[SECRET:ANTHROPIC_KEY:"));
+        assert!(
+            messages[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains(&placeholder)
+        );
+        let mut args = serde_json::json!({"command": format!("echo {placeholder} > .env"), "n": 1});
+        vault.restore(&mut args);
+        assert_eq!(
+            args["command"],
+            "echo sk-ant-api03-abcdefghijklmnopqrstuvwx > .env"
+        );
+        let decoded: serde_json::Value = serde_json::from_str(
+            messages[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut pem = decoded["pem"].clone();
+        vault.restore(&mut pem);
+        assert_eq!(
+            pem,
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----"
+        );
     }
 }

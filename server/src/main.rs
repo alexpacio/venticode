@@ -3,6 +3,7 @@ mod browse;
 mod browser;
 mod computer;
 mod connections;
+mod context;
 mod history;
 mod inference;
 mod log;

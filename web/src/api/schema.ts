@@ -662,7 +662,7 @@ export interface components {
             harness_id?: string;
         };
         /** @enum {string} */
-        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
+        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "fetch_url" | "extension_list_tools" | "extension_call_tool" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
         DirectoryEntry: {
             name: string;
             directory: boolean;

@@ -274,6 +274,8 @@ pub fn tool_head(operation: &str, target: &str) -> String {
         "ask_model" => "Ask",
         "preview" => "Preview",
         "project_service_start" => "Service",
+        "fetch_url" => "Fetch",
+        other if other.starts_with("extension_") => "Extension",
         other if other.starts_with("mcp_") => "MCP",
         other if other.starts_with("browser_") => "Browser",
         other if other.starts_with("desktop_") => "Desktop",
@@ -1449,10 +1451,13 @@ impl App {
                 return Ok(());
             }
             KeyCode::F(4) => {
-                self.nav.hidden = !self.nav.hidden;
-                if self.nav.hidden && self.focus == Focus::Nav {
-                    self.focus = Focus::Editor;
-                }
+                nav::toggle(self, false);
+                self.nav.inspector_hidden = self.nav.hidden;
+                return Ok(());
+            }
+            // Ctrl+B / Ctrl+Alt+B toggle the side panes, as in VS Code.
+            KeyCode::Char('b') if ctrl => {
+                nav::toggle(self, k.modifiers.contains(Modifiers::ALT));
                 return Ok(());
             }
             KeyCode::Char('l') if ctrl => return self.open_picker(Pick::Model),
@@ -2438,8 +2443,8 @@ impl App {
             .collect();
         out.push(String::new());
         out.push(self.msg(
-            "Tab pannelli · F2 progetti · F3 harness · F4 mostra/nasconde i pannelli · Shift+Tab modalità · Ctrl+L modello · Ctrl+O espande gli strumenti · Esc interrompe · Ctrl+C cancella/esce · Shift+Invio a capo · ? aiuto",
-            "Tab panes · F2 projects · F3 harnesses · F4 show/hide panes · Shift+Tab mode · Ctrl+L model · Ctrl+O expand tools · Esc interrupt · Ctrl+C clear/quit · Shift+Enter newline · ? help",
+            "Tab pannelli · F2 progetti · F3 harness · F4 mostra/nasconde i pannelli · Ctrl+B albero · Ctrl+Alt+B dettagli · Shift+Tab modalità · Ctrl+L modello · Ctrl+O espande gli strumenti · Esc interrompe · Ctrl+C cancella/esce · Shift+Invio a capo · ? aiuto",
+            "Tab panes · F2 projects · F3 harnesses · F4 show/hide panes · Ctrl+B tree · Ctrl+Alt+B inspector · Shift+Tab mode · Ctrl+L model · Ctrl+O expand tools · Esc interrupt · Ctrl+C clear/quit · Shift+Enter newline · ? help",
         ).into());
         out.join("\n")
     }

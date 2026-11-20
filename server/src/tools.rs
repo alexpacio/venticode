@@ -11,6 +11,10 @@ const ACTION: &[&str] = &[
     "agent_start",
     "mcp_call_tool",
     "preview",
+    // Network egress and project-supplied JS run on the user's machine: always ask unless yolo.
+    "fetch_url",
+    "extension_list_tools",
+    "extension_call_tool",
 ];
 const COMPUTER_OPERATIONS: &[&str] = &[
     "ask_model",
@@ -137,6 +141,9 @@ pub(super) fn definitions(mode: &str, bot: Option<&Value>, standalone: bool) -> 
         if runtime == "computer" && operations.contains(&"execute") {
             guidance.push_str(" Set arguments.model_access to true when an approved command needs to invoke venticode-cli ask. Use project_service_start for a service that must remain running through this run.");
         }
+        if operations.contains(&"extension_call_tool") {
+            guidance.push_str(" extension_list_tools lists tools registered by the project's JavaScript extensions (.venticode/extensions, .pi/extensions). extension_call_tool takes tool and parameters.");
+        }
         if operations.contains(&"mcp_list_servers") {
             guidance.push_str(" mcp_list_servers returns server ids and revisions. mcp_list_tools uses server_id and revision. mcp_call_tool also takes tool and parameters.");
         }
@@ -251,6 +258,12 @@ const FILE_FUNCTIONS: &[(&str, &str, &str, &[&str])] = &[
         &["query"],
     ),
     (
+        "fetch",
+        "fetch_url",
+        "Fetch an http(s) URL and return its content as markdown (HTML is converted; set raw to true for the unconverted body). Private and loopback addresses are refused.",
+        &["url"],
+    ),
+    (
         "bash",
         "execute",
         "Execute a command in the project folder with the host's native shell. Returns stdout, stderr and the exit status.",
@@ -280,6 +293,9 @@ pub(super) fn file_functions(defs: &mut Value, mode: &str) {
                 "ls" | "bash" => {
                     properties["path"] = json!({"type":"string"});
                 }
+                "fetch" => {
+                    properties["raw"] = json!({"type":"boolean"});
+                }
                 _ => {}
             }
             defs.as_array_mut().unwrap().push(json!({"type":"function","function":{"name":name,"description":description,
@@ -307,6 +323,7 @@ fn project_arguments(name: &str, body: Value) -> Result<Value> {
         "edit" => &["expected_sha256"],
         "grep" => &["path", "regex"],
         "ls" | "bash" => &["path"],
+        "fetch" => &["raw"],
         _ => &[],
     };
     for (k, v) in obj {
@@ -319,7 +336,7 @@ fn project_arguments(name: &str, body: Value) -> Result<Value> {
         match k.as_str() {
             "path" | "expected_sha256" if !v.is_string() => return Err(bad()),
             "start_line" | "end_line" if !v.as_u64().is_some_and(|n| n >= 1) => return Err(bad()),
-            "regex" if !v.is_boolean() => return Err(bad()),
+            "regex" | "raw" if !v.is_boolean() => return Err(bad()),
             _ => {}
         }
     }

@@ -24,8 +24,11 @@ const SELECTED_BG: u8 = 237;
 
 #[derive(Default)]
 pub struct Nav {
-    /// F4 hides the panes (the tree still opens while it has focus).
+    /// Ctrl+B or the `‹` on its divider collapses the tree (it still opens
+    /// while it has focus).
     pub hidden: bool,
+    /// Ctrl+Alt+B or the `›` on its divider collapses the inspector.
+    pub inspector_hidden: bool,
     /// Key of the highlighted row; keys survive reloads, indexes do not.
     pub key: String,
     /// `/` search over conversation titles; Some while active.
@@ -37,6 +40,8 @@ pub struct Nav {
     mentions: HashMap<String, Result<Vec<Value>, String>>,
     /// Layout of the last frame, for mouse hit-testing.
     rect: Rect,
+    /// Clickable dividers of the tree and the inspector.
+    dividers: [Rect; 2],
     offset: usize,
     inspector: bool,
 }
@@ -558,53 +563,91 @@ fn hints(app: &App, row: Option<&Row>) -> String {
     )
 }
 
-fn separator(f: &mut Frame, x: u16, top: u16, height: u16) {
+/// A pane divider with its collapse/expand icon on top; the whole column is
+/// the click target.
+fn divider(f: &mut Frame, x: u16, top: u16, height: u16, icon: &'static str) -> Rect {
     paint(
         f,
         Rect::new(x, top, 1, height),
-        (0..height).map(|_| Line::styled("│", fg(DIM))),
+        (0..height).map(|i| {
+            if i == 0 {
+                Line::styled(icon, fg(GRAY))
+            } else {
+                Line::styled("│", fg(DIM))
+            }
+        }),
     );
+    Rect::new(x, top, 1, height)
+}
+
+/// Collapse or expand the tree (`inspector == false`) or the inspector.
+pub fn toggle(app: &mut App, inspector: bool) {
+    if inspector {
+        app.nav.inspector_hidden = !app.nav.inspector_hidden;
+        return;
+    }
+    let open = !app.nav.hidden || app.focus == Focus::Nav;
+    app.nav.hidden = open;
+    if open && app.focus == Focus::Nav {
+        app.focus = Focus::Editor;
+    }
 }
 
 /// Split the screen into [tree | center | inspector] and draw both panes.
+/// A collapsed pane leaves its divider as a one-column rail to reopen it.
 /// Returns the center area for the active screen.
 pub fn draw(f: &mut Frame, app: &mut App) -> Rect {
     let area = f.area();
     let focused = app.focus == Focus::Nav;
     app.nav.inspector = false;
     app.nav.rect = Rect::default();
-    if (app.nav.hidden && !focused) || area.width < 40 || app.screen == Screen::SignedOut {
+    app.nav.dividers = [Rect::default(); 2];
+    let narrow = area.width < 90;
+    if area.width < 40 || app.screen == Screen::SignedOut || (narrow && !focused) {
         return area;
     }
     // On narrow terminals the focused tree takes the whole screen.
-    let tree_width = if area.width < 90 {
-        if !focused {
-            return area;
-        }
-        area.width
-    } else {
-        (area.width / 4).clamp(28, 40)
-    };
-    let tree = Rect::new(area.x, area.y, tree_width, area.height);
-    draw_tree(f, tree, app);
-    if tree_width == area.width {
+    if narrow {
+        draw_tree(f, area, app);
         return Rect::default();
     }
-    separator(f, tree.x + tree_width, area.y, area.height);
-    let center_x = tree.x + tree_width + 1;
-    let mut center_width = area.width - tree_width - 1;
+    let tree_open = !app.nav.hidden || focused;
+    let tree_width = if tree_open {
+        (area.width / 4).clamp(28, 40)
+    } else {
+        0
+    };
+    if tree_open {
+        draw_tree(f, Rect::new(area.x, area.y, tree_width, area.height), app);
+    }
+    let left = area.x + tree_width;
+    let icon = if tree_open { "‹" } else { "›" };
+    app.nav.dividers[0] = divider(f, left, area.y, area.height, icon);
+    // Column of the right divider, or the screen end without an inspector.
+    let mut right = area.x + area.width;
     if area.width >= 130 {
-        let inspector = (area.width / 4).clamp(30, 46);
-        center_width -= inspector + 1;
-        let x = center_x + center_width;
-        separator(f, x, area.y, area.height);
-        app.nav.inspector = true;
-        draw_inspector(f, Rect::new(x + 2, area.y, inspector - 2, area.height), app);
+        let open = !app.nav.inspector_hidden;
+        let inspector = if open {
+            (area.width / 4).clamp(30, 46)
+        } else {
+            0
+        };
+        right -= inspector + 1;
+        let icon = if open { "›" } else { "‹" };
+        app.nav.dividers[1] = divider(f, right, area.y, area.height, icon);
+        if open {
+            app.nav.inspector = true;
+            draw_inspector(
+                f,
+                Rect::new(right + 2, area.y, inspector - 2, area.height),
+                app,
+            );
+        }
     }
     Rect::new(
-        center_x + 1,
+        left + 2,
         area.y,
-        center_width.saturating_sub(2),
+        (right - left - 1).saturating_sub(2),
         area.height,
     )
 }
@@ -1340,6 +1383,11 @@ pub async fn key(app: &mut App, cx: &Cx, k: KeyEvent) -> Result<()> {
 
 /// Mouse click inside the tree: highlight the row, activate on a second click.
 pub async fn click(app: &mut App, cx: &Cx, x: u16, y: u16) -> Result<bool> {
+    let hit = |r: &Rect| r.width > 0 && x == r.x && y >= r.y && y < r.y + r.height;
+    if let Some(i) = app.nav.dividers.iter().position(hit) {
+        toggle(app, i == 1);
+        return Ok(true);
+    }
     if !app.nav.contains(x, y) {
         return Ok(false);
     }
@@ -1360,6 +1408,20 @@ pub async fn click(app: &mut App, cx: &Cx, x: u16, y: u16) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panes_collapse_independently() {
+        let mut app = crate::app::tests::test_app();
+        toggle(&mut app, true);
+        assert!(app.nav.inspector_hidden && !app.nav.hidden);
+        // A tree shown only because it has focus collapses on the first toggle.
+        app.nav.hidden = true;
+        app.focus = Focus::Nav;
+        toggle(&mut app, false);
+        assert!(app.nav.hidden && app.focus == Focus::Editor);
+        toggle(&mut app, false);
+        assert!(!app.nav.hidden);
+    }
 
     #[test]
     fn expansion_defaults() {

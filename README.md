@@ -149,7 +149,8 @@ The right pane shows details of the highlighted item. Otherwise it shows the
 session: context use, todos, changed files, and the harness with its MCP
 servers. Tab moves focus from the prompt to the tree and then to the screen.
 F2 jumps to the current project, F3 to the harnesses, and F4 shows or hides
-the panes. In the tree, use the arrow keys (or h/j/k/l) to move, Enter to
+the panes. Ctrl+B collapses or expands the tree and Ctrl+Alt+B the right pane;
+clicking a pane's divider (the `‹`/`›` at its top) does the same. In the tree, use the arrow keys (or h/j/k/l) to move, Enter to
 open, `/` to search conversations, and these keys:
 
 - `n`: start a conversation in a project, or create a project on a folder.

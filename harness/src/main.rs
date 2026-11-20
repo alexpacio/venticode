@@ -1,10 +1,12 @@
 mod agents;
 mod config;
+mod extensions;
 mod foreign;
 mod mcp;
 mod oauth;
 mod protocol;
 mod runtime;
+mod url_read;
 
 #[cfg(target_os = "linux")]
 mod managed;

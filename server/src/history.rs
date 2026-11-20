@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::Write;
 
 const TOOL_OUTPUT_LIMIT: usize = 65_536;
@@ -249,13 +250,38 @@ pub(super) fn context_budget_tokens() -> usize {
     limit.saturating_mul(4) / 5
 }
 
+/// Rescale the byte-estimate budget by the provider's reported prompt tokens for the
+/// messages last sent (pi sizes context from real usage, not only estimates).
+pub(super) fn calibrated_budget(
+    budget: usize,
+    messages: &[Value],
+    last: Option<(usize, u64)>,
+) -> usize {
+    match last {
+        Some((len, tokens)) if tokens > 0 && len <= messages.len() => {
+            let ratio = (estimate_tokens(&messages[..len]) as f64 / tokens as f64).clamp(0.25, 4.0);
+            (budget as f64 * ratio) as usize
+        }
+        _ => budget,
+    }
+}
+
+pub(super) const COMPACTION_PREFIX: &str = "[Context compacted:";
+
 /// Two-tier context compaction (inspired by pi_agent_rust's `ShakeFirst` + sliding window):
 /// 1. Stub out bulky old `role: "tool"` outputs (keeping the most recent messages verbatim).
 /// 2. If still over budget, drop oldest complete turns without splitting `tool_calls` from their
-///    matching `tool` results, inserting a clean compaction notice after the system message.
-pub(super) fn compact_messages(messages: &mut Vec<Value>, budget_tokens: usize) -> bool {
+///    matching `tool` results, inserting a compaction notice after the system message.
+///
+/// Returns `None` when nothing changed, otherwise the dropped messages (empty after a shake
+/// only). The notice lists the files the dropped turns read and modified; callers may replace
+/// it with [`summarize`]'s model-written summary.
+pub(super) fn compact_messages(
+    messages: &mut Vec<Value>,
+    budget_tokens: usize,
+) -> Option<Vec<Value>> {
     if estimate_tokens(messages) <= budget_tokens {
-        return false;
+        return None;
     }
     let mut compacted = false;
     let keep_from = messages.len().saturating_sub(SHAKE_TOOL_KEEP_RECENT);
@@ -280,7 +306,7 @@ pub(super) fn compact_messages(messages: &mut Vec<Value>, budget_tokens: usize) 
         }
     }
     if estimate_tokens(messages) <= budget_tokens {
-        return compacted;
+        return compacted.then(Vec::new);
     }
     // Tier 2: drop oldest complete turns after index 0 (system) while keeping at least the last turn.
     let start_idx = if messages.first().is_some_and(|m| m["role"] == "system") {
@@ -288,7 +314,7 @@ pub(super) fn compact_messages(messages: &mut Vec<Value>, budget_tokens: usize) 
     } else {
         0
     };
-    let mut dropped_messages = 0usize;
+    let mut dropped = Vec::new();
     while estimate_tokens(messages) > budget_tokens && messages.len() > start_idx + 4 {
         // Identify the end of the oldest atomic turn starting at `start_idx`:
         // an assistant message with `tool_calls` must stay grouped with its immediately following `tool` messages.
@@ -304,20 +330,168 @@ pub(super) fn compact_messages(messages: &mut Vec<Value>, budget_tokens: usize) 
         if drop_end >= messages.len().saturating_sub(2) {
             break;
         }
-        dropped_messages += drop_end - start_idx;
-        messages.drain(start_idx..drop_end);
-        compacted = true;
+        dropped.extend(messages.drain(start_idx..drop_end));
     }
-    if dropped_messages > 0 {
+    if !dropped.is_empty() {
         messages.insert(
             start_idx,
-            json!({
-                "role": "user",
-                "content": format!("[Context compacted: {dropped_messages} earlier messages omitted to stay within the model context window.]")
-            }),
+            json!({"role":"user","content":compaction_notice(&dropped, None)}),
         );
     }
-    compacted
+    (compacted || !dropped.is_empty()).then_some(dropped)
+}
+
+/// Notice for dropped messages: the optional summary plus pi's `<read-files>` /
+/// `<modified-files>` lists, carried forward from an earlier notice that was dropped too.
+pub(super) fn compaction_notice(dropped: &[Value], summary: Option<&str>) -> String {
+    let (read, modified) = file_operations(dropped);
+    let mut out = format!(
+        "{COMPACTION_PREFIX} {} earlier messages omitted to stay within the model context window.]",
+        dropped.len()
+    );
+    if let Some(summary) = summary {
+        out.push_str("\n\n");
+        out.push_str(summary.trim());
+    }
+    for (tag, files) in [("read-files", read), ("modified-files", modified)] {
+        if !files.is_empty() {
+            out.push_str(&format!(
+                "\n\n<{tag}>\n{}\n</{tag}>",
+                files.into_iter().collect::<Vec<_>>().join("\n")
+            ));
+        }
+    }
+    out
+}
+
+/// Files read and modified by the dropped tool calls (pi's `FileOperations`).
+fn file_operations(dropped: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut read, mut modified) = (BTreeSet::new(), BTreeSet::new());
+    for msg in dropped {
+        if let Some(previous) = msg["content"]
+            .as_str()
+            .filter(|c| c.starts_with(COMPACTION_PREFIX))
+        {
+            for (tag, set) in [("read-files", &mut read), ("modified-files", &mut modified)] {
+                if let Some((_, rest)) = previous.split_once(&format!("<{tag}>\n"))
+                    && let Some((list, _)) = rest.split_once(&format!("\n</{tag}>"))
+                {
+                    set.extend(list.lines().map(str::to_owned));
+                }
+            }
+        }
+        for call in msg["tool_calls"].as_array().into_iter().flatten() {
+            let Ok(args) = serde_json::from_str::<Value>(
+                call["function"]["arguments"].as_str().unwrap_or("{}"),
+            ) else {
+                continue;
+            };
+            let (op, args) = match call["function"]["name"].as_str().unwrap_or_default() {
+                "project_tool" => (
+                    args["operation"].as_str().unwrap_or_default().to_owned(),
+                    args["arguments"].clone(),
+                ),
+                "read" => ("read_file".into(), args),
+                "edit" => ("edit_file".into(), args),
+                "write" => ("write_file".into(), args),
+                _ => continue,
+            };
+            let set = match op.as_str() {
+                "read_file" => &mut read,
+                "edit_file" | "write_file" | "mkdir" | "remove" | "rename" => &mut modified,
+                _ => continue,
+            };
+            for key in ["path", "destination"] {
+                if let Some(path) = args[key].as_str().filter(|p| !p.is_empty()) {
+                    set.insert(path.to_owned());
+                }
+            }
+        }
+    }
+    // A modified file was necessarily read in its latest form; list it once.
+    read.retain(|p| !modified.contains(p));
+    (read, modified)
+}
+
+const SUMMARY_SYSTEM: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const SUMMARY_FORMAT: &str = "Use this EXACT format:\n\n## Goal\n[What is the user trying to accomplish?]\n\n## Constraints & Preferences\n- [Constraints, preferences, or requirements the user mentioned, or \"(none)\"]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Data, examples, or references needed to continue, or \"(none)\"]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const SUMMARY_TRANSCRIPT_BYTES: usize = 200 * 1024;
+
+/// Ask the model for pi's structured checkpoint summary of the dropped messages,
+/// updating the previous summary when an earlier notice is among them. `None` on any failure.
+pub(super) async fn summarize(
+    app: &crate::App,
+    h: &axum::http::HeaderMap,
+    model: &str,
+    dropped: &[Value],
+    vault: &mut crate::secrets::Vault,
+) -> Option<String> {
+    use futures_util::StreamExt;
+    let mut previous = None;
+    let mut transcript = String::new();
+    let clip = |s: &str, n: usize| s[..s.floor_char_boundary(n)].to_owned();
+    for msg in dropped {
+        let content = msg["content"].as_str().unwrap_or_default();
+        match msg["role"].as_str() {
+            Some("user") if content.starts_with(COMPACTION_PREFIX) => previous = Some(content),
+            Some("user") => transcript.push_str(&format!("[User]: {content}\n\n")),
+            Some("assistant") => {
+                if !content.is_empty() {
+                    transcript.push_str(&format!("[Assistant]: {content}\n\n"));
+                }
+                for call in msg["tool_calls"].as_array().into_iter().flatten() {
+                    let args = call["function"]["arguments"].as_str().unwrap_or_default();
+                    transcript.push_str(&format!(
+                        "[Assistant tool call]: {}({})\n\n",
+                        call["function"]["name"].as_str().unwrap_or_default(),
+                        clip(args, 1024)
+                    ));
+                }
+            }
+            Some("tool") => {
+                transcript.push_str(&format!("[Tool result]: {}\n\n", clip(content, 2048)))
+            }
+            _ => {}
+        }
+    }
+    if transcript.len() > SUMMARY_TRANSCRIPT_BYTES {
+        let start = transcript.ceil_char_boundary(transcript.len() - SUMMARY_TRANSCRIPT_BYTES);
+        transcript.drain(..start);
+    }
+    let instruction = match previous {
+        Some(previous) => format!(
+            "<previous-summary>\n{previous}\n</previous-summary>\n\nThe messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags. Update it: preserve existing information, add new progress and decisions, move completed items to Done, and update Next Steps.\n\n{SUMMARY_FORMAT}"
+        ),
+        None => format!(
+            "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\n{SUMMARY_FORMAT}"
+        ),
+    };
+    let mut request = json!({"model":model,"stream":true,"max_tokens":4096,"messages":[
+        {"role":"system","content":SUMMARY_SYSTEM},
+        {"role":"user","content":format!("<conversation>\n{transcript}</conversation>\n\n{instruction}")}
+    ]});
+    vault.obfuscate(app, &mut request["messages"]);
+    let collect = async {
+        let mut stream = crate::inference::infer(app, h, &request).await.ok()?;
+        let mut summary = String::new();
+        while let Some(data) = stream.next().await {
+            let data = data.ok()?;
+            if data == "[DONE]" {
+                break;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&data)
+                && let Some(delta) = v["choices"][0]["delta"]["content"].as_str()
+            {
+                summary.push_str(delta);
+            }
+        }
+        Some(summary)
+    };
+    let summary = tokio::time::timeout(std::time::Duration::from_secs(120), collect)
+        .await
+        .ok()
+        .flatten()?;
+    (!summary.trim().is_empty()).then_some(summary)
 }
 
 #[cfg(test)]
@@ -405,12 +579,65 @@ mod tests {
             json!({"role":"user","content":"fourth"}),
         ];
         let changed = compact_messages(&mut messages, 2_000);
-        assert!(changed);
+        assert!(changed.is_some());
         assert!(
             messages[3]["content"]
                 .as_str()
                 .unwrap()
                 .contains("[compacted 20000 bytes")
+        );
+    }
+
+    #[test]
+    fn dropped_turns_list_file_operations_and_carry_them_forward() {
+        let call = |name: &str, args: Value| json!({"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+        let mut messages = vec![json!({"role":"system","content":"sys"})];
+        messages.push(json!({"role":"user","content":"x".repeat(9_000)}));
+        messages.push(call("read", json!({"path":"src/a.rs"})));
+        messages.push(json!({"role":"tool","tool_call_id":"c","content":"ok"}));
+        messages.push(call(
+            "project_tool",
+            json!({"operation":"rename","arguments":{"path":"old.rs","destination":"new.rs"}}),
+        ));
+        messages.push(json!({"role":"tool","tool_call_id":"c","content":"ok"}));
+        messages.push(call(
+            "edit",
+            json!({"path":"src/a.rs","oldText":"a","newText":"b"}),
+        ));
+        messages.push(json!({"role":"tool","tool_call_id":"c","content":"ok"}));
+        for text in ["recent 1", "recent 2", "recent 3", "recent 4"] {
+            messages.push(json!({"role":"user","content":text}));
+        }
+        let dropped = compact_messages(&mut messages, 50).unwrap();
+        assert!(!dropped.is_empty());
+        let notice = messages[1]["content"].as_str().unwrap();
+        assert!(notice.starts_with(COMPACTION_PREFIX));
+        assert!(notice.contains("<modified-files>\nnew.rs\nold.rs\nsrc/a.rs\n</modified-files>"));
+        assert!(!notice.contains("<read-files>"));
+        // A later compaction that drops this notice keeps its lists.
+        let again = compaction_notice(
+            &[messages[1].clone(), call("read", json!({"path":"b.md"}))],
+            Some("## Goal\nx"),
+        );
+        assert!(again.contains("## Goal\nx"));
+        assert!(again.contains("<read-files>\nb.md\n</read-files>"));
+        assert!(again.contains("src/a.rs"));
+        assert_eq!(messages.last().unwrap()["content"], "recent 4");
+    }
+
+    #[test]
+    fn budget_follows_provider_token_counts() {
+        let messages = vec![json!({"role":"user","content":"x".repeat(3_000)})];
+        let estimated = estimate_tokens(&messages) as u64;
+        assert_eq!(calibrated_budget(1000, &messages, None), 1000);
+        // The provider counted twice the estimate: the budget in estimate units halves.
+        assert_eq!(
+            calibrated_budget(1000, &messages, Some((1, estimated * 2))),
+            500
+        );
+        assert_eq!(
+            calibrated_budget(1000, &messages, Some((2, estimated))),
+            1000
         );
     }
 

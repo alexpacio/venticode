@@ -442,6 +442,17 @@ impl Runtime {
                     )
                     .await?
             }
+            "fetch_url" => crate::url_read::fetch(text(args, "url")?, args["raw"] == true).await?,
+            "extension_list_tools" => crate::extensions::list(files.clone()).await?,
+            "extension_call_tool" => {
+                let tool = text(args, "tool")?.to_owned();
+                let parameters = args.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                ensure!(
+                    parameters.is_object(),
+                    "Extension tool parameters must be an object"
+                );
+                crate::extensions::call(files.clone(), tool, parameters).await?
+            }
             "preview" => {
                 let port = args["port"]
                     .as_u64()
