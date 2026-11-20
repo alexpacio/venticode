@@ -571,6 +571,7 @@ const TOOL_SUMMARIES: &[(&str, &str)] = &[
         "Search file contents for patterns (respects .gitignore)",
     ),
     ("ls", "List directory contents"),
+    ("skill", "Load a skill's instructions by name"),
     (
         "fetch",
         "Fetch a web page or file from an http(s) URL as markdown",
@@ -700,10 +701,14 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         .as_ref()
         .is_some_and(|r| r.inventory()["items"][0]["host_info"]["model_access"] == true);
     let computer_id = computer_runner.as_ref().map(|r| r.id());
-    let project_context = if use_tools && conversation.get::<&str, _>("runtime") != "kitesurf" {
-        crate::context::load(app, h, &member, &conversation).await
+    let project = if use_tools && conversation.get::<&str, _>("runtime") != "kitesurf" {
+        crate::context::Project::new(&member, &conversation)
     } else {
         None
+    };
+    let project_context = match &project {
+        Some(p) => p.prompt(app, h).await,
+        None => None,
     };
     let _preview_cleanup = computer_runner.map(|runner| computer::PreviewCleanup { runner, run });
     let result = generate_turns(
@@ -718,6 +723,7 @@ async fn generate(app: &App, h: &HeaderMap, id: Uuid, run: Uuid, model: String) 
         vision,
         model_access,
         conversation.get::<Value, _>("document")["goal_id"].is_string(),
+        project.as_ref(),
         project_context.as_deref(),
         &mut kitesurf,
     )
@@ -769,6 +775,7 @@ async fn generate_turns(
     vision: bool,
     model_access: bool,
     goal: bool,
+    project: Option<&crate::context::Project>,
     project_context: Option<&str>,
     kitesurf: &mut Option<browser::Browser>,
 ) -> Result<()> {
@@ -785,6 +792,9 @@ async fn generate_turns(
         }
     }
     let mut messages = history.into_messages();
+    if let Some(project) = project {
+        project.expand_skill_commands(app, h, &mut messages).await;
+    }
     let mut repairs = 0;
     let mut handoff_injected = false;
     let mut cumulative_tokens: u64 = 0;

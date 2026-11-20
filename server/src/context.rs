@@ -37,145 +37,256 @@ struct Rule {
     format: &'static str,
 }
 
-/// Read the project context for a conversation row (needs `harness_id`, `root`, `path`).
-pub(super) async fn load(
-    app: &App,
-    h: &HeaderMap,
-    member: &Member,
-    c: &sqlx::postgres::PgRow,
-) -> Option<String> {
-    let harness: Uuid = c.get::<Option<Uuid>, _>("harness_id")?;
-    let root: String = c.get("root");
-    member.harness(harness, &root).ok()?;
-    let project_path: String = c.get("path");
-    let project = c.get::<Option<Uuid>, _>("project_id");
-    let call = |operation: &'static str, path: String| {
+/// The conversation's project folder on its harness.
+pub(super) struct Project {
+    harness: Uuid,
+    root: String,
+    path: String,
+    project: Option<Uuid>,
+}
+
+impl Project {
+    /// From a conversation row (`harness_id`, `root`, `path`, `project_id`) the member may use.
+    pub(super) fn new(member: &Member, c: &sqlx::postgres::PgRow) -> Option<Self> {
+        let harness: Uuid = c.get::<Option<Uuid>, _>("harness_id")?;
+        let root: String = c.get("root");
+        member.harness(harness, &root).ok()?;
+        Some(Project {
+            harness,
+            root,
+            path: c.get("path"),
+            project: c.get("project_id"),
+        })
+    }
+
+    /// One read-only harness operation; `None` on any failure.
+    async fn call(
+        &self,
+        app: &App,
+        h: &HeaderMap,
+        operation: &str,
+        arguments: Value,
+    ) -> Option<Value> {
         let request_id = Uuid::new_v4();
         let execute = json!({
-            "action": "execute", "request_id": request_id, "project_id": project.unwrap_or(request_id),
-            "harness_id": harness, "root": root, "project_path": project_path,
-            "operation": operation, "arguments": {"path": path},
+            "action": "execute", "request_id": request_id, "project_id": self.project.unwrap_or(request_id),
+            "harness_id": self.harness, "root": self.root, "project_path": self.path,
+            "operation": operation, "arguments": arguments,
         });
-        async move {
-            crate::browse::browse(app, h, &execute, request_id)
-                .await
-                .ok()
-        }
-    };
-    let names = |listing: Option<Value>, dirs: bool| -> Vec<String> {
-        let mut names: Vec<String> = listing
-            .and_then(|v| v["items"].as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter(|i| i["directory"] == dirs && i["symlink"] != true)
-            .filter_map(|i| i["name"].as_str().map(str::to_owned))
-            .collect();
-        names.sort();
-        names
-    };
-    let top = call("list_files", ".".into()).await;
-    if top.is_none() {
-        tracing::debug!("project context skipped: harness listing failed");
-        return None;
+        crate::browse::browse(app, h, &execute, request_id)
+            .await
+            .ok()
     }
-    let (files, dirs) = (names(top.clone(), false), names(top, true));
-    let has_file = |n: &str| files.iter().any(|f| f == n);
-    let has_dir = |n: &str| dirs.iter().any(|d| d == n);
 
-    // Directory candidates: (dir, extension filter, format).
-    let mut dir_specs: Vec<(&str, Option<&str>, &'static str)> = Vec::new();
-    if has_dir(".cursor") {
-        dir_specs.push((".cursor/rules", Some("mdc"), "cursor-mdc"));
+    /// System-prompt additions: project context files and the skills catalog.
+    pub(super) async fn prompt(&self, app: &App, h: &HeaderMap) -> Option<String> {
+        let (files, skills) = futures_util::future::join(
+            self.context_files(app, h),
+            self.call(app, h, "skill_list", json!({})),
+        )
+        .await;
+        let out = files.unwrap_or_default() + &skills.map(|s| skills_block(&s)).unwrap_or_default();
+        (!out.is_empty()).then_some(out)
     }
-    if has_dir(".clinerules") {
-        dir_specs.push((".clinerules", Some("md"), "cline"));
-    }
-    if has_dir(".github") {
-        dir_specs.push((".github/instructions", Some("md"), "copilot-scoped"));
-    }
-    if has_dir(".windsurf") {
-        dir_specs.push((".windsurf/rules", None, "windsurf-dir"));
-    }
-    let listings = futures_util::future::join_all(
-        dir_specs
-            .iter()
-            .map(|(d, _, _)| call("list_files", (*d).into())),
-    )
-    .await;
 
-    // Everything to read, in pi's discovery order.
-    let mut wanted: Vec<(String, &'static str)> = Vec::new();
-    for native in ["AGENTS.md", "CLAUDE.md"] {
-        if has_file(native) {
-            wanted.push((native.into(), "native"));
+    /// pi's `/skill:name args`: replace such user messages with the skill body and the arguments.
+    pub(super) async fn expand_skill_commands(
+        &self,
+        app: &App,
+        h: &HeaderMap,
+        messages: &mut [Value],
+    ) {
+        for message in messages.iter_mut().filter(|m| m["role"] == "user") {
+            let Some((name, args)) = message["content"].as_str().and_then(skill_command) else {
+                continue;
+            };
+            let Some(skill) = self.call(app, h, "skill_read", json!({"name": name})).await else {
+                continue;
+            };
+            if skill["user_invocable"] == false {
+                continue;
+            }
+            message["content"] = json!(expand_skill(&skill, &args));
         }
     }
-    let dir_files = |dir: &str, ext: Option<&str>, listing: &Option<Value>| -> Vec<String> {
-        names(listing.clone(), false)
-            .into_iter()
-            .filter(|n| {
-                ext.is_none_or(|e| {
-                    n.rsplit_once('.')
-                        .is_some_and(|(_, x)| x.eq_ignore_ascii_case(e))
+
+    /// Context files (`AGENTS.md` and foreign rules) read through the harness.
+    async fn context_files(&self, app: &App, h: &HeaderMap) -> Option<String> {
+        let call = |operation: &'static str, path: String| {
+            self.call(app, h, operation, json!({"path": path}))
+        };
+        let names = |listing: Option<Value>, dirs: bool| -> Vec<String> {
+            let mut names: Vec<String> = listing
+                .and_then(|v| v["items"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|i| i["directory"] == dirs && i["symlink"] != true)
+                .filter_map(|i| i["name"].as_str().map(str::to_owned))
+                .collect();
+            names.sort();
+            names
+        };
+        let top = call("list_files", ".".into()).await;
+        if top.is_none() {
+            tracing::debug!("project context skipped: harness listing failed");
+            return None;
+        }
+        let (files, dirs) = (names(top.clone(), false), names(top, true));
+        let has_file = |n: &str| files.iter().any(|f| f == n);
+        let has_dir = |n: &str| dirs.iter().any(|d| d == n);
+
+        // Directory candidates: (dir, extension filter, format).
+        let mut dir_specs: Vec<(&str, Option<&str>, &'static str)> = Vec::new();
+        if has_dir(".cursor") {
+            dir_specs.push((".cursor/rules", Some("mdc"), "cursor-mdc"));
+        }
+        if has_dir(".clinerules") {
+            dir_specs.push((".clinerules", Some("md"), "cline"));
+        }
+        if has_dir(".github") {
+            dir_specs.push((".github/instructions", Some("md"), "copilot-scoped"));
+        }
+        if has_dir(".windsurf") {
+            dir_specs.push((".windsurf/rules", None, "windsurf-dir"));
+        }
+        let listings = futures_util::future::join_all(
+            dir_specs
+                .iter()
+                .map(|(d, _, _)| call("list_files", (*d).into())),
+        )
+        .await;
+
+        // Everything to read, in pi's discovery order.
+        let mut wanted: Vec<(String, &'static str)> = Vec::new();
+        for native in ["AGENTS.md", "CLAUDE.md"] {
+            if has_file(native) {
+                wanted.push((native.into(), "native"));
+            }
+        }
+        let dir_files = |dir: &str, ext: Option<&str>, listing: &Option<Value>| -> Vec<String> {
+            names(listing.clone(), false)
+                .into_iter()
+                .filter(|n| {
+                    ext.is_none_or(|e| {
+                        n.rsplit_once('.')
+                            .is_some_and(|(_, x)| x.eq_ignore_ascii_case(e))
+                    })
                 })
+                .take(MAX_DIR_RULES)
+                .map(|n| format!("{dir}/{n}"))
+                .collect()
+        };
+        let spec_files = |format: &str| {
+            dir_specs
+                .iter()
+                .zip(&listings)
+                .filter(|((_, _, f), _)| *f == format)
+                .flat_map(|((d, e, _), l)| dir_files(d, *e, l))
+                .collect::<Vec<_>>()
+        };
+        wanted.extend(
+            spec_files("cursor-mdc")
+                .into_iter()
+                .map(|p| (p, "cursor-mdc")),
+        );
+        if has_file(".cursorrules") {
+            wanted.push((".cursorrules".into(), "cursor-legacy"));
+        }
+        wanted.extend(spec_files("cline").into_iter().map(|p| (p, "cline")));
+        if has_file(".clinerules") {
+            wanted.push((".clinerules".into(), "cline"));
+        }
+        if has_dir(".github") {
+            wanted.push((".github/copilot-instructions.md".into(), "copilot"));
+        }
+        wanted.extend(
+            spec_files("copilot-scoped")
+                .into_iter()
+                .filter(|p| p.ends_with(".instructions.md"))
+                .map(|p| (p, "copilot-scoped")),
+        );
+        if has_file(".windsurfrules") {
+            wanted.push((".windsurfrules".into(), "windsurf"));
+        }
+        wanted.extend(
+            spec_files("windsurf-dir")
+                .into_iter()
+                .map(|p| (p, "windsurf-dir")),
+        );
+        if has_file("GEMINI.md") {
+            wanted.push(("GEMINI.md".into(), "gemini"));
+        }
+        let contents = futures_util::future::join_all(
+            wanted.iter().map(|(p, _)| call("read_file", p.clone())),
+        )
+        .await;
+        let read: Vec<(String, &'static str, String)> = wanted
+            .into_iter()
+            .zip(contents)
+            .filter_map(|((path, format), v)| {
+                let v = v?;
+                let content = v["content"].as_str().filter(|_| v["encoding"] == "utf8")?;
+                Some((path, format, content.to_owned()))
             })
-            .take(MAX_DIR_RULES)
-            .map(|n| format!("{dir}/{n}"))
-            .collect()
-    };
-    let spec_files = |format: &str| {
-        dir_specs
-            .iter()
-            .zip(&listings)
-            .filter(|((_, _, f), _)| *f == format)
-            .flat_map(|((d, e, _), l)| dir_files(d, *e, l))
-            .collect::<Vec<_>>()
-    };
-    wanted.extend(
-        spec_files("cursor-mdc")
-            .into_iter()
-            .map(|p| (p, "cursor-mdc")),
+            .collect();
+        render(read)
+    }
+}
+
+/// `/skill:name rest` → `(name, rest)`.
+fn skill_command(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("/skill:")?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| (name.to_owned(), rest[end..].trim().to_owned()))
+}
+
+fn expand_skill(skill: &Value, args: &str) -> String {
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        skill["name"].as_str().unwrap_or_default(),
+        skill["location"].as_str().unwrap_or_default(),
+        skill["base_dir"].as_str().unwrap_or_default(),
+        skill["content"].as_str().unwrap_or_default()
     );
-    if has_file(".cursorrules") {
-        wanted.push((".cursorrules".into(), "cursor-legacy"));
+    if args.is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{args}")
     }
-    wanted.extend(spec_files("cline").into_iter().map(|p| (p, "cline")));
-    if has_file(".clinerules") {
-        wanted.push((".clinerules".into(), "cline"));
-    }
-    if has_dir(".github") {
-        wanted.push((".github/copilot-instructions.md".into(), "copilot"));
-    }
-    wanted.extend(
-        spec_files("copilot-scoped")
-            .into_iter()
-            .filter(|p| p.ends_with(".instructions.md"))
-            .map(|p| (p, "copilot-scoped")),
-    );
-    if has_file(".windsurfrules") {
-        wanted.push((".windsurfrules".into(), "windsurf"));
-    }
-    wanted.extend(
-        spec_files("windsurf-dir")
-            .into_iter()
-            .map(|p| (p, "windsurf-dir")),
-    );
-    if has_file("GEMINI.md") {
-        wanted.push(("GEMINI.md".into(), "gemini"));
-    }
-    let contents =
-        futures_util::future::join_all(wanted.iter().map(|(p, _)| call("read_file", p.clone())))
-            .await;
-    let read: Vec<(String, &'static str, String)> = wanted
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// pi's `<available_skills>` block for skills the model may invoke.
+fn skills_block(listing: &Value) -> String {
+    let skills: Vec<String> = listing["skills"]
+        .as_array()
         .into_iter()
-        .zip(contents)
-        .filter_map(|((path, format), v)| {
-            let v = v?;
-            let content = v["content"].as_str().filter(|_| v["encoding"] == "utf8")?;
-            Some((path, format, content.to_owned()))
+        .flatten()
+        .filter(|s| s["model_invocable"] != false)
+        .take(128)
+        .map(|s| {
+            format!(
+                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
+                escape_xml(s["name"].as_str().unwrap_or_default()),
+                escape_xml(s["description"].as_str().unwrap_or_default()),
+                escape_xml(s["location"].as_str().unwrap_or_default())
+            )
         })
         .collect();
-    render(read)
+    if skills.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the skill tool with the skill's name to load it when the task matches its description.\nWhen a skill references a relative path, resolve it against the skill's base_dir.\n\n<available_skills>\n{}\n</available_skills>\n",
+        skills.join("\n")
+    )
 }
 
 /// Build the prompt block from `(relative path, format, content)` in discovery order.
@@ -547,6 +658,32 @@ mod tests {
         assert!(!out.contains("# Project Context"));
         assert!(out.contains("[1 imported rule(s) omitted"));
         assert!(render(vec![]).is_none());
+    }
+
+    #[test]
+    fn skills_catalog_and_commands_follow_pi() {
+        let listing = json!({"skills":[
+            {"name":"sql","description":"SQL <help>","location":"/p/.pi/skills/sql/SKILL.md","model_invocable":true},
+            {"name":"hidden","description":"x","location":"/h","model_invocable":false}
+        ]});
+        let block = skills_block(&listing);
+        assert!(
+            block.contains("<name>sql</name>\n    <description>SQL &lt;help&gt;</description>")
+        );
+        assert!(!block.contains("hidden"));
+        assert!(skills_block(&json!({"skills":[]})).is_empty());
+        assert_eq!(
+            skill_command("/skill:sql  optimize this\nquery"),
+            Some(("sql".into(), "optimize this\nquery".into()))
+        );
+        assert_eq!(skill_command("/skill:"), None);
+        assert_eq!(skill_command("hello /skill:sql"), None);
+        let skill =
+            json!({"name":"sql","location":"/s/SKILL.md","base_dir":"/s","content":"Use CTEs."});
+        assert_eq!(
+            expand_skill(&skill, "go"),
+            "<skill name=\"sql\" location=\"/s/SKILL.md\">\nReferences are relative to /s.\n\nUse CTEs.\n</skill>\n\ngo"
+        );
     }
 
     #[test]

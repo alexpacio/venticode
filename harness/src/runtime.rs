@@ -442,6 +442,25 @@ impl Runtime {
                     )
                     .await?
             }
+            "catalog_list" => {
+                crate::catalog::list(text(args, "repo")?, args["ref"].as_str().unwrap_or("main"))
+                    .await?
+            }
+            "catalog_install" => crate::catalog::install(files.clone(), args).await?,
+            "catalog_remove" => crate::catalog::remove(files.clone(), args).await?,
+            "catalog_installed" => {
+                let files = files.clone();
+                tokio::task::spawn_blocking(move || crate::catalog::installed(&files)).await?
+            }
+            "skill_list" => {
+                let base = files.base_path().to_path_buf();
+                tokio::task::spawn_blocking(move || crate::skills::list(&base)).await?
+            }
+            "skill_read" => {
+                let base = files.base_path().to_path_buf();
+                let name = text(args, "name")?.to_owned();
+                tokio::task::spawn_blocking(move || crate::skills::read(&base, &name)).await??
+            }
             "fetch_url" => crate::url_read::fetch(text(args, "url")?, args["raw"] == true).await?,
             "extension_list_tools" => crate::extensions::list(files.clone()).await?,
             "extension_call_tool" => {

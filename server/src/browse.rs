@@ -53,8 +53,19 @@ pub(super) async fn browse(
     execute: &Value,
     request_id: Uuid,
 ) -> Result<Value> {
+    browse_within(app, h, execute, request_id, BROWSE_TIMEOUT).await
+}
+
+/// [`browse`] with a caller-chosen deadline (repository downloads take longer).
+pub(super) async fn browse_within(
+    app: &App,
+    h: &HeaderMap,
+    execute: &Value,
+    request_id: Uuid,
+    deadline: Duration,
+) -> Result<Value> {
     crate::tools::relay(app, h, execute.clone()).await?;
-    let outcome = tokio::time::timeout(BROWSE_TIMEOUT, async {
+    let outcome = tokio::time::timeout(deadline, async {
         let mut after = 0i64;
         let mut result = None;
         loop {

@@ -255,6 +255,127 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/showcase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Curated GitHub sources of pi skills and plugins */
+        get: operations["listShowcaseSources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{id}/showcase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Skills and plugins in a showcase source or any public GitHub repository
+         * @description The project's harness downloads the repository archive from codeload.github.com and lists folders holding SKILL.md (skills) and pi extensions (plugins). `source` is a curated source id or `owner/repo`.
+         */
+        get: operations["listShowcaseItems"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{id}/showcase/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install a listed skill or plugin
+         * @description Skills install into the project's .pi/skills or the harness user's ~/.pi/agent/skills; plugins only into the project's .pi/extensions. An install of the same name is replaced.
+         */
+        post: operations["installShowcaseItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{id}/showcase/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Remove an installed skill or plugin by name */
+        post: operations["removeShowcaseItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{id}/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /** pi plugins installed in the project (.pi/extensions, .venticode/extensions) */
+        get: operations["listPlugins"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{id}/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the pi agent skills a member can invoke with /skill:name
+         * @description The project's harness reads SKILL.md files from the project's .pi/skills and .agents/skills folders and from ~/.pi/agent/skills and ~/.agents/skills on its host. Only user-invocable skills are listed.
+         */
+        get: operations["listSkills"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/projects/{id}/imports": {
         parameters: {
             query?: never;
@@ -662,12 +783,39 @@ export interface components {
             harness_id?: string;
         };
         /** @enum {string} */
-        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "fetch_url" | "extension_list_tools" | "extension_call_tool" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
+        HarnessOperation: "list_files" | "find_files" | "search_files" | "read_file" | "write_file" | "edit_file" | "mkdir" | "rename" | "remove" | "execute" | "terminal_start" | "agent_start" | "mcp_list_servers" | "mcp_list_tools" | "mcp_call_tool" | "preview" | "fetch_url" | "extension_list_tools" | "extension_call_tool" | "skill_list" | "skill_read" | "browser_tabs" | "browser_new_tab" | "browser_select_tab" | "browser_open" | "browser_snapshot" | "browser_follow_link" | "browser_open_preview" | "desktop_screenshot" | "desktop_act" | "project_service_start" | "ask_model";
         DirectoryEntry: {
             name: string;
             directory: boolean;
             symlink: boolean;
             bytes: number;
+        };
+        ShowcaseSource: {
+            id: string;
+            /** @description owner/name on GitHub */
+            repo: string;
+            ref: string;
+            title: string;
+            description: {
+                it: string;
+                en: string;
+            };
+        };
+        ShowcaseItem: {
+            /** @enum {string} */
+            kind: "skill" | "plugin";
+            name: string;
+            description: string;
+            /** @description Folder or file in the repository */
+            path: string;
+            /** @description plugin: registers tools the agent can call */
+            tools: boolean;
+            /** @description plugin: imports files outside its folder, which are not installed */
+            outside_imports: boolean;
+        };
+        Skill: {
+            name: string;
+            description: string;
         };
         ForeignSession: {
             id: string;
@@ -1412,6 +1560,205 @@ export interface operations {
             200: components["responses"]["Deleted"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    listShowcaseSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sources */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["ShowcaseSource"][];
+                    };
+                };
+            };
+        };
+    };
+    listShowcaseItems: {
+        parameters: {
+            query: {
+                source: string;
+                ref?: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installable items */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        repo: string;
+                        ref: string;
+                        items: components["schemas"]["ShowcaseItem"][];
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    installShowcaseItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: string;
+                    ref?: string;
+                    /** @enum {string} */
+                    kind: "skill" | "plugin";
+                    path: string;
+                    /** @enum {string} */
+                    scope: "project" | "user";
+                };
+            };
+        };
+        responses: {
+            /** @description Installed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        kind: "skill" | "plugin";
+                        /** @enum {string} */
+                        scope: "project" | "user";
+                        name: string;
+                        /** @description Folder the item was written to */
+                        installed: string;
+                        files: number;
+                        replaced: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    removeShowcaseItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact origin of the workspace host */
+                Origin: components["parameters"]["Origin"];
+            };
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    kind: "skill" | "plugin";
+                    name: string;
+                    /** @enum {string} */
+                    scope: "project" | "user";
+                };
+            };
+        };
+        responses: {
+            /** @description Removal result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        removed: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    listPlugins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed plugins */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            name: string;
+                            path: string;
+                        }[];
+                    };
+                };
+            };
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    listSkills: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invocable skills */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["Skill"][];
+                    };
+                };
+            };
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     listForeignSessions: {

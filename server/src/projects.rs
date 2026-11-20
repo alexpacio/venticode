@@ -5,6 +5,18 @@ pub(super) fn routes() -> Router<App> {
         .route("/projects", get(list).post(create))
         .route("/projects/{id}", delete(remove))
         .route("/projects/{id}/imports", get(foreign_sessions).post(import))
+        .route("/projects/{id}/skills", get(skills))
+        .route("/projects/{id}/plugins", get(crate::showcase::installed))
+        .route("/projects/{id}/showcase", get(crate::showcase::items))
+        .route(
+            "/projects/{id}/showcase/install",
+            post(crate::showcase::install),
+        )
+        .route(
+            "/projects/{id}/showcase/remove",
+            post(crate::showcase::remove),
+        )
+        .route("/showcase", get(crate::showcase::sources))
         .route("/conversations", get(conversations).post(start))
         .route(
             "/conversations/{id}",
@@ -341,6 +353,19 @@ async fn foreign(
     operation: &str,
     arguments: Value,
 ) -> Result<Value> {
+    harness_call(app, h, m, project, operation, arguments, None).await
+}
+
+/// [`foreign`] with an optional longer deadline.
+pub(super) async fn harness_call(
+    app: &App,
+    h: &HeaderMap,
+    m: &Member,
+    project: Uuid,
+    operation: &str,
+    arguments: Value,
+    deadline: Option<std::time::Duration>,
+) -> Result<Value> {
     let row = sqlx::query(
         "SELECT harness_id,root,path FROM projects WHERE workspace=$1 AND owner_id=$2 AND id=$3",
     )
@@ -361,7 +386,10 @@ async fn foreign(
         "harness_id": harness, "root": root, "project_path": row.get::<String, _>("path"),
         "operation": operation, "arguments": arguments,
     });
-    crate::browse::browse(app, h, &execute, request_id).await
+    match deadline {
+        Some(d) => crate::browse::browse_within(app, h, &execute, request_id, d).await,
+        None => crate::browse::browse(app, h, &execute, request_id).await,
+    }
 }
 
 /// `GET /projects/{id}/imports` — Claude Code and Codex sessions recorded for this project.
@@ -384,6 +412,28 @@ async fn foreign_sessions(
                 "modified_ms": i["modified_ms"].as_u64().unwrap_or(0),
             }))
         })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// `GET /projects/{id}/skills` — pi agent skills a member can invoke with `/skill:name`.
+async fn skills(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Result<Json<Value>> {
+    let m = Member::load(&app, &h, false).await?;
+    let value = foreign(&app, &h, &m, id, "skill_list", json!({})).await?;
+    // The harness is outside the trust boundary: keep bounded, well-formed entries only.
+    let items: Vec<Value> = value["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["user_invocable"] != false)
+        .filter_map(|s| {
+            let name = s["name"]
+                .as_str()
+                .filter(|n| !n.is_empty() && n.len() <= 128 && !n.contains(char::is_whitespace))?;
+            let description: String = s["description"].as_str()?.chars().take(1024).collect();
+            Some(json!({"name": name, "description": description}))
+        })
+        .take(256)
         .collect();
     Ok(Json(json!({ "items": items })))
 }

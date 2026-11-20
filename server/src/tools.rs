@@ -3,7 +3,14 @@ use crate::history::{append_output, tool_content};
 use crate::runs::{append, record, stage};
 use std::time::{Duration, Instant};
 
-const READ: &[&str] = &["list_files", "find_files", "search_files", "read_file"];
+const READ: &[&str] = &[
+    "list_files",
+    "find_files",
+    "search_files",
+    "read_file",
+    "skill_list",
+    "skill_read",
+];
 const EDIT: &[&str] = &["write_file", "edit_file", "mkdir", "rename", "remove"];
 const ACTION: &[&str] = &[
     "execute",
@@ -33,10 +40,18 @@ const TOOL_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(900);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
 const PREVIEW_MAX_CHARS: usize = 1024;
 
-/// Session import reads Claude Code/Codex logs for the project folder. Only the
-/// import endpoints dispatch these; `policy` rejects them, so the model cannot.
+/// Endpoint-only operations: session import (Claude Code/Codex logs) and the
+/// showcase installer. `policy` rejects them, so the model cannot call them.
 pub(super) fn is_import_operation(op: &str) -> bool {
-    matches!(op, "foreign_sessions" | "foreign_session_import")
+    matches!(
+        op,
+        "foreign_sessions"
+            | "foreign_session_import"
+            | "catalog_list"
+            | "catalog_install"
+            | "catalog_remove"
+            | "catalog_installed"
+    )
 }
 
 pub(super) fn is_project_operation(op: &str) -> bool {
@@ -51,7 +66,7 @@ pub(super) fn is_computer_operation(op: &str) -> bool {
 /// pure read-only tools can execute concurrently in maximal contiguous batches.
 pub(super) fn is_parallel_safe(name: &str, args: &Value) -> bool {
     match name {
-        "read" | "ls" | "grep" => true,
+        "read" | "ls" | "grep" | "skill" => true,
         "project_tool" => args["operation"]
             .as_str()
             .is_some_and(|op| READ.contains(&op) || LOCAL_MCP.contains(&op)),
@@ -256,6 +271,12 @@ const FILE_FUNCTIONS: &[(&str, &str, &str, &[&str])] = &[
         "search_files",
         "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Set regex to true for regular expressions.",
         &["query"],
+    ),
+    (
+        "skill",
+        "skill_read",
+        "Load a skill's instructions (SKILL.md body and base_dir) by the name listed in available_skills.",
+        &["name"],
     ),
     (
         "fetch",

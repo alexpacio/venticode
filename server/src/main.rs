@@ -13,6 +13,7 @@ mod projects;
 mod runner;
 mod runs;
 mod secrets;
+mod showcase;
 mod standalone;
 mod storage;
 mod tools;

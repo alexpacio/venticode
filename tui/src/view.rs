@@ -554,6 +554,20 @@ fn panel(app: &App, width: usize) -> Option<(String, u8, Vec<Line<'static>>)> {
         let labels: Vec<String> = p.items.iter().map(|i| i.0.clone()).collect();
         let current = p.items.iter().position(|i| i.1 == p.current);
         let mut lines = choices(&labels, p.sel, current);
+        // Long lists (showcase sources hold hundreds of skills) scroll with the selection.
+        if lines.len() > crate::app::PICKER_ROWS {
+            let start = (p.sel + 1)
+                .saturating_sub(crate::app::PICKER_ROWS)
+                .min(lines.len() - crate::app::PICKER_ROWS);
+            let total = lines.len();
+            lines = lines
+                .drain(start..start + crate::app::PICKER_ROWS)
+                .collect();
+            lines.push(Line::styled(
+                format!("  {}/{} · PgUp/PgDn", p.sel + 1, total),
+                fg(DIM),
+            ));
+        }
         lines.push(Line::default());
         lines.push(Line::styled(
             app.msg("Invio conferma · Esc annulla", "Enter confirm · Esc cancel"),
@@ -743,7 +757,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         rows.len().clamp(1, 6) as u16 + 2
     };
     let banner = u16::from(!app.status.is_empty());
-    let suggestions = slash_suggestions(&app.input, app.hide_menu);
+    let suggestions = slash_suggestions(&app.input, app.hide_menu, app.skill_list());
     let panel = panel(app, width);
     let panel_height = match &panel {
         Some((_, _, lines)) => lines.len() as u16 + 2,
@@ -793,7 +807,11 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             let start = (sel + 1).saturating_sub(height);
             for (i, cmd) in suggestions.iter().enumerate().skip(start).take(height) {
                 let on = i == sel;
-                let desc = if app.en { cmd.2 } else { cmd.1 };
+                let desc = if app.en {
+                    cmd.2.as_str()
+                } else {
+                    cmd.1.as_str()
+                };
                 let line = Line::from_spans(vec![
                     Span::styled(if on { "  ❯ " } else { "    " }, fg(ORANGE)),
                     Span::styled(

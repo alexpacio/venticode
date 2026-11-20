@@ -39,6 +39,21 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Resume a conversation [N]",
     ),
     (
+        "/skills",
+        "Skill e plugin installati · /skill:nome",
+        "Installed skills and plugins · /skill:name",
+    ),
+    (
+        "/showcase",
+        "Sfoglia e installa skill e plugin [owner/repo]",
+        "Browse and install skills and plugins [owner/repo]",
+    ),
+    (
+        "/uninstall",
+        "Rimuovi: skill|plugin nome [user]",
+        "Remove: skill|plugin name [user]",
+    ),
+    (
         "/import",
         "Importa una sessione Claude Code o Codex",
         "Import a Claude Code or Codex session",
@@ -238,21 +253,74 @@ pub fn append_capped_output(dest: &mut String, chunk: &str, max_bytes: usize) {
     }
 }
 
+/// Rows a picker shows at once; longer lists scroll with the selection.
+pub const PICKER_ROWS: usize = 12;
+
+/// Percent-encode a query value (the browser build has no `url` crate).
+fn query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `skill · name · description`, with plugin compatibility hints.
+fn showcase_label(item: &Value, en: bool) -> String {
+    let mut label = format!("{} · {}", string(item, "kind"), string(item, "name"));
+    if item["kind"] == "plugin" {
+        label.push_str(match (item["tools"] == true, en) {
+            (true, true) => " [tools]",
+            (true, false) => " [strumenti]",
+            (false, true) => " [no tools: commands/UI only]",
+            (false, false) => " [senza strumenti: solo comandi/UI]",
+        });
+    }
+    let description: String = string(item, "description").chars().take(90).collect();
+    if !description.is_empty() {
+        label.push_str(" · ");
+        label.push_str(&description);
+    }
+    clean(&label)
+}
+
+/// Slash menu entries `(command, italiano, english)`: the built-in commands,
+/// then `/skill:name` for each listed pi skill (its description is not translated).
 pub fn slash_suggestions(
     input: &str,
     hide: bool,
-) -> Vec<&'static (&'static str, &'static str, &'static str)> {
+    skills: &[Value],
+) -> Vec<(String, String, String)> {
     if hide || !input.starts_with('/') || input.contains(' ') {
         return Vec::new();
     }
-    COMMANDS.iter().filter(|c| c.0.starts_with(input)).collect()
+    let skills = skills.iter().map(|s| {
+        let description = string(s, "description");
+        (
+            format!("/skill:{}", string(s, "name")),
+            description.clone(),
+            description,
+        )
+    });
+    COMMANDS
+        .iter()
+        .map(|c| (c.0.to_owned(), c.1.to_owned(), c.2.to_owned()))
+        .chain(skills)
+        .filter(|c| c.0.starts_with(input))
+        .collect()
 }
 
-fn needs_tab_completion(line: &str, suggestions: usize) -> bool {
+fn needs_tab_completion(line: &str, suggestions: usize, skills: &[Value]) -> bool {
     line.starts_with('/')
         && !line.starts_with("//")
         && !line.contains(' ')
-        && !COMMANDS.iter().any(|c| c.0 == line)
+        && !slash_suggestions(line, false, skills)
+            .iter()
+            .any(|c| c.0 == line)
         && suggestions > 0
 }
 
@@ -348,6 +416,12 @@ pub enum Pick {
     Chat,
     /// Importable Claude Code/Codex sessions as (label, id).
     Import(Vec<(String, String)>),
+    /// Showcase sources as (label, source id).
+    Showcase(Vec<(String, String)>),
+    /// Items of a showcase source: (source, items as (label, "kind\tpath")).
+    ShowcaseItems(String, Vec<(String, String)>),
+    /// Where to install a skill: (source, repository path).
+    ShowcaseScope(String, String),
     Runtime(String),
     Policy(String, &'static str),
 }
@@ -504,6 +578,8 @@ pub struct App {
     pub bots: Vec<Value>,
     pub connections: Vec<Value>,
     pub project: Value,
+    /// pi skills of a project as `(project id, items)`, loaded by `/skills`.
+    pub skills: (Value, Vec<Value>),
     pub chat: Value,
     pub model: String,
     pub effort: String,
@@ -585,6 +661,7 @@ impl App {
             bots: vec![],
             connections: vec![],
             project: Value::Null,
+            skills: (Value::Null, vec![]),
             chat: Value::Null,
             model: String::new(),
             effort: "medium".into(),
@@ -669,6 +746,15 @@ impl App {
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Skills loaded for the current project, for `/skill:name` completion.
+    pub fn skill_list(&self) -> &[Value] {
+        if self.skills.0 == self.project["id"] {
+            &self.skills.1
+        } else {
+            &[]
+        }
     }
 
     pub fn note(&mut self, s: impl AsRef<str>) {
@@ -1476,7 +1562,7 @@ impl App {
             }
             _ => {}
         }
-        let suggestions = slash_suggestions(&self.input, self.hide_menu).len();
+        let suggestions = slash_suggestions(&self.input, self.hide_menu, self.skill_list()).len();
         if k.code == KeyCode::Tab && !(self.focus == Focus::Editor && suggestions > 0) {
             self.cycle_focus();
             return Ok(());
@@ -1632,7 +1718,7 @@ impl App {
         let m = k.modifiers;
         let ctrl = m.contains(Modifiers::CTRL);
         let alt = m.contains(Modifiers::ALT);
-        let suggestions = slash_suggestions(&self.input, self.hide_menu);
+        let suggestions = slash_suggestions(&self.input, self.hide_menu, self.skill_list());
         let count = suggestions.len();
         self.selection = self.selection.min(count.saturating_sub(1));
         let width = self.editor_width.max(1);
@@ -1780,10 +1866,12 @@ impl App {
         if line.is_empty() {
             return Ok(());
         }
-        if needs_tab_completion(&line, suggestions) {
+        if needs_tab_completion(&line, suggestions, self.skill_list()) {
             self.input = format!(
                 "{} ",
-                slash_suggestions(&line, false)[self.selection.min(suggestions - 1)].0
+                slash_suggestions(&line, false, self.skill_list())
+                    [self.selection.min(suggestions - 1)]
+                .0
             );
             self.caret = self.input.len();
             return Ok(());
@@ -1870,6 +1958,35 @@ impl App {
                 items.clone(),
                 String::new(),
             ),
+            Pick::Showcase(items) => (
+                self.msg(
+                    "Showcase · scegli una sorgente (/showcase owner/repo per altre)",
+                    "Showcase · choose a source (/showcase owner/repo for others)",
+                ),
+                items.clone(),
+                String::new(),
+            ),
+            Pick::ShowcaseItems(_, items) => (
+                self.msg("Installa · ↑/↓ PgUp/PgDn", "Install · ↑/↓ PgUp/PgDn"),
+                items.clone(),
+                String::new(),
+            ),
+            Pick::ShowcaseScope(..) => (
+                self.msg("Dove installare la skill?", "Where should the skill go?"),
+                vec![
+                    pair(
+                        "Questo progetto (.pi/skills)",
+                        "This project (.pi/skills)",
+                        "project",
+                    ),
+                    pair(
+                        "Tutti i progetti di questo harness (~/.pi/agent/skills)",
+                        "Every project on this harness (~/.pi/agent/skills)",
+                        "user",
+                    ),
+                ],
+                String::new(),
+            ),
             Pick::Runtime(bot) => {
                 let bot = self
                     .bots
@@ -1938,6 +2055,14 @@ impl App {
                 p.sel = (p.sel + 1).min(n.saturating_sub(1));
                 return Ok(());
             }
+            KeyCode::PageUp => {
+                p.sel = p.sel.saturating_sub(PICKER_ROWS);
+                return Ok(());
+            }
+            KeyCode::PageDown => {
+                p.sel = (p.sel + PICKER_ROWS).min(n.saturating_sub(1));
+                return Ok(());
+            }
             KeyCode::Enter => p.sel,
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
                 c as usize - '1' as usize
@@ -1969,6 +2094,20 @@ impl App {
                     .await?;
                 self.chats.insert(0, chat.clone());
                 self.activate(cx, chat)?;
+            }
+            Pick::Showcase(_) => self.showcase_items(cx, &value).await?,
+            Pick::ShowcaseItems(source, _) => {
+                let (kind, path) = value.split_once('\t').unwrap_or(("", ""));
+                if kind == "skill" {
+                    self.open_picker(Pick::ShowcaseScope(source, path.to_owned()))?;
+                } else {
+                    self.showcase_install(cx, &source, kind, path, "project")
+                        .await?;
+                }
+            }
+            Pick::ShowcaseScope(source, path) => {
+                self.showcase_install(cx, &source, "skill", &path, &value)
+                    .await?
             }
             Pick::Runtime(bot) => {
                 screens::patch_bot(self, cx, &bot, json!({"runtime": value})).await?
@@ -2259,6 +2398,125 @@ impl App {
             "/effort" if argument.is_empty() => self.open_picker(Pick::Effort)?,
             "/permissions" if argument.is_empty() => self.open_picker(Pick::Mode)?,
             "/resume" | "/open" if argument.is_empty() => self.open_picker(Pick::Chat)?,
+            "/skills" => {
+                let id = string(&self.project, "id");
+                ensure!(
+                    !id.is_empty(),
+                    self.msg(
+                        "F2 · scegli prima un progetto",
+                        "F2 · choose a project first"
+                    )
+                );
+                let listing = self
+                    .remote
+                    .api(cx, Method::Get, &format!("/projects/{id}/skills"), None)
+                    .await?;
+                let items = listing["items"].as_array().cloned().unwrap_or_default();
+                let lines: Vec<String> = items
+                    .iter()
+                    .map(|s| {
+                        clean(&format!(
+                            "/skill:{:<24} {}",
+                            string(s, "name"),
+                            string(s, "description")
+                        ))
+                    })
+                    .collect();
+                self.skills = (self.project["id"].clone(), items);
+                let plugins = self
+                    .remote
+                    .api(cx, Method::Get, &format!("/projects/{id}/plugins"), None)
+                    .await?;
+                let plugins: Vec<String> = plugins["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        clean(&format!(
+                            "plugin {:<24} {}",
+                            string(p, "name"),
+                            string(p, "path")
+                        ))
+                    })
+                    .collect();
+                let mut out = Vec::new();
+                out.push(if lines.is_empty() {
+                    self.msg(
+                        "Nessuna skill in .pi/skills, .agents/skills, ~/.pi/agent/skills o ~/.agents/skills",
+                        "No skills in .pi/skills, .agents/skills, ~/.pi/agent/skills or ~/.agents/skills",
+                    )
+                    .to_owned()
+                } else {
+                    lines.join("\n")
+                });
+                if !plugins.is_empty() {
+                    out.push(plugins.join("\n"));
+                }
+                out.push(
+                    self.msg(
+                        "/showcase per installarne altri",
+                        "/showcase to install more",
+                    )
+                    .to_owned(),
+                );
+                self.note(out.join("\n\n"));
+            }
+            "/showcase" => {
+                let id = string(&self.project, "id");
+                ensure!(
+                    !id.is_empty(),
+                    self.msg(
+                        "F2 · scegli prima un progetto",
+                        "F2 · choose a project first"
+                    )
+                );
+                if argument.is_empty() {
+                    let listing = self.remote.api(cx, Method::Get, "/showcase", None).await?;
+                    let lang = if self.en { "en" } else { "it" };
+                    let items = listing["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|s| {
+                            let label = format!(
+                                "{} · {}",
+                                string(s, "title"),
+                                string(&s["description"], lang)
+                            );
+                            (clean(&label), string(s, "id"))
+                        })
+                        .collect();
+                    self.open_picker(Pick::Showcase(items))?;
+                } else {
+                    self.showcase_items(cx, argument).await?;
+                }
+            }
+            "/uninstall" => {
+                let id = string(&self.project, "id");
+                let mut parts = argument.split_whitespace();
+                let (kind, name) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let scope = parts.next().unwrap_or("project");
+                ensure!(
+                    !id.is_empty() && matches!(kind, "skill" | "plugin") && !name.is_empty(),
+                    "/uninstall skill|plugin nome/name [user]"
+                );
+                let body = json!({"kind": kind, "name": name, "scope": scope});
+                let out = self
+                    .remote
+                    .api(
+                        cx,
+                        Method::Post,
+                        &format!("/projects/{id}/showcase/remove"),
+                        Some(body),
+                    )
+                    .await?;
+                self.skills.0 = Value::Null;
+                self.note(if out["removed"] == true {
+                    self.msg("Rimosso", "Removed")
+                } else {
+                    self.msg("Non installato", "Not installed")
+                });
+            }
             "/import" => {
                 let id = string(&self.project, "id");
                 ensure!(
@@ -2433,6 +2691,74 @@ impl App {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Open the item picker for a showcase source id or `owner/repo`.
+    async fn showcase_items(&mut self, cx: &Cx, source: &str) -> Result<()> {
+        self.note(self.msg(
+            "Scarico il repository dall'harness…",
+            "Downloading the repository on the harness…",
+        ));
+        let path = format!(
+            "/projects/{}/showcase?source={}",
+            string(&self.project, "id"),
+            query_escape(source)
+        );
+        let listing = self.remote.api(cx, Method::Get, &path, None).await?;
+        let items: Vec<(String, String)> = listing["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| {
+                (
+                    showcase_label(i, self.en),
+                    format!("{}\t{}", string(i, "kind"), string(i, "path")),
+                )
+            })
+            .collect();
+        ensure!(
+            !items.is_empty(),
+            self.msg(
+                "Nessuna skill o plugin pi in questo repository",
+                "No pi skills or plugins in this repository"
+            )
+        );
+        self.open_picker(Pick::ShowcaseItems(source.to_owned(), items))
+    }
+
+    async fn showcase_install(
+        &mut self,
+        cx: &Cx,
+        source: &str,
+        kind: &str,
+        path: &str,
+        scope: &str,
+    ) -> Result<()> {
+        let url = format!("/projects/{}/showcase/install", string(&self.project, "id"));
+        let body = json!({"source": source, "kind": kind, "path": path, "scope": scope});
+        let out = self.remote.api(cx, Method::Post, &url, Some(body)).await?;
+        // Completion for /skill: reloads on the next /skills.
+        self.skills.0 = Value::Null;
+        let name = string(&out, "name");
+        let place = string(&out, "installed");
+        let files = out["files"].as_u64().unwrap_or(0);
+        let note = if kind == "skill" {
+            format!(
+                "{} {name} → {place} ({files} file) · /skills, /skill:{name}",
+                self.msg("Skill installata", "Skill installed")
+            )
+        } else {
+            format!(
+                "{} {name} → {place} ({files} file) · {}",
+                self.msg("Plugin installato", "Plugin installed"),
+                self.msg(
+                    "l'agente lo trova con extension_list_tools",
+                    "the agent finds it with extension_list_tools"
+                )
+            )
+        };
+        self.note(clean(&note));
         Ok(())
     }
 
@@ -2618,17 +2944,37 @@ pub(crate) mod tests {
 
     #[test]
     fn slash_command_enter_requires_exact_match_or_arguments() {
-        let partial = slash_suggestions("/q", false).len();
+        let partial = slash_suggestions("/q", false, &[]).len();
         assert!(!needs_tab_completion(
             "/exit",
-            slash_suggestions("/exit", false).len()
+            slash_suggestions("/exit", false, &[]).len(),
+            &[]
         ));
         assert_eq!(partial, 0);
-        let de = slash_suggestions("/de", false);
+        let de = slash_suggestions("/de", false, &[]);
         assert!(de.iter().any(|c| c.0 == "/delete"));
-        assert!(needs_tab_completion("/de", de.len()));
-        assert!(!needs_tab_completion("//q", 0));
-        assert!(slash_suggestions("/model 1", false).is_empty());
+        assert!(needs_tab_completion("/de", de.len(), &[]));
+        assert!(!needs_tab_completion("//q", 0, &[]));
+        assert!(slash_suggestions("/model 1", false, &[]).is_empty());
+        assert_eq!(query_escape("acme/tools@v1 x"), "acme/tools%40v1%20x");
+        let plugin = json!({"kind":"plugin","name":"todo","tools":false,"description":"Todos"});
+        assert_eq!(
+            showcase_label(&plugin, true),
+            "plugin · todo [no tools: commands/UI only] · Todos"
+        );
+        // pi skills complete as /skill:name and run as typed.
+        let skills = [json!({"name":"sql-expert","description":"SQL help"})];
+        let found = slash_suggestions("/skill:s", false, &skills);
+        assert_eq!(
+            found,
+            [(
+                "/skill:sql-expert".to_owned(),
+                "SQL help".to_owned(),
+                "SQL help".to_owned()
+            )]
+        );
+        assert!(needs_tab_completion("/skill:s", found.len(), &skills));
+        assert!(!needs_tab_completion("/skill:sql-expert", 1, &skills));
     }
 
     #[test]
